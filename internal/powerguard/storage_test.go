@@ -75,6 +75,50 @@ func TestParseSMARTReportsStandbyPowerMode(t *testing.T) {
 	}
 }
 
+func TestParseSMARTDetectsStandbyFromMessages(t *testing.T) {
+	data := []byte(`{
+  "json_format_version": [1, 0],
+  "smartctl": {
+    "version": [7, 3],
+    "argv": ["smartctl", "-j", "-n", "standby", "-H", "-A", "/dev/sdb"],
+    "messages": [
+      {
+        "string": "Device is in STANDBY mode, exit(2)",
+        "severity": "information"
+      }
+    ],
+    "exit_status": 2
+  },
+  "device": {"name": "/dev/sdb", "type": "sat", "protocol": "ATA"}
+}`)
+	result, err := parseSMART(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !powerModeIsSleeping(result.PowerMode) {
+		t.Fatalf("expected sleeping power mode derived from messages, got %+v", result)
+	}
+	if result.Passed != nil || result.TemperatureC != 0 {
+		t.Fatalf("expected no health/temperature data for sleeping drive, got %+v", result)
+	}
+}
+
+func TestParseSMARTIgnoresUnrelatedMessages(t *testing.T) {
+	data := []byte(`{
+  "smartctl": {
+    "messages": [{"string": "/dev/sdz: No such file or directory", "severity": "error"}],
+    "exit_status": 2
+  }
+}`)
+	result, err := parseSMART(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if powerModeIsSleeping(result.PowerMode) {
+		t.Fatalf("did not expect sleeping power mode for open failure, got %+v", result)
+	}
+}
+
 func TestReadBlockActivityUsesInflightIO(t *testing.T) {
 	root := t.TempDir()
 	statPath := filepath.Join(root, "sys", "class", "block", "sda", "stat")

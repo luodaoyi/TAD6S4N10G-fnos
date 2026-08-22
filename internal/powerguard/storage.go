@@ -452,6 +452,12 @@ func parseSMART(data []byte) (smartResult, error) {
 			PercentageUsed  int64   `json:"percentage_used"`
 		} `json:"nvme_smart_health_information_log"`
 		PowerMode string `json:"power_mode"`
+		Smartctl  struct {
+			ExitStatus int64 `json:"exit_status"`
+			Messages   []struct {
+				String string `json:"string"`
+			} `json:"messages"`
+		} `json:"smartctl"`
 	}
 	if err := json.Unmarshal(data, &document); err != nil {
 		return smartResult{}, fmt.Errorf("解析 SMART JSON: %w", err)
@@ -460,9 +466,26 @@ func parseSMART(data []byte) (smartResult, error) {
 	if temperature == 0 {
 		temperature = document.NVMe.Temperature
 	}
+	// smartctl -n standby reports sleeping drives via smartctl.messages
+	// ("Device is in STANDBY mode, exit(2)") rather than a power_mode field.
+	powerMode := strings.TrimSpace(document.PowerMode)
+	if powerMode == "" {
+		for _, msg := range document.Smartctl.Messages {
+			lower := strings.ToLower(msg.String)
+			switch {
+			case strings.Contains(lower, "standby"):
+				powerMode = "standby"
+			case strings.Contains(lower, "sleep"):
+				powerMode = "sleep"
+			}
+			if powerMode != "" {
+				break
+			}
+		}
+	}
 	return smartResult{
 		Passed: document.SmartStatus.Passed, TemperatureC: temperature,
 		Critical: document.NVMe.CriticalWarning, PercentageUsed: document.NVMe.PercentageUsed,
-		PowerMode: document.PowerMode,
+		PowerMode: powerMode,
 	}, nil
 }
