@@ -322,7 +322,9 @@ function renderStorageVisual(storage = {}) {
         temperature.textContent = '';
       } else if (hasTemperature) {
         temperature.textContent = compact
-          ? `${Math.round(Number(slot.temperature_c))}°C`
+          ? (group.kind === 'front'
+            ? `${Math.round(Number(slot.temperature_c))}\n°C`
+            : `${Math.round(Number(slot.temperature_c))}°C`)
           : formatTemperature(slot.temperature_c);
       } else {
         temperature.textContent = compact ? '—' : '— °C';
