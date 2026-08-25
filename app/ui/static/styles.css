@@ -438,10 +438,11 @@ small {
 .temperature-pair p { margin: 0; }
 .temperature-pair b { font-size: 18px; }
 
-.fan-overview { min-width: 148px; }
+.fan-overview { min-width: 0; width: 100%; }
 
 .fan-rpm-list {
   display: grid;
+  width: 100%;
   gap: 6px;
 }
 
@@ -488,7 +489,7 @@ small {
   margin: 0;
 }
 
-.storage-visual-front { padding-top: 30px; }
+.storage-visual-front { padding-top: 0; }
 
 .storage-visual-group figcaption {
   height: 22px;
@@ -498,6 +499,18 @@ small {
   font-weight: 700;
   line-height: 22px;
   text-align: center;
+}
+
+.storage-visual-m2 figcaption {
+  position: absolute;
+  left: 50%;
+  top: 16%;
+  z-index: 2;
+  height: auto;
+  margin: 0;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+  white-space: nowrap;
 }
 
 .storage-visual-frame {
@@ -622,11 +635,26 @@ small {
 }
 
 .status-table tbody th { color: #303641; font-weight: 650; white-space: nowrap; }
-.status-table .storage-empty td { color: #a0a5af; }
+.status-table .storage-empty td { color: #7b8290; }
 .status-table .storage-present td:nth-child(2) { color: #2f86bc; font-weight: 650; }
 .status-table .storage-used td:nth-child(2) { color: var(--success); font-weight: 650; }
 .status-table .storage-warning td:nth-child(2),
-.status-table .storage-warning td:nth-child(6) { color: var(--danger); font-weight: 650; }
+.status-table .storage-warning td:nth-child(6),
+.status-table .storage-col-temp.is-hot { color: var(--danger); font-weight: 650; }
+.status-table .storage-col-activity.activity-idle { color: #3d4654; font-weight: 650; }
+.status-table .storage-col-activity.activity-sleeping { color: #2a7ab0; font-weight: 650; }
+.status-table .storage-col-activity.activity-busy { color: #3d4654; font-weight: 650; }
+
+.storage-visual-slot.tone-sleep .storage-slot-overlay { filter: sepia(.28) hue-rotate(175deg) saturate(.9); }
+.storage-visual-slot.tone-unused .storage-slot-overlay { filter: saturate(.25) brightness(1.06); }
+
+.stat-box {
+  display: inline-block;
+  padding: 2px 7px;
+  border-radius: 6px;
+}
+.stat-box.warn { color: #9a5b00; background: #fff4e0; }
+.stat-box.danger { color: var(--danger); background: #fff1f0; }
 
 .storage-table th:nth-child(1), .storage-table td:nth-child(1) { width: 72px; }
 .storage-table th:nth-child(2), .storage-table td:nth-child(2) { width: 64px; }
@@ -707,8 +735,14 @@ small {
 
 .diagnostic-chip b { color: #475065; font-size: 11px; white-space: nowrap; }
 .diagnostic-chip.ok, .diagnostic-ok { color: var(--success); }
-.diagnostic-chip.muted { color: var(--muted); }
-.diagnostic-chip.warning, .diagnostic-error { color: var(--danger); }
+.diagnostic-chip.muted { color: #5c6470; }
+.diagnostic-chip.warning, .diagnostic-error {
+  display: inline-block;
+  padding: 2px 7px;
+  border-radius: 6px;
+  color: var(--danger);
+  background: #fff1f0;
+}
 
 .notice {
   margin: 0;
@@ -783,9 +817,9 @@ small {
 
 .curve-chart {
   display: block;
-  width: auto;
-  max-width: 1100px;
-  margin-right: auto;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
   min-height: 220px;
   aspect-ratio: 640 / 260;
   border: 1px solid #e2e5ea;
@@ -1103,6 +1137,8 @@ small {
 .about-heading img { width: 168px; max-height: 118px; object-fit: contain; }
 .about-heading h2 { font-size: 22px; }
 .about-heading p { margin: 0; color: var(--muted); font-size: 13px; }
+.about-health-line strong.ok { color: var(--success); }
+.about-health-line strong.danger { color: var(--danger); }
 .about-version-line { margin-top: 8px !important; }
 .about-version-line strong { color: var(--text); font-weight: 700; }
 
@@ -1270,9 +1306,9 @@ button.danger {
   }
   .storage-visual-group { width: auto; max-width: 100%; }
   .curve-chart {
-    width: auto;
-    max-width: 1100px;
-    margin-right: auto;
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
   }
   .storage-table .storage-col-activity,
   .storage-table .storage-col-purpose { display: none; }
@@ -1330,15 +1366,13 @@ button.danger {
     text-overflow: ellipsis;
   }
   .app-tabs button > img { flex-shrink: 0; }
-  .sidebar-meta {
-    flex-direction: row;
-    flex-wrap: wrap;
-    align-items: center;
-    margin-top: 6px;
-    min-width: 0;
-    overflow: hidden;
-  }
-  .sidebar-meta .health-summary { margin-left: auto; }
+  .sidebar-meta { display: none; }
+  .app-sidebar { max-height: 72px; }
+  .curve-chart,
+  .storage-visual,
+  .storage-visual-group,
+  .device-identity img { max-width: 100%; }
+  .tab-form { overflow-x: hidden; }
   .health-tooltip {
     top: 116px;
     right: 12px;
