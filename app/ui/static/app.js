@@ -316,11 +316,22 @@ function renderStorageVisual(storage = {}) {
       const temperature = marker.querySelector('.storage-slot-text span');
       const status = marker.querySelector('.storage-slot-text small');
       marker.querySelector('.storage-slot-text b').textContent = id.split('-').pop();
+      const compact = window.matchMedia('(max-width: 599px)').matches;
       const hasTemperature = Number(slot.temperature_c) > 0;
-      temperature.textContent = tone === 'empty' ? '' : (hasTemperature ? formatTemperature(slot.temperature_c) : '— °C');
-      status.textContent = tone === 'empty'
-        ? '空置'
-        : (slot.state === 'warning' ? '告警' : (slot.state === 'present' ? '未使用' : (STORAGE_ACTIVITY_LABELS[slot.activity] || '健康')));
+      if (tone === 'empty') {
+        temperature.textContent = '';
+      } else if (hasTemperature) {
+        temperature.textContent = compact
+          ? `${Math.round(Number(slot.temperature_c))}°C`
+          : formatTemperature(slot.temperature_c);
+      } else {
+        temperature.textContent = compact ? '—' : '— °C';
+      }
+      status.textContent = compact
+        ? ''
+        : (tone === 'empty'
+          ? '空置'
+          : (slot.state === 'warning' ? '告警' : (slot.state === 'present' ? '未使用' : (STORAGE_ACTIVITY_LABELS[slot.activity] || '健康'))));
     });
   });
 }
