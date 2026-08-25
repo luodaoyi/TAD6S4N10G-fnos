@@ -1,5 +1,5 @@
 appname=tad-module
-version=0.10.2
+version=0.10.3
 display_name=TAD6S4N模块
 desc=面向 TAD6S4N10G 的温度、功耗、三曲线风扇、硬盘面板、GPIO 按键与脱敏调试报告模块。
 source=thirdparty
@@ -13,4 +13,4 @@ desktop_uidir=ui
 desktop_applaunchname=tad-module.Application
 checkport=false
 disable_authorization_path=false
-changelog=将 GitHub 仓库和检查更新移到关于页；进入插件不再自动弹出启动检查窗口，改为悬停或点按“需要检查”时显示浮窗。
+changelog=监控面板按 390/768/1280 三档响应式排版：窄屏一盘一卡、仓位图上下排，槽内只留槽号和温度；平板保留侧栏与五列表；桌面七列两行型号，仓位图与曲线居左不拉满。
