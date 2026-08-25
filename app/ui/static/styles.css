@@ -475,7 +475,9 @@ small {
   grid-template-columns: minmax(0, 52fr) minmax(0, 43fr);
   gap: clamp(18px, 3vw, 44px);
   align-items: flex-start;
-  justify-content: stretch;
+  justify-content: start;
+  width: 100%;
+  max-width: 1100px;
   margin-top: 4px;
   overflow: hidden;
 }
@@ -545,12 +547,23 @@ small {
   display: flex;
   flex-direction: column;
   justify-content: center;
+  min-width: 0;
+  overflow: hidden;
   padding: 4px;
   pointer-events: none;
 }
 
+.storage-slot-text b,
+.storage-slot-text span,
+.storage-slot-text small {
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  overflow-wrap: anywhere;
+}
 .storage-slot-text b { color: #3e4551; font-size: 11px; }
-.storage-slot-text span { color: #353b45; font-size: 11px; font-weight: 700; white-space: nowrap; }
+.storage-slot-text span { color: #353b45; font-size: 11px; font-weight: 700; }
 .storage-slot-text small { margin: 3px 0 0; color: #606978; font-size: 9px; }
 
 .storage-visual-slot.tone-red .storage-slot-text span,
@@ -620,6 +633,27 @@ small {
 .storage-table th:nth-child(3), .storage-table td:nth-child(3) { width: 56px; }
 .storage-table th:nth-child(6), .storage-table td:nth-child(6) { width: 72px; }
 .storage-table th:nth-child(7), .storage-table td:nth-child(7) { width: 72px; }
+.storage-table .storage-col-device {
+  width: auto;
+  min-width: 0;
+  overflow: hidden;
+}
+.storage-device {
+  min-width: 0;
+  overflow: hidden;
+}
+.storage-model,
+.storage-device-meta,
+.storage-device-extra {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.storage-device-extra,
+.storage-card-head,
+.storage-head-model { display: none; }
 
 .inline-status {
   min-height: 16px;
@@ -750,7 +784,7 @@ small {
 .curve-chart {
   display: block;
   width: 100%;
-  max-width: none;
+  max-width: 1100px;
   min-height: 220px;
   aspect-ratio: 640 / 260;
   border: 1px solid #e2e5ea;
@@ -1218,16 +1252,34 @@ button.danger {
 
 .message.error { color: var(--danger); }
 
-@media (max-width: 980px) {
+@media (max-width: 1023px) {
   .overview-grid,
   .device-stats,
   .diagnostic-grid,
   .about-features,
   .field-grid { grid-template-columns: 1fr 1fr; }
   .fan-overview { grid-column: 1 / -1; min-width: 0; }
+  .storage-visual {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 12px;
+    max-width: none;
+  }
+  .storage-table .storage-col-activity,
+  .storage-table .storage-col-purpose { display: none; }
+  .storage-head-device { display: none; }
+  .storage-head-model { display: inline; }
+  .storage-device-meta { display: none; }
+  .storage-device-extra { display: block; }
+  .storage-model {
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
 }
 
-@media (max-width: 720px) {
+@media (max-width: 599px) {
   .app-layout {
     grid-template-columns: 1fr;
     grid-template-rows: auto minmax(0, 1fr);
@@ -1290,14 +1342,14 @@ button.danger {
   .device-stats,
   .field-grid,
   .diagnostic-grid,
-  .about-features,
-  .power-modes { grid-template-columns: 1fr; }
+  .about-features { grid-template-columns: 1fr; }
   .fan-overview { grid-column: auto; }
-  .storage-visual {
-    grid-template-columns: minmax(0, 52fr) minmax(0, 43fr);
-    gap: 8px;
+  .power-modes {
+    display: grid;
+    width: 100%;
+    grid-template-columns: 1fr 1fr;
   }
-  .curve-chart { width: 100%; }
+  .curve-chart { width: 100%; max-width: none; }
   .panel-heading,
   .script-editor-footer,
   .curve-toolbar { flex-direction: column; align-items: flex-start; }
@@ -1307,4 +1359,88 @@ button.danger {
   .debug-actions { flex-direction: row; align-items: stretch; }
   .debug-actions button { flex: 1 1 calc(50% - 8px); min-width: 0; }
   .debug-report { min-height: 280px; }
+
+  .storage-panel .table-scroll,
+  .gpio-editor .table-scroll { overflow: visible; }
+  .storage-table,
+  .storage-table tbody { display: block; width: 100%; }
+  .storage-table thead { display: none; }
+  .storage-table tbody tr {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 8px;
+    align-items: flex-start;
+    margin: 0 0 8px;
+    padding: 10px 12px;
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    background: var(--surface);
+  }
+  .storage-table tbody tr:last-child { margin-bottom: 0; }
+  .storage-table tbody th,
+  .storage-table tbody td {
+    padding: 0;
+    border-bottom: 0;
+  }
+  .storage-card-head {
+    display: block;
+    flex: 1 1 100%;
+    order: 0;
+    color: #303641;
+    font-weight: 650;
+  }
+  .storage-col-slot,
+  .storage-col-state,
+  .storage-col-temp { display: none; }
+  .storage-col-device {
+    display: block;
+    flex: 1 1 100%;
+    order: 1;
+    width: auto;
+  }
+  .storage-table .storage-col-activity { order: 2; }
+  .storage-table .storage-col-purpose { order: 3; }
+  .storage-table .storage-col-health { order: 4; }
+  .storage-device-extra { display: none; }
+  .storage-device-meta { display: block; }
+  .storage-table .storage-col-activity,
+  .storage-table .storage-col-purpose,
+  .storage-table .storage-col-health {
+    display: inline-flex;
+    padding: 4px 8px;
+    border: 1px solid #e0e3e8;
+    border-radius: 6px;
+    background: #fff;
+  }
+  .storage-empty .storage-col-device,
+  .storage-empty .storage-col-activity,
+  .storage-empty .storage-col-purpose,
+  .storage-empty .storage-col-health { display: none; }
+
+  .gpio-table,
+  .gpio-table tbody { display: block; width: 100%; }
+  .gpio-table thead { display: none; }
+  .gpio-table tr {
+    display: block;
+    margin: 0 0 8px;
+    padding: 12px;
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    background: var(--surface);
+  }
+  .gpio-table tr:last-child { margin-bottom: 0; }
+  .gpio-table th,
+  .gpio-table td {
+    display: block;
+    width: 100%;
+    padding: 6px 0;
+    border-bottom: 0;
+  }
+  .gpio-table td::before {
+    content: attr(data-label);
+    display: block;
+    margin-bottom: 4px;
+    color: var(--muted);
+    font-size: 11px;
+  }
 }

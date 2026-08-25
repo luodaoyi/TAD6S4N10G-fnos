@@ -175,25 +175,58 @@ function renderStorageTable(storage = {}) {
   body.replaceChildren();
   slots.forEach((slot) => {
     const row = document.createElement('tr');
+    const empty = slot.state === 'empty';
     row.className = `storage-${slot.state || 'unknown'}`;
     const label = slot.kind === 'front' ? `前置 ${slot.slot}` : `M.2 ${slot.slot}`;
-    const deviceDetail = [slot.device, slot.model, slot.serial, formatSize(slot.size_bytes)].filter(Boolean).join(' · ');
-    const values = [
-      label,
-      STORAGE_STATE_LABELS[slot.state] || slot.state || '未知',
-      slot.state === 'empty' ? '—' : (STORAGE_ACTIVITY_LABELS[slot.activity] || slot.activity || '未知'),
-      deviceDetail || '—',
-      slot.purpose || (slot.state === 'empty' ? '空仓位' : '—'),
-      slot.warning || slot.health || '—',
-      formatTemperature(slot.temperature_c, Number(slot.temperature_c) > 0),
+    const stateLabel = STORAGE_STATE_LABELS[slot.state] || slot.state || '未知';
+    const activityLabel = empty ? '—' : (STORAGE_ACTIVITY_LABELS[slot.activity] || slot.activity || '未知');
+    const purposeLabel = slot.purpose || (empty ? '空仓位' : '—');
+    const healthLabel = slot.warning || slot.health || '—';
+    const temperature = formatTemperature(slot.temperature_c, Number(slot.temperature_c) > 0);
+    const model = slot.model || '—';
+    const meta = [slot.device, formatSize(slot.size_bytes), slot.serial].filter(Boolean).join(' · ') || '—';
+    const extra = [activityLabel, purposeLabel].filter((value) => value && value !== '—').join(' · ') || '—';
+    const cells = [
+      ['th', '仓位', 'storage-col-slot', label],
+      ['td', '状态', 'storage-col-state', stateLabel],
+      ['td', '活动', 'storage-col-activity', activityLabel],
+      ['td', '设备', 'storage-col-device', null],
+      ['td', '用途', 'storage-col-purpose', purposeLabel],
+      ['td', '健康', 'storage-col-health', healthLabel],
+      ['td', '温度', 'storage-col-temp', temperature],
     ];
-    const labels = ['仓位', '状态', '活动', '设备', '用途', '健康', '温度'];
-    values.forEach((value, index) => {
-      const cell = document.createElement(index === 0 ? 'th' : 'td');
-      cell.dataset.label = labels[index];
-      cell.textContent = value;
+    cells.forEach(([tag, name, className, value]) => {
+      const cell = document.createElement(tag);
+      cell.dataset.label = name;
+      cell.className = className;
+      if (className === 'storage-col-device') {
+        if (empty) {
+          cell.textContent = '—';
+        } else {
+          const wrap = document.createElement('div');
+          wrap.className = 'storage-device';
+          const title = document.createElement('span');
+          title.className = 'storage-model';
+          title.textContent = model;
+          const detail = document.createElement('small');
+          detail.className = 'storage-device-meta';
+          detail.textContent = meta;
+          const more = document.createElement('small');
+          more.className = 'storage-device-extra';
+          more.textContent = extra;
+          wrap.append(title, detail, more);
+          cell.append(wrap);
+        }
+      } else {
+        cell.textContent = value;
+      }
       row.append(cell);
     });
+    const cardHead = document.createElement('td');
+    cardHead.className = 'storage-card-head';
+    cardHead.dataset.label = '仓位';
+    cardHead.textContent = empty ? `${label} · ${stateLabel}` : `${label} · ${stateLabel} · ${temperature}`;
+    row.append(cardHead);
     body.append(row);
   });
   if (!slots.length) {
