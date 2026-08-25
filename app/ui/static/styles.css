@@ -1348,6 +1348,26 @@ button.danger {
     max-height: calc(100vh - 128px);
   }
   .tab-form { padding: 10px; }
+  .storage-slot-text {
+    padding: 1px 2px;
+    gap: 0;
+    line-height: 1;
+  }
+  .storage-slot-text small { display: none; }
+  .storage-slot-text b,
+  .storage-slot-text span {
+    display: block;
+    min-width: 0;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    overflow-wrap: normal;
+    word-break: keep-all;
+    line-height: 1.1;
+  }
+  .storage-slot-text b { font-size: 8px; }
+  .storage-slot-text span { font-size: 8px; font-weight: 700; }
   .overview-grid,
   .device-stats,
   .field-grid,
