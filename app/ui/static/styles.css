@@ -476,7 +476,7 @@ small {
   gap: clamp(18px, 3vw, 44px);
   align-items: flex-start;
   justify-content: start;
-  width: 100%;
+  width: auto;
   max-width: 1100px;
   margin-top: 4px;
   overflow: hidden;
@@ -783,8 +783,9 @@ small {
 
 .curve-chart {
   display: block;
-  width: 100%;
+  width: auto;
   max-width: 1100px;
+  margin-right: auto;
   min-height: 220px;
   aspect-ratio: 640 / 260;
   border: 1px solid #e2e5ea;
@@ -1259,10 +1260,19 @@ button.danger {
   .about-features,
   .field-grid { grid-template-columns: 1fr 1fr; }
   .fan-overview { grid-column: 1 / -1; min-width: 0; }
+  .app-layout { grid-template-columns: 152px minmax(0, 1fr); }
   .storage-visual {
     grid-template-columns: minmax(0, 1fr);
     gap: 12px;
-    max-width: none;
+    justify-items: start;
+    width: auto;
+    max-width: 1100px;
+  }
+  .storage-visual-group { width: auto; max-width: 100%; }
+  .curve-chart {
+    width: auto;
+    max-width: 1100px;
+    margin-right: auto;
   }
   .storage-table .storage-col-activity,
   .storage-table .storage-col-purpose { display: none; }
@@ -1349,7 +1359,6 @@ button.danger {
     width: 100%;
     grid-template-columns: 1fr 1fr;
   }
-  .curve-chart { width: 100%; max-width: none; }
   .panel-heading,
   .script-editor-footer,
   .curve-toolbar { flex-direction: column; align-items: flex-start; }
