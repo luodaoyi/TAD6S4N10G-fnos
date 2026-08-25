@@ -1348,26 +1348,43 @@ button.danger {
     max-height: calc(100vh - 128px);
   }
   .tab-form { padding: 10px; }
+  .storage-slot-overlay { z-index: 0; }
   .storage-slot-text {
-    padding: 1px 2px;
-    gap: 0;
+    z-index: 2;
+    inset: 8% 10%;
+    padding: 0;
+    gap: 1px;
+    align-items: stretch;
+    justify-content: center;
     line-height: 1;
   }
   .storage-slot-text small { display: none; }
   .storage-slot-text b,
   .storage-slot-text span {
     display: block;
+    width: 100%;
     min-width: 0;
-    max-width: 100%;
     overflow: hidden;
-    text-overflow: ellipsis;
+    text-overflow: clip;
     white-space: nowrap;
     overflow-wrap: normal;
     word-break: keep-all;
-    line-height: 1.1;
+    text-align: center;
+    line-height: 1.05;
+    font-size: clamp(9px, 2.6vw, 11px);
   }
-  .storage-slot-text b { font-size: 8px; }
-  .storage-slot-text span { font-size: 8px; font-weight: 700; }
+  .storage-slot-text b { font-weight: 700; }
+  .storage-slot-text span { font-weight: 700; }
+  .storage-visual-front .storage-slot-text { inset: 12% 14%; }
+  .storage-visual-front .storage-slot-text b,
+  .storage-visual-front .storage-slot-text span {
+    font-size: clamp(8px, 2.3vw, 10px);
+  }
+  .storage-visual-front .storage-slot-text span { white-space: pre-line; }
+  .storage-visual-m2 .storage-slot-text { inset: 10% 8% 10% 26%; }
+  .storage-visual-m2 .storage-slot-overlay.flipped + .storage-slot-text {
+    inset: 10% 26% 10% 8%;
+  }
   .overview-grid,
   .device-stats,
   .field-grid,
