@@ -30,8 +30,8 @@ const (
 	StorageActivitySleeping = "sleeping"
 	StorageActivityUnknown  = "unknown"
 
-	storageIdleUtilMax    = 0.0
-	storageWorkingUtilMax = 70.0
+	storageWorkingUtilMax    = 70.0
+	storageWorkingDisplayMin = 0.5
 )
 
 type StorageSlot struct {
@@ -127,16 +127,11 @@ type smartResult struct {
 }
 
 type blockIOSample struct {
-	Reads      uint64
-	Writes     uint64
-	ReadTicks  uint64
-	WriteTicks uint64
-	IOTicks    uint64
-	InFlight   uint64
-	StallCount int
-	SampledAt  time.Time
-	Util       float64
-	HasUtil    bool
+	IOTicks   uint64
+	InFlight  uint64
+	SampledAt time.Time
+	Util      float64
+	HasUtil   bool
 }
 
 var blockIOStates sync.Map
@@ -152,7 +147,6 @@ func (m *Manager) RefreshStorage(forceSMART bool) StorageStatus {
 }
 
 func (m *Manager) StorageStatus() StorageStatus {
-	m.RefreshStorageActivity()
 	m.storageMu.RLock()
 	defer m.storageMu.RUnlock()
 	status := cloneStorageStatus(m.storageStatus)
@@ -568,7 +562,8 @@ func activityFromUtilization(util float64) string {
 	if util > storageWorkingUtilMax {
 		return StorageActivityBusy
 	}
-	if util > storageIdleUtilMax {
+	// 低于 0.5 的繁忙度经前端 Math.round 显示为 0%，按 README 约定归为空闲。
+	if util >= storageWorkingDisplayMin {
 		return StorageActivityWorking
 	}
 	return StorageActivityIdle
@@ -619,23 +614,21 @@ func (m *Manager) readBlockActivity(kname, kind string) (string, *float64) {
 	if len(fields) < 10 {
 		return StorageActivityUnknown, nil
 	}
-	reads, readErr := strconv.ParseUint(fields[0], 10, 64)
-	writes, writeErr := strconv.ParseUint(fields[4], 10, 64)
-	readTicks, readTickErr := strconv.ParseUint(fields[3], 10, 64)
-	writeTicks, writeTickErr := strconv.ParseUint(fields[7], 10, 64)
 	inFlight, flightErr := strconv.ParseUint(fields[8], 10, 64)
 	ioTicks, ioTickErr := strconv.ParseUint(fields[9], 10, 64)
-	if readErr != nil || writeErr != nil || readTickErr != nil || writeTickErr != nil || flightErr != nil || ioTickErr != nil {
+	if flightErr != nil || ioTickErr != nil {
 		return StorageActivityUnknown, nil
 	}
 	sample := blockIOSample{
-		Reads: reads, Writes: writes, ReadTicks: readTicks, WriteTicks: writeTicks,
 		IOTicks: ioTicks, InFlight: inFlight, SampledAt: time.Now(),
 	}
 	previous, hadPrevious := loadBlockIO(kname)
 	_ = kind
 	if !hadPrevious {
 		storeBlockIO(kname, sample)
+		if inFlight > 0 {
+			return StorageActivityBusy, nil
+		}
 		return StorageActivityIdle, nil
 	}
 	if util := storageUtilization(previous, sample); util != nil {

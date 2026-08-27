@@ -355,3 +355,32 @@ func containsString(values []string, want string) bool {
 	}
 	return false
 }
+
+func TestReadBlockActivityBusyOnFirstSampleWithInFlight(t *testing.T) {
+	resetBlockIOStates()
+	root := t.TempDir()
+	statPath := filepath.Join(root, "sys", "class", "block", "sdc", "stat")
+	if err := os.MkdirAll(filepath.Dir(statPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manager := &Manager{Root: root}
+	got, util := sampleUtil(t, manager, statPath, "sdc", "1 0 8 2 3 0 9 4 7 100 0\n", 0)
+	if got != StorageActivityBusy || util != nil {
+		t.Fatalf("first sample with in-flight IO: got %q util %v, want busy and nil", got, util)
+	}
+}
+
+func TestReadBlockActivitySubHalfPercentIsIdle(t *testing.T) {
+	resetBlockIOStates()
+	root := t.TempDir()
+	statPath := filepath.Join(root, "sys", "class", "block", "sdd", "stat")
+	if err := os.MkdirAll(filepath.Dir(statPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manager := &Manager{Root: root}
+	sampleUtil(t, manager, statPath, "sdd", "1 0 8 2 3 0 9 4 0 100 0\n", 0)
+	got, util := sampleUtil(t, manager, statPath, "sdd", "1 0 8 2 3 0 9 4 0 104 0\n", time.Second)
+	if got != StorageActivityIdle || util == nil || *util <= 0 || *util >= 0.5 {
+		t.Fatalf("0.4%% util: got %q util %v, want idle with 0 < util < 0.5", got, util)
+	}
+}

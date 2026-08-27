@@ -247,8 +247,18 @@ function storageTempTone(slot = {}) {
   return isStorageHot(slot) ? 'danger' : 'temp';
 }
 
+function storageSlotStatusLabel(slot = {}, tone = '') {
+  if (tone === 'empty') return '空置';
+  if (slot.state === 'warning') return STORAGE_STATE_LABELS.warning;
+  if (isStorageHot(slot)) return '高温';
+  if (slot.state === 'present') return '未使用';
+  if (slot.state === 'unknown') return STORAGE_STATE_LABELS.unknown;
+  return STORAGE_ACTIVITY_LABELS[slot.activity]
+    || (slot.state === 'used' ? '健康' : (STORAGE_STATE_LABELS[slot.state] || STORAGE_STATE_LABELS.unknown));
+}
+
 function connectedFans(fanStatus = {}, limit = 0) {
-  const fans = (fanStatus.fans || []).filter((fan) => Number(fan.rpm) > 0);
+  const fans = (fanStatus.fans || []).filter((fan) => Number(fan.rpm) >= 0);
   return limit > 0 ? fans.slice(0, limit) : fans;
 }
 
@@ -475,23 +485,10 @@ function renderStorageVisual(storage = {}) {
       } else {
         temperature.textContent = formatTemperature(slot.temperature_c);
       }
-      const statusLabel = tone === 'empty'
-        ? '空置'
-        : (slot.state === 'warning'
-          ? '告警'
-          : (isStorageHot(slot)
-            ? '高温'
-            : (slot.state === 'present'
-              ? '未使用'
-              : (STORAGE_ACTIVITY_LABELS[slot.activity] || ''))));
       if (status) {
-        if (group.kind === 'm2') {
-          status.textContent = tone === 'empty'
-            ? '空置'
-            : (STORAGE_ACTIVITY_LABELS[slot.activity] || '');
-        } else {
-          status.textContent = compact ? '' : statusLabel;
-        }
+        status.textContent = compact && group.kind === 'front'
+          ? ''
+          : storageSlotStatusLabel(slot, tone);
       }
     });
   });
