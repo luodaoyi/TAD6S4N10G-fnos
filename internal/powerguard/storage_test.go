@@ -380,7 +380,7 @@ func TestReadBlockActivitySubHalfPercentIsIdle(t *testing.T) {
 	manager := &Manager{Root: root}
 	sampleUtil(t, manager, statPath, "sdd", "1 0 8 2 3 0 9 4 0 100 0\n", 0)
 	got, util := sampleUtil(t, manager, statPath, "sdd", "1 0 8 2 3 0 9 4 0 104 0\n", time.Second)
-	if got != StorageActivityIdle || util == nil || *util <= 0 || *util >= 0.5 {
-		t.Fatalf("0.4%% util: got %q util %v, want idle with 0 < util < 0.5", got, util)
+	if got != StorageActivityIdle || util == nil || *util != 0 {
+		t.Fatalf("0.4%% util: got %q util %v, want idle with util forced to 0", got, util)
 	}
 }
