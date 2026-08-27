@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -66,6 +67,10 @@ type storageSlotSpec struct {
 	Prefix  bool
 }
 
+// TAD6S4N10G 的仓位模板：绝对 PCI 地址只在当前总线拓扑下成立（例如拔掉
+// 与盘位共用同一 PCIe 上游交换芯片的网卡后，内核重新编号会使这些路径失效）。
+// 真正的解析优先走 discoverSlotBusPaths，按相对拓扑推导；此表仅提供
+// 兜底路径与稳定的仓位 ID/数量。
 var storageSlotSpecs = []storageSlotSpec{
 	{ID: "front-1", Kind: "front", Slot: 1, BusPath: "/dev/disk/by-path/pci-0000:02:00.0-ata-1"},
 	{ID: "front-2", Kind: "front", Slot: 2, BusPath: "/dev/disk/by-path/pci-0000:02:00.0-ata-2"},
@@ -77,6 +82,124 @@ var storageSlotSpecs = []storageSlotSpec{
 	{ID: "m2-2", Kind: "m2", Slot: 2, BusPath: "/dev/disk/by-path/pci-0000:05:00.0-nvme-", Prefix: true},
 	{ID: "m2-3", Kind: "m2", Slot: 3, BusPath: "/dev/disk/by-path/pci-0000:06:00.0-nvme-", Prefix: true},
 	{ID: "m2-4", Kind: "m2", Slot: 4, BusPath: "/dev/disk/by-path/pci-0000:07:00.0-nvme-", Prefix: true},
+}
+
+var pciAddrPattern = regexp.MustCompile(`^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]$`)
+
+// discoverSlotBusPaths 从 sysfs 相对拓扑推导当前各仓位的 by-path 前缀。
+// SATA：取注册 ATA 端口数最多的控制器（TAD6S4N10G 为六口），按端口号升序
+// 对应 front-1..N，端口注册与是否插盘无关；M.2：按控制器地址升序对应
+// m2-1..4。拔掉网卡导致总线整体重编号时，相对顺序保持，映射自动跟随；
+// 读不到 sysfs 或结构为空时返回空表，调用方沿用模板的固定路径。
+func (m *Manager) discoverSlotBusPaths() map[string]string {
+	overrides := make(map[string]string)
+	if controller, ports := bestSATAController(m.discoverSATAControllers()); controller != "" {
+		if count := min(len(ports), 6); count != 0 {
+			for index, port := range ports[:count] {
+				overrides[fmt.Sprintf("front-%d", index+1)] = fmt.Sprintf("/dev/disk/by-path/pci-%s-ata-%d", controller, port)
+			}
+		}
+	}
+	if addrs := m.discoverNVMeControllers(); len(addrs) != 0 {
+		unique := orderedUniqueStrings(addrs)
+		if count := min(len(unique), 4); count != 0 {
+			for index, addr := range unique[:count] {
+				overrides[fmt.Sprintf("m2-%d", index+1)] = fmt.Sprintf("/dev/disk/by-path/pci-%s-nvme-", addr)
+			}
+		}
+	}
+	return overrides
+}
+
+func (m *Manager) discoverSATAControllers() map[int]string {
+	dir := m.rooted("/sys/class/ata_port")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	ports := make(map[int]string)
+	for _, entry := range entries {
+		port, parseErr := strconv.Atoi(strings.TrimPrefix(entry.Name(), "ata"))
+		if parseErr != nil || port <= 0 {
+			continue
+		}
+		resolved, linkErr := filepath.EvalSymlinks(filepath.Join(dir, entry.Name()))
+		if linkErr != nil {
+			continue
+		}
+		addr := lastPCIComponent(resolved)
+		if addr != "" {
+			ports[port] = addr
+		}
+	}
+	return ports
+}
+
+func bestSATAController(ports map[int]string) (string, []int) {
+	counts := make(map[string]int)
+	portNumbers := make(map[string][]int)
+	for port, addr := range ports {
+		counts[addr]++
+		portNumbers[addr] = append(portNumbers[addr], port)
+	}
+	best := ""
+	bestCount := 0
+	for addr, count := range counts {
+		if count > bestCount || (count == bestCount && best != "" && addr < best) {
+			best = addr
+			bestCount = count
+		}
+	}
+	if best == "" {
+		return "", nil
+	}
+	numbers := portNumbers[best]
+	sort.Ints(numbers)
+	return best, numbers
+}
+
+func (m *Manager) discoverNVMeControllers() []string {
+	dir := m.rooted("/sys/class/nvme")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	addrs := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		resolved, linkErr := filepath.EvalSymlinks(filepath.Join(dir, entry.Name()))
+		if linkErr != nil {
+			continue
+		}
+		addr := lastPCIComponent(resolved)
+		if addr != "" {
+			addrs = append(addrs, addr)
+		}
+	}
+	return addrs
+}
+
+func orderedUniqueStrings(values []string) []string {
+	seen := make(map[string]bool, len(values))
+	unique := make([]string, 0, len(values))
+	for _, value := range values {
+		if seen[value] {
+			continue
+		}
+		seen[value] = true
+		unique = append(unique, value)
+	}
+	sort.Strings(unique)
+	return unique
+}
+
+func lastPCIComponent(path string) string {
+	last := ""
+	for _, part := range strings.Split(filepath.ToSlash(path), "/") {
+		if pciAddrPattern.MatchString(part) {
+			last = part
+		}
+	}
+	return last
 }
 
 type blockInfo struct {
@@ -190,7 +313,11 @@ func (m *Manager) collectStorage(forceSMART bool) StorageStatus {
 	if topologyErr != nil {
 		status.LastError = combineError(status.LastError, topologyErr)
 	}
+	overrides := m.discoverSlotBusPaths()
 	for _, spec := range storageSlotSpecs {
+		if base, ok := overrides[spec.ID]; ok {
+			spec.BusPath = base
+		}
 		slot := StorageSlot{
 			ID: spec.ID, Kind: spec.Kind, Slot: spec.Slot,
 			State: StorageEmpty, BusPath: spec.BusPath,

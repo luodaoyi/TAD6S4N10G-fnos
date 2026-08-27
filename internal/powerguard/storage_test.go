@@ -240,3 +240,107 @@ func containsString(values []string, want string) bool {
 	}
 	return false
 }
+
+func TestLastPCIComponentPicksDeepestController(t *testing.T) {
+	cases := map[string]string{
+		"/sys/devices/pci0000:00/0000:00:13.0/0000:02:00.0/ata1/ata_port/ata1": "0000:02:00.0",
+		"/sys/devices/pci0000:00/0000:00:1c.4/0000:01:00.0/0000:02:00.0/nvme/nvme0": "0000:02:00.0",
+		"/sys/devices/platform/soc/ata_port/ata3": "",
+	}
+	for path, want := range cases {
+		if got := lastPCIComponent(path); got != want {
+			t.Fatalf("lastPCIComponent(%q) = %q, want %q", path, got, want)
+		}
+	}
+}
+
+func TestBestSATAControllerPrefersMostPorts(t *testing.T) {
+	ports := map[int]string{
+		1: "0000:02:00.0", 2: "0000:02:00.0", 3: "0000:02:00.0",
+		4: "0000:02:00.0", 5: "0000:02:00.0", 6: "0000:02:00.0",
+		7: "0000:05:00.0", 8: "0000:03:00.0", 9: "0000:03:00.0",
+	}
+	controller, numbers := bestSATAController(ports)
+	if controller != "0000:02:00.0" {
+		t.Fatalf("controller = %q, want 0000:02:00.0", controller)
+	}
+	want := []int{1, 2, 3, 4, 5, 6}
+	if len(numbers) != len(want) {
+		t.Fatalf("ports = %v, want %v", numbers, want)
+	}
+	for index := range want {
+		if numbers[index] != want[index] {
+			t.Fatalf("ports[%d] = %d, want %d", index, numbers[index], want[index])
+		}
+	}
+}
+
+func TestBestSATAControllerBreaksTiesByLowestAddress(t *testing.T) {
+	controller, _ := bestSATAController(map[int]string{1: "0000:04:00.0", 2: "0000:03:00.0"})
+	if controller != "0000:03:00.0" {
+		t.Fatalf("controller = %q, want lowest address 0000:03:00.0", controller)
+	}
+}
+
+func TestOrderedUniqueStringsSortsAndDeduplicates(t *testing.T) {
+	got := orderedUniqueStrings([]string{"0000:06:00.0", "0000:03:00.0", "0000:06:00.0", "0000:05:00.0"})
+	want := []string{"0000:03:00.0", "0000:05:00.0", "0000:06:00.0"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for index := range want {
+		if got[index] != want[index] {
+			t.Fatalf("got[%d] = %q, want %q", index, got[index], want[index])
+		}
+	}
+}
+
+func TestDiscoverSlotBusPathsFallsBackWithoutSysfs(t *testing.T) {
+	manager := &Manager{Root: t.TempDir()}
+	overrides := manager.discoverSlotBusPaths()
+	if len(overrides) != 0 {
+		t.Fatalf("expected empty overrides without sysfs tree, got %v", overrides)
+	}
+}
+
+func TestDiscoverSlotBusPathsMapsPortsAndControllers(t *testing.T) {
+	root := t.TempDir()
+	sataDir := filepath.Join(root, "sys", "class", "ata_port")
+	nvmeDir := filepath.Join(root, "sys", "class", "nvme")
+	for _, dir := range []string{sataDir, nvmeDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	targets := []struct{ linkDir, linkName, target string }{
+		{sataDir, "ata1", "../devices/pci0000:00/0000:00:13.0/0000:01:00.0/ata1"},
+		{sataDir, "ata2", "../devices/pci0000:00/0000:00:13.0/0000:01:00.0/ata2"},
+		{nvmeDir, "nvme0", "../devices/pci0000:00/0000:00:1c.0/0000:03:00.0/nvme"},
+		{nvmeDir, "nvme1", "../devices/pci0000:00/0000:00:1c.1/0000:04:00.0/nvme"},
+	}
+	for _, item := range targets {
+		if err := os.MkdirAll(filepath.Join(item.linkDir, item.target), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(item.target, filepath.Join(item.linkDir, item.linkName)); err != nil {
+			t.Skipf("cannot create symlinks on this platform: %v", err)
+		}
+	}
+	manager := &Manager{Root: root}
+	overrides := manager.discoverSlotBusPaths()
+	if got := overrides["front-1"]; got != "/dev/disk/by-path/pci-0000:01:00.0-ata-1" {
+		t.Fatalf("front-1 = %q", got)
+	}
+	if got := overrides["front-2"]; got != "/dev/disk/by-path/pci-0000:01:00.0-ata-2" {
+		t.Fatalf("front-2 = %q", got)
+	}
+	if _, ok := overrides["front-3"]; ok {
+		t.Fatal("front-3 should stay unresolved with only two ports registered")
+	}
+	if got := overrides["m2-1"]; got != "/dev/disk/by-path/pci-0000:03:00.0-nvme-" {
+		t.Fatalf("m2-1 = %q", got)
+	}
+	if got := overrides["m2-2"]; got != "/dev/disk/by-path/pci-0000:04:00.0-nvme-" {
+		t.Fatalf("m2-2 = %q", got)
+	}
+}
