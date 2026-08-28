@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -59,25 +60,38 @@ type StorageStatus struct {
 }
 
 type storageSlotSpec struct {
-	ID      string
-	Kind    string
-	Slot    int
-	BusPath string
-	Prefix  bool
+	ID             string
+	Kind           string
+	Slot           int
+	BusPath        string
+	Prefix         bool
+	MappingKnown   bool
+	MissingUnknown bool
+	Warning        string
 }
 
 var storageSlotSpecs = []storageSlotSpec{
-	{ID: "front-1", Kind: "front", Slot: 1, BusPath: "/dev/disk/by-path/pci-0000:02:00.0-ata-1"},
-	{ID: "front-2", Kind: "front", Slot: 2, BusPath: "/dev/disk/by-path/pci-0000:02:00.0-ata-2"},
-	{ID: "front-3", Kind: "front", Slot: 3, BusPath: "/dev/disk/by-path/pci-0000:02:00.0-ata-3"},
-	{ID: "front-4", Kind: "front", Slot: 4, BusPath: "/dev/disk/by-path/pci-0000:02:00.0-ata-4"},
-	{ID: "front-5", Kind: "front", Slot: 5, BusPath: "/dev/disk/by-path/pci-0000:02:00.0-ata-5"},
-	{ID: "front-6", Kind: "front", Slot: 6, BusPath: "/dev/disk/by-path/pci-0000:02:00.0-ata-6"},
-	{ID: "m2-1", Kind: "m2", Slot: 1, BusPath: "/dev/disk/by-path/pci-0000:04:00.0-nvme-", Prefix: true},
-	{ID: "m2-2", Kind: "m2", Slot: 2, BusPath: "/dev/disk/by-path/pci-0000:05:00.0-nvme-", Prefix: true},
-	{ID: "m2-3", Kind: "m2", Slot: 3, BusPath: "/dev/disk/by-path/pci-0000:06:00.0-nvme-", Prefix: true},
-	{ID: "m2-4", Kind: "m2", Slot: 4, BusPath: "/dev/disk/by-path/pci-0000:07:00.0-nvme-", Prefix: true},
+	{ID: "front-1", Kind: "front", Slot: 1},
+	{ID: "front-2", Kind: "front", Slot: 2},
+	{ID: "front-3", Kind: "front", Slot: 3},
+	{ID: "front-4", Kind: "front", Slot: 4},
+	{ID: "front-5", Kind: "front", Slot: 5},
+	{ID: "front-6", Kind: "front", Slot: 6},
+	{ID: "m2-1", Kind: "m2", Slot: 1},
+	{ID: "m2-2", Kind: "m2", Slot: 2},
+	{ID: "m2-3", Kind: "m2", Slot: 3},
+	{ID: "m2-4", Kind: "m2", Slot: 4},
 }
+
+type storagePCIDevice struct {
+	BDF      string
+	Vendor   string
+	Device   string
+	Class    string
+	Topology string
+}
+
+var pciBDFPattern = regexp.MustCompile(`^[[:xdigit:]]{4}:[[:xdigit:]]{2}:[[:xdigit:]]{2}\.[0-7]$`)
 
 type blockInfo struct {
 	KName     string
@@ -190,13 +204,33 @@ func (m *Manager) collectStorage(forceSMART bool) StorageStatus {
 	if topologyErr != nil {
 		status.LastError = combineError(status.LastError, topologyErr)
 	}
-	for _, spec := range storageSlotSpecs {
+	runtimeSpecs, mappingErr := m.discoverStorageSlotSpecs()
+	if mappingErr != nil {
+		status.LastError = combineError(status.LastError, mappingErr)
+	}
+	for _, spec := range runtimeSpecs {
 		slot := StorageSlot{
 			ID: spec.ID, Kind: spec.Kind, Slot: spec.Slot,
 			State: StorageEmpty, BusPath: spec.BusPath,
 		}
+		if !spec.MappingKnown {
+			slot.State = StorageUnknown
+			slot.Warning = spec.Warning
+			status.LastError = combineError(status.LastError, fmt.Errorf("%s: %s", spec.ID, spec.Warning))
+			status.Slots = append(status.Slots, slot)
+			continue
+		}
+		if spec.BusPath == "" {
+			status.Slots = append(status.Slots, slot)
+			continue
+		}
 		device, kname, err := m.resolveStorageDevice(spec)
 		if errors.Is(err, fs.ErrNotExist) {
+			if spec.MissingUnknown {
+				slot.State = StorageUnknown
+				slot.Warning = spec.Warning
+				status.LastError = combineError(status.LastError, fmt.Errorf("%s: %s", spec.ID, spec.Warning))
+			}
 			status.Slots = append(status.Slots, slot)
 			continue
 		}
@@ -270,6 +304,150 @@ func (m *Manager) collectStorage(forceSMART bool) StorageStatus {
 		}
 	}
 	return status
+}
+
+func (m *Manager) discoverStorageSlotSpecs() ([]storageSlotSpec, error) {
+	devices, err := m.readStoragePCIDevices()
+	if err != nil {
+		specs := cloneStorageSlotSpecs()
+		for index := range specs {
+			specs[index].Warning = "无法读取 PCI 拓扑，不能确定物理仓位"
+		}
+		return specs, fmt.Errorf("读取 PCI 拓扑: %w", err)
+	}
+	return mapStorageSlotSpecs(devices), nil
+}
+
+func cloneStorageSlotSpecs() []storageSlotSpec {
+	return append([]storageSlotSpec(nil), storageSlotSpecs...)
+}
+
+func mapStorageSlotSpecs(devices []storagePCIDevice) []storageSlotSpec {
+	specs := cloneStorageSlotSpecs()
+
+	// The board routes M.2 1..4 through the stable 00:1d.0..3 root ports.
+	// Leaf BDFs are assigned after PCI enumeration and can move with the mlx5 card.
+	var asmControllers []storagePCIDevice
+	var intelSATA *storagePCIDevice
+	rootPorts := make(map[int]bool)
+	nvmeBySlot := make(map[int][]storagePCIDevice)
+	for index := range devices {
+		device := &devices[index]
+		if pciID(device.Vendor) == "1b21" && pciID(device.Device) == "1166" && pciClass(device.Class) == "0106" {
+			asmControllers = append(asmControllers, *device)
+		}
+		if pciID(device.Vendor) == "8086" && pciClass(device.Class) == "0106" && strings.HasSuffix(strings.ToLower(device.BDF), ":00:17.0") {
+			intelSATA = device
+		}
+		if slot, ok := tadM2RootSlot(device.BDF); ok && pciClass(device.Class) == "0604" {
+			rootPorts[slot] = true
+		}
+		if pciClass(device.Class) == "0108" {
+			if slot, ok := tadM2SlotFromTopology(device.Topology); ok {
+				nvmeBySlot[slot] = append(nvmeBySlot[slot], *device)
+			}
+		}
+	}
+
+	for index := 0; index < 6; index++ {
+		spec := &specs[index]
+		switch len(asmControllers) {
+		case 1:
+			spec.MappingKnown = true
+			spec.BusPath = fmt.Sprintf("/dev/disk/by-path/pci-%s-ata-%d", strings.ToLower(asmControllers[0].BDF), spec.Slot)
+		case 0:
+			spec.Warning = "未识别到 ASM1166 SATA 控制器，不能确定前置仓位"
+		default:
+			spec.Warning = "检测到多个 ASM1166 SATA 控制器，不能确定前置仓位"
+		}
+	}
+
+	for slot := 1; slot <= 4; slot++ {
+		spec := &specs[5+slot]
+		controllers := nvmeBySlot[slot]
+		switch len(controllers) {
+		case 1:
+			spec.MappingKnown = true
+			spec.MissingUnknown = true
+			spec.Prefix = true
+			spec.BusPath = "/dev/disk/by-path/pci-" + strings.ToLower(controllers[0].BDF) + "-nvme-"
+			spec.Warning = "已识别 NVMe 控制器，但没有找到对应块设备路径"
+		case 0:
+			if slot >= 3 && intelSATA != nil {
+				spec.MappingKnown = true
+				spec.BusPath = fmt.Sprintf("/dev/disk/by-path/pci-%s-ata-%d", strings.ToLower(intelSATA.BDF), slot-2)
+			} else if rootPorts[slot] {
+				spec.MappingKnown = true
+			} else {
+				spec.Warning = fmt.Sprintf("未识别到 M.2 %d 的 PCIe 根端口，不能确定仓位", slot)
+			}
+		default:
+			spec.Warning = fmt.Sprintf("M.2 %d 根端口下检测到多个 NVMe 控制器，不能确定仓位", slot)
+		}
+	}
+	return specs
+}
+
+func (m *Manager) readStoragePCIDevices() ([]storagePCIDevice, error) {
+	base := m.rooted("/sys/bus/pci/devices")
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		return nil, err
+	}
+	devices := make([]storagePCIDevice, 0, len(entries))
+	for _, entry := range entries {
+		bdf := strings.ToLower(entry.Name())
+		if !pciBDFPattern.MatchString(bdf) {
+			continue
+		}
+		path := filepath.Join(base, entry.Name())
+		vendor, _ := readTrim(filepath.Join(path, "vendor"))
+		deviceID, _ := readTrim(filepath.Join(path, "device"))
+		class, _ := readTrim(filepath.Join(path, "class"))
+		topology, resolveErr := filepath.EvalSymlinks(path)
+		if resolveErr != nil {
+			topology = path
+		}
+		devices = append(devices, storagePCIDevice{
+			BDF: bdf, Vendor: vendor, Device: deviceID, Class: class,
+			Topology: filepath.ToSlash(topology),
+		})
+	}
+	return devices, nil
+}
+
+func pciID(value string) string {
+	return strings.TrimPrefix(strings.ToLower(strings.TrimSpace(value)), "0x")
+}
+
+func pciClass(value string) string {
+	value = pciID(value)
+	if len(value) < 4 {
+		return value
+	}
+	return value[:4]
+}
+
+func tadM2RootSlot(bdf string) (int, bool) {
+	bdf = strings.ToLower(strings.TrimSpace(bdf))
+	for index := 0; index < 4; index++ {
+		if strings.HasSuffix(bdf, fmt.Sprintf(":00:1d.%d", index)) {
+			return index + 1, true
+		}
+	}
+	return 0, false
+}
+
+func tadM2SlotFromTopology(topology string) (int, bool) {
+	parts := strings.FieldsFunc(strings.ToLower(filepath.ToSlash(topology)), func(r rune) bool {
+		return r == '/'
+	})
+	for _, part := range parts {
+		if slot, ok := tadM2RootSlot(part); ok {
+			return slot, true
+		}
+	}
+	return 0, false
 }
 
 func (m *Manager) resolveStorageDevice(spec storageSlotSpec) (string, string, error) {

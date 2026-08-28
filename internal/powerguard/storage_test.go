@@ -8,21 +8,102 @@ import (
 	"time"
 )
 
-func TestStorageSlotMappingMatchesTAD6S4N10G(t *testing.T) {
+func TestStorageSlotTemplatesKeepTenLogicalSlots(t *testing.T) {
 	if len(storageSlotSpecs) != 10 {
 		t.Fatalf("got %d slots, want 10", len(storageSlotSpecs))
 	}
-	if storageSlotSpecs[0].ID != "front-1" || storageSlotSpecs[0].BusPath != "/dev/disk/by-path/pci-0000:02:00.0-ata-1" {
-		t.Fatalf("unexpected front slot 1 mapping: %+v", storageSlotSpecs[0])
+	if storageSlotSpecs[0].ID != "front-1" || storageSlotSpecs[5].ID != "front-6" {
+		t.Fatalf("unexpected front slot templates: %+v", storageSlotSpecs[:6])
 	}
-	if storageSlotSpecs[5].ID != "front-6" || storageSlotSpecs[5].BusPath != "/dev/disk/by-path/pci-0000:02:00.0-ata-6" {
-		t.Fatalf("unexpected front slot 6 mapping: %+v", storageSlotSpecs[5])
+	if storageSlotSpecs[6].ID != "m2-1" || storageSlotSpecs[9].ID != "m2-4" {
+		t.Fatalf("unexpected M.2 slot templates: %+v", storageSlotSpecs[6:])
 	}
-	if storageSlotSpecs[6].ID != "m2-1" || storageSlotSpecs[6].BusPath != "/dev/disk/by-path/pci-0000:04:00.0-nvme-" {
-		t.Fatalf("unexpected M.2 slot 1 mapping: %+v", storageSlotSpecs[6])
+}
+
+func tadStorageFixture(asmBDF string, nvmeBDFs []string) []storagePCIDevice {
+	devices := []storagePCIDevice{
+		{BDF: asmBDF, Vendor: "0x1b21", Device: "0x1166", Class: "0x010601"},
+		{BDF: "0000:00:1d.0", Vendor: "0x8086", Class: "0x060400"},
+		{BDF: "0000:00:1d.1", Vendor: "0x8086", Class: "0x060400"},
+		{BDF: "0000:00:1d.2", Vendor: "0x8086", Class: "0x060400"},
+		{BDF: "0000:00:1d.3", Vendor: "0x8086", Class: "0x060400"},
 	}
-	if storageSlotSpecs[9].ID != "m2-4" || storageSlotSpecs[9].BusPath != "/dev/disk/by-path/pci-0000:07:00.0-nvme-" {
-		t.Fatalf("unexpected M.2 slot 4 mapping: %+v", storageSlotSpecs[9])
+	for index, bdf := range nvmeBDFs {
+		devices = append(devices, storagePCIDevice{
+			BDF: bdf, Class: "0x010802",
+			Topology: "/sys/devices/pci0000:00/0000:00:1d." + string(rune('0'+index)) + "/" + bdf,
+		})
+	}
+	return devices
+}
+
+func TestStorageMappingSurvivesLeafBDFRenumbering(t *testing.T) {
+	withMellanox := mapStorageSlotSpecs(tadStorageFixture("0000:02:00.0", []string{
+		"0000:04:00.0", "0000:05:00.0", "0000:06:00.0", "0000:07:00.0",
+	}))
+	withoutMellanox := mapStorageSlotSpecs(tadStorageFixture("0000:01:00.0", []string{
+		"0000:03:00.0", "0000:04:00.0", "0000:05:00.0", "0000:06:00.0",
+	}))
+
+	if len(withMellanox) != 10 || len(withoutMellanox) != 10 {
+		t.Fatalf("slot count changed: with=%d without=%d", len(withMellanox), len(withoutMellanox))
+	}
+	if withMellanox[0].BusPath != "/dev/disk/by-path/pci-0000:02:00.0-ata-1" ||
+		withoutMellanox[0].BusPath != "/dev/disk/by-path/pci-0000:01:00.0-ata-1" {
+		t.Fatalf("ASM1166 BDF was not discovered dynamically: with=%+v without=%+v", withMellanox[0], withoutMellanox[0])
+	}
+	for index := 6; index < 10; index++ {
+		if withMellanox[index].ID != withoutMellanox[index].ID ||
+			!withMellanox[index].MappingKnown || !withoutMellanox[index].MappingKnown {
+			t.Fatalf("logical M.2 mapping changed at %d: with=%+v without=%+v", index, withMellanox[index], withoutMellanox[index])
+		}
+	}
+	if withMellanox[6].BusPath != "/dev/disk/by-path/pci-0000:04:00.0-nvme-" ||
+		withoutMellanox[6].BusPath != "/dev/disk/by-path/pci-0000:03:00.0-nvme-" {
+		t.Fatalf("M.2 slot 1 did not follow root port 00:1d.0: with=%+v without=%+v", withMellanox[6], withoutMellanox[6])
+	}
+}
+
+func TestStorageMappingSupportsM2SATAAndPrefersNVMe(t *testing.T) {
+	devices := tadStorageFixture("0000:02:00.0", []string{"0000:04:00.0", "0000:05:00.0", "0000:06:00.0"})
+	devices = append(devices, storagePCIDevice{
+		BDF: "0000:00:17.0", Vendor: "0x8086", Device: "0x54d3", Class: "0x010601",
+	})
+	specs := mapStorageSlotSpecs(devices)
+
+	if specs[8].BusPath != "/dev/disk/by-path/pci-0000:06:00.0-nvme-" || !specs[8].Prefix {
+		t.Fatalf("NVMe must take priority for M.2 3: %+v", specs[8])
+	}
+	if specs[9].BusPath != "/dev/disk/by-path/pci-0000:00:17.0-ata-2" || specs[9].Prefix {
+		t.Fatalf("M.2 4 SATA mapping is wrong: %+v", specs[9])
+	}
+}
+
+func TestStorageMappingMarksUndeterminedSlotsUnknown(t *testing.T) {
+	specs := mapStorageSlotSpecs(nil)
+	if len(specs) != 10 {
+		t.Fatalf("got %d slots, want 10", len(specs))
+	}
+	for _, spec := range specs {
+		if spec.MappingKnown || spec.Warning == "" {
+			t.Fatalf("undetermined slot must carry a warning: %+v", spec)
+		}
+	}
+}
+
+func TestCollectStorageDoesNotReportUnknownTopologyAsEmpty(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "dev", "disk", "by-path"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	status := (&Manager{Root: root}).collectStorage(false)
+	if len(status.Slots) != 10 {
+		t.Fatalf("got %d slots, want 10", len(status.Slots))
+	}
+	for _, slot := range status.Slots {
+		if slot.State != StorageUnknown || slot.Warning == "" {
+			t.Fatalf("unknown topology was reported as a physical state: %+v", slot)
+		}
 	}
 }
 
