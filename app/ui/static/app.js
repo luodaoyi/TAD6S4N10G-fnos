@@ -1138,23 +1138,47 @@ function svgElement(name, attributes = {}, text = '') {
   return element;
 }
 
+const CURVE_VIEWBOX = { width: 640, height: 260 };
+const CURVE_TEXT_PX = 12;
+
+function curveChartScale(svg) {
+  const width = svg?.clientWidth || 0;
+  const height = svg?.clientHeight || 0;
+  if (!width || !height) return 1;
+  return Math.max(0.25, Math.min(width / CURVE_VIEWBOX.width, height / CURVE_VIEWBOX.height));
+}
+
+function updateCurveChartTextScale(svg) {
+  if (!svg) return;
+  const scale = curveChartScale(svg);
+  const fontSize = CURVE_TEXT_PX / scale;
+  svg.querySelectorAll('text').forEach((text) => text.setAttribute('font-size', fontSize));
+  svg.querySelectorAll('.curve-node-label').forEach((label) => {
+    // CSS class sets a presentation default; inline user-unit style wins and
+    // keeps the halo at a steady visual width as the SVG is resized.
+    label.style.strokeWidth = `${4 / scale}`;
+  });
+}
+
 function renderFanChart(kind = 'cpu') {
   const editor = curveEditors[kind];
   const svg = $(editor.chartID);
   const curve = curveFromInputs(kind);
   if (curve.some((point) => !Number.isFinite(point.temp_c) || !Number.isFinite(point.pwm_percent))) return;
   const { left, right, top, bottom } = CHART;
+  const chartScale = curveChartScale(svg);
+  const textSize = CURVE_TEXT_PX / chartScale;
   const x = (temp) => left + ((clamp(temp, 20, 100) - 20) / 80) * (right - left);
   const y = (speed) => bottom - ((clamp(speed, 30, 100) - 30) / 70) * (bottom - top);
   svg.replaceChildren();
 
   [20, 40, 60, 80, 100].forEach((temp) => {
     svg.append(svgElement('line', { x1: x(temp), y1: top, x2: x(temp), y2: bottom, stroke: 'rgba(72,82,102,.12)' }));
-    svg.append(svgElement('text', { x: x(temp), y: 246, fill: '#7b8290', 'font-size': 12, 'text-anchor': 'middle' }, `${temp}°`));
+    svg.append(svgElement('text', { x: x(temp), y: CURVE_VIEWBOX.height - 14 / chartScale, fill: '#7b8290', 'font-size': textSize, 'text-anchor': 'middle' }, `${temp}°`));
   });
   [30, 50, 70, 100].forEach((speed) => {
     svg.append(svgElement('line', { x1: left, y1: y(speed), x2: right, y2: y(speed), stroke: 'rgba(72,82,102,.12)' }));
-    svg.append(svgElement('text', { x: 42, y: y(speed) + 4, fill: '#7b8290', 'font-size': 12, 'text-anchor': 'end' }, `${speed}%`));
+    svg.append(svgElement('text', { x: left - 8 / chartScale, y: y(speed) + textSize * 0.35, fill: '#7b8290', 'font-size': textSize, 'text-anchor': 'end' }, `${speed}%`));
   });
   svg.append(svgElement('polyline', {
     points: curve.map((point) => `${x(point.temp_c)},${y(point.pwm_percent)}`).join(' '),
@@ -1168,9 +1192,10 @@ function renderFanChart(kind = 'cpu') {
   const actualTemp = Number(actualTemperatures[kind]);
   if (Number.isFinite(actualTemp) && actualTemp > 0) {
     const currentLabel = `当前 ${actualTemp.toFixed(1)}°C`;
-    const currentX = clamp(x(actualTemp), 72, 568);
+    const currentLabelWidth = Math.max(72 / chartScale, currentLabel.length * textSize * 0.6);
+    const currentX = clamp(x(actualTemp), currentLabelWidth / 2 + 4 / chartScale, CURVE_VIEWBOX.width - currentLabelWidth / 2 - 4 / chartScale);
     svg.append(svgElement('line', { x1: x(actualTemp), y1: top, x2: x(actualTemp), y2: bottom, stroke: '#e89b24', 'stroke-width': 2, 'stroke-dasharray': '6 5' }));
-    svg.append(svgElement('text', { x: currentX, y: 16, fill: '#b96f00', 'font-size': 12, 'text-anchor': 'middle' }, currentLabel));
+    svg.append(svgElement('text', { x: currentX, y: textSize + 4 / chartScale, fill: '#b96f00', 'font-size': textSize, 'text-anchor': 'middle' }, currentLabel));
   }
   curve.forEach((point, index) => {
     const selected = index === editor.selectedIndex;
@@ -1191,14 +1216,15 @@ function renderFanChart(kind = 'cpu') {
     });
     svg.append(node);
     const label = `${point.temp_c}° · ${point.pwm_percent}%`;
-    const labelWidth = Math.max(72, label.length * 6.4);
-    const labelX = clamp(nodeX, 8 + labelWidth / 2, 632 - labelWidth / 2);
-    const labelY = nodeY < 50 ? nodeY + 26 : nodeY - 16;
+    const labelWidth = Math.max(72 / chartScale, label.length * textSize * 0.6);
+    const labelX = clamp(nodeX, 8 / chartScale + labelWidth / 2, CURVE_VIEWBOX.width - 8 / chartScale - labelWidth / 2);
+    const labelY = nodeY < 50 / chartScale ? nodeY + 26 / chartScale : nodeY - 16 / chartScale;
     svg.append(svgElement('text', {
       x: labelX, y: labelY, fill: selected ? editor.color : '#596273',
       'font-size': 12, 'font-weight': selected ? 800 : 600, 'text-anchor': 'middle', class: 'curve-node-label',
     }, label));
   });
+  updateCurveChartTextScale(svg);
   updateCurveControls(kind);
 }
 
@@ -1739,6 +1765,18 @@ function setupCurveEditor(kind) {
   $(editor.removeID).addEventListener('click', () => removeSelectedCurvePoint(kind));
 }
 CURVE_KINDS.forEach(setupCurveEditor);
+function setupCurveChartScaling() {
+  const charts = CURVE_KINDS.map((kind) => $(curveEditors[kind].chartID)).filter(Boolean);
+  const update = () => CURVE_KINDS.forEach((kind) => renderFanChart(kind));
+  if (typeof ResizeObserver === 'function') {
+    const observer = new ResizeObserver(update);
+    charts.forEach((chart) => observer.observe(chart));
+  } else {
+    window.addEventListener('resize', update, { passive: true });
+  }
+  update();
+}
+setupCurveChartScaling();
 $('fan-min').addEventListener('input', () => {
   if ($('fan-min').value !== '') CURVE_KINDS.forEach(normalizeCurveToControls);
 });
