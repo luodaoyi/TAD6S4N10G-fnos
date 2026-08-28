@@ -200,28 +200,28 @@
             <div class="panel-heading gpio-heading">
               <div>
                 <h2 id="gpio-heading">机箱按键映射</h2>
-                <p>固定读取主板 GPIO：复制键 0xA04/bit6、网络键 0xA00/bit3、后置重置键 0xA03/bit6；每种按压时长可独立绑定内置动作或自定义 Bash 脚本。</p>
+                <p>固定读取主板 GPIO：复制键 0xA04/bit6、网络键 0xA00/bit3、后置重置键 0xA03/bit6；长按 3/9/15 秒可独立绑定内置动作或自定义 Bash 脚本。</p>
               </div>
               <label class="toggle"><input id="gpio-enabled" type="checkbox"><span></span>启用按键映射</label>
             </div>
             <div class="table-scroll">
               <table class="status-table gpio-table">
-                <thead><tr><th>按键</th><th>短按</th><th>长按 3 秒</th><th>长按 9 秒</th><th>长按 15 秒</th></tr></thead>
+                <thead><tr><th>按键</th><th>长按 3 秒</th><th>长按 9 秒</th><th>长按 15 秒</th></tr></thead>
                 <tbody>
-                  <tr data-button="copy"><th data-label="按键"><span class="button-name"><img src="images/panel/复制按键.svg" alt="">复制按键</span></th><td data-label="短按"><select class="gpio-action" data-stage="short"></select></td><td data-label="长按 3 秒"><select class="gpio-action" data-stage="hold_3s"></select></td><td data-label="长按 9 秒"><select class="gpio-action" data-stage="hold_9s"></select></td><td data-label="长按 15 秒"><select class="gpio-action" data-stage="hold_15s"></select></td></tr>
-                  <tr data-button="network"><th data-label="按键"><span class="button-name"><img src="images/panel/网络按键.svg" alt="">网络按键</span></th><td data-label="短按"><select class="gpio-action" data-stage="short"></select></td><td data-label="长按 3 秒"><select class="gpio-action" data-stage="hold_3s"></select></td><td data-label="长按 9 秒"><select class="gpio-action" data-stage="hold_9s"></select></td><td data-label="长按 15 秒"><select class="gpio-action" data-stage="hold_15s"></select></td></tr>
-                  <tr data-button="rear_reset"><th data-label="按键"><span class="button-name"><img src="images/panel/RESET按键.svg" alt="">后置重置按键</span></th><td data-label="短按"><select class="gpio-action" data-stage="short"></select></td><td data-label="长按 3 秒"><select class="gpio-action" data-stage="hold_3s"></select></td><td data-label="长按 9 秒"><select class="gpio-action" data-stage="hold_9s"></select></td><td data-label="长按 15 秒"><select class="gpio-action" data-stage="hold_15s"></select></td></tr>
+                  <tr data-button="copy"><th data-label="按键"><span class="button-name"><img src="images/panel/复制按键.svg" alt="">复制按键</span></th><td data-label="长按 3 秒"><select class="gpio-action" data-stage="hold_3s"></select></td><td data-label="长按 9 秒"><select class="gpio-action" data-stage="hold_9s"></select></td><td data-label="长按 15 秒"><select class="gpio-action" data-stage="hold_15s"></select></td></tr>
+                  <tr data-button="network"><th data-label="按键"><span class="button-name"><img src="images/panel/网络按键.svg" alt="">网络按键</span></th><td data-label="长按 3 秒"><select class="gpio-action" data-stage="hold_3s"></select></td><td data-label="长按 9 秒"><select class="gpio-action" data-stage="hold_9s"></select></td><td data-label="长按 15 秒"><select class="gpio-action" data-stage="hold_15s"></select></td></tr>
+                  <tr data-button="rear_reset"><th data-label="按键"><span class="button-name"><img src="images/panel/RESET按键.svg" alt="">后置重置按键</span></th><td data-label="长按 3 秒"><select class="gpio-action" data-stage="hold_3s"></select></td><td data-label="长按 9 秒"><select class="gpio-action" data-stage="hold_9s"></select></td><td data-label="长按 15 秒"><select class="gpio-action" data-stage="hold_15s"></select></td></tr>
                 </tbody>
               </table>
             </div>
             <p id="gpio-status" class="inline-status">按键映射默认关闭。</p>
-            <p class="notice">按键动作在松开时触发；自定义脚本由插件服务以 root 运行，单次最长 30 秒并限制日志输出。请只保存你完全信任的脚本。</p>
+            <p class="notice">短按不会触发动作；达到长按阈值时会尝试蜂鸣并闪灯确认，松开后执行对应动作。自定义脚本由插件服务以 root 运行，单次最长 30 秒并限制日志输出。请只保存你完全信任的脚本。</p>
           </section>
           <section class="card gpio-scripts-panel" aria-labelledby="gpio-scripts-heading">
             <div class="panel-heading">
               <div>
                 <h2 id="gpio-scripts-heading">Shell 脚本管理</h2>
-                <p>新增或编辑 Bash 脚本后，再到上方短按/长按下拉框选择对应脚本；最后点击“保存按钮控制”统一持久化。</p>
+                <p>新增或编辑 Bash 脚本后，再到上方长按下拉框选择对应脚本；最后点击“保存按钮控制”统一持久化。</p>
               </div>
               <button id="gpio-script-add" type="button" class="primary">+ 新增脚本</button>
             </div>

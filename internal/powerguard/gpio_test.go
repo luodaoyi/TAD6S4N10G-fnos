@@ -44,18 +44,40 @@ func TestDefaultGPIOConfigIsDisabledAndSafe(t *testing.T) {
 	}
 }
 
+func TestNormalizeConfigClearsLegacyShortActions(t *testing.T) {
+	config := DefaultConfig(profiles[1])
+	config.GPIO.Buttons[0].Actions.Short = GPIOActionLog
+	if !normalizeConfig(&config) {
+		t.Fatal("legacy short action did not trigger config migration")
+	}
+	if config.GPIO.Buttons[0].Actions.Short != GPIOActionNone {
+		t.Fatalf("legacy short action was preserved: %+v", config.GPIO.Buttons[0])
+	}
+}
+
 func TestGPIOValidationRejectsUnknownAction(t *testing.T) {
 	config := DefaultGPIOConfig()
-	config.Buttons[0].Actions.Short = "shell_command"
+	config.Buttons[0].Actions.Hold3S = "shell_command"
 	if err := validateGPIOConfig(config); err == nil {
 		t.Fatal("unknown GPIO action was accepted")
+	}
+}
+
+func TestGPIOValidationPreservesLegacyShortActionWithoutExecutingIt(t *testing.T) {
+	config := DefaultGPIOConfig()
+	config.Buttons[0].Actions.Short = "legacy_unsupported_action"
+	if err := validateGPIOConfig(config); err != nil {
+		t.Fatalf("legacy short action was rejected: %v", err)
+	}
+	if stage, action := gpioActionForDuration(config.Buttons[0].Actions, 2*time.Second); stage != "" || action != GPIOActionNone {
+		t.Fatalf("short action is executable: stage=%q action=%q", stage, action)
 	}
 }
 
 func TestGPIOValidationAcceptsScriptBinding(t *testing.T) {
 	config := DefaultGPIOConfig()
 	config.Scripts = []GPIOScript{{ID: "backup-1", Name: "备份脚本", Body: "printf 'ok'\n"}}
-	config.Buttons[0].Actions.Short = GPIOActionScriptPrefix + "backup-1"
+	config.Buttons[0].Actions.Hold3S = GPIOActionScriptPrefix + "backup-1"
 	if err := validateGPIOConfig(config); err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +92,7 @@ func TestGPIOValidationRejectsInvalidScripts(t *testing.T) {
 		{"path id", func(config *GPIOConfig) { config.Scripts[0].ID = "../bad" }},
 		{"empty name", func(config *GPIOConfig) { config.Scripts[0].Name = "  " }},
 		{"empty body", func(config *GPIOConfig) { config.Scripts[0].Body = "\n" }},
-		{"missing binding", func(config *GPIOConfig) { config.Buttons[0].Actions.Short = GPIOActionScriptPrefix + "missing" }},
+		{"missing binding", func(config *GPIOConfig) { config.Buttons[0].Actions.Hold3S = GPIOActionScriptPrefix + "missing" }},
 		{"duplicate id", func(config *GPIOConfig) { config.Scripts = append(config.Scripts, config.Scripts[0]) }},
 		{"duplicate name", func(config *GPIOConfig) {
 			config.Scripts = append(config.Scripts, GPIOScript{ID: "script-2", Name: " 测试脚本 ", Body: "true\n"})
@@ -87,7 +109,7 @@ func TestGPIOValidationRejectsInvalidScripts(t *testing.T) {
 	}
 }
 
-func TestGPIOPollDebouncesAndClassifiesRelease(t *testing.T) {
+func TestGPIOPollIgnoresShortPress(t *testing.T) {
 	config := DefaultGPIOConfig()
 	config.Enabled = true
 	config.Buttons[0].Actions.Short = GPIOActionLog
@@ -111,8 +133,8 @@ func TestGPIOPollDebouncesAndClassifiesRelease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(events) != 1 || events[0].ButtonID != "copy" || events[0].Stage != "短按" || events[0].Action != GPIOActionLog {
-		t.Fatalf("unexpected GPIO events: %+v", events)
+	if len(events) != 0 {
+		t.Fatalf("short press produced GPIO events: %+v", events)
 	}
 }
 
@@ -122,7 +144,7 @@ func TestGPIOActionThresholds(t *testing.T) {
 		duration time.Duration
 		want     string
 	}{
-		{2 * time.Second, "s"}, {3 * time.Second, "3"},
+		{2 * time.Second, GPIOActionNone}, {3 * time.Second, "3"},
 		{9 * time.Second, "9"}, {15 * time.Second, "15"},
 	} {
 		_, got := gpioActionForDuration(actions, test.duration)
@@ -132,11 +154,11 @@ func TestGPIOActionThresholds(t *testing.T) {
 	}
 }
 
-func TestGPIOPollResolvesBoundScript(t *testing.T) {
+func TestGPIOPollConfirmsThresholdOnceAndResolvesBoundScriptOnRelease(t *testing.T) {
 	config := DefaultGPIOConfig()
 	config.Enabled = true
 	config.Scripts = []GPIOScript{{ID: "hello", Name: "问候", Body: "printf hello\n"}}
-	config.Buttons[0].Actions.Short = GPIOActionScriptPrefix + "hello"
+	config.Buttons[0].Actions.Hold3S = GPIOActionScriptPrefix + "hello"
 	port := &fakeGPIOPort{values: make([]byte, 0xA05)}
 	for _, spec := range gpioButtonSpecs {
 		port.set(spec, true)
@@ -148,14 +170,78 @@ func TestGPIOPollResolvesBoundScript(t *testing.T) {
 	port.set(copyButton, false)
 	_, _ = manager.PollGPIO(config, port, start.Add(10*time.Millisecond))
 	_, _ = manager.PollGPIO(config, port, start.Add(120*time.Millisecond))
-	port.set(copyButton, true)
-	_, _ = manager.PollGPIO(config, port, start.Add(time.Second))
-	events, err := manager.PollGPIO(config, port, start.Add(1120*time.Millisecond))
+	confirmations, err := manager.PollGPIO(config, port, start.Add(3120*time.Millisecond))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(events) != 1 || events[0].Script == nil || events[0].Script.ID != "hello" || events[0].Script.Body != "printf hello\n" {
+	if len(confirmations) != 1 || !confirmations[0].IsFeedback() || confirmations[0].Stage != "长按 3 秒" || confirmations[0].Feedback.Tones != 1 {
+		t.Fatalf("unexpected GPIO confirmation: %+v", confirmations)
+	}
+	confirmations, err = manager.PollGPIO(config, port, start.Add(3220*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(confirmations) != 0 {
+		t.Fatalf("threshold was confirmed more than once: %+v", confirmations)
+	}
+	port.set(copyButton, true)
+	_, _ = manager.PollGPIO(config, port, start.Add(3230*time.Millisecond))
+	events, err := manager.PollGPIO(config, port, start.Add(3340*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].Kind != GPIOEventAction || events[0].Script == nil || events[0].Script.ID != "hello" || events[0].Script.Body != "printf hello\n" {
 		t.Fatalf("script was not resolved into GPIO event: %+v", events)
+	}
+}
+
+func TestGPIOFeedbackThresholdsAreDistinct(t *testing.T) {
+	confirmations := gpioFeedbackForDuration(16*time.Second, 0)
+	if len(confirmations) != 3 {
+		t.Fatalf("got %d confirmations, want 3", len(confirmations))
+	}
+	for i, want := range []struct {
+		stage string
+		count int
+	}{{"长按 3 秒", 1}, {"长按 9 秒", 2}, {"长按 15 秒", 3}} {
+		if confirmations[i].stage != want.stage || confirmations[i].pattern.Tones != want.count || confirmations[i].pattern.Flashes != want.count {
+			t.Fatalf("confirmation %d = %+v, want %s/%d", i, confirmations[i], want.stage, want.count)
+		}
+	}
+	if got := gpioFeedbackForDuration(16*time.Second, 0x7); len(got) != 0 {
+		t.Fatalf("already-confirmed thresholds produced feedback: %+v", got)
+	}
+}
+
+type fakeGPIOTone struct {
+	count int
+	err   error
+}
+
+func (tone *fakeGPIOTone) PlayTones(count int) error {
+	tone.count = count
+	return tone.err
+}
+
+type fakeGPIOLED struct {
+	count int
+	err   error
+}
+
+func (led *fakeGPIOLED) Flash(count int) error {
+	led.count = count
+	return led.err
+}
+
+func TestRunGPIOFeedbackAttemptsBothOutputs(t *testing.T) {
+	tone := &fakeGPIOTone{err: io.ErrClosedPipe}
+	led := &fakeGPIOLED{}
+	err := runGPIOFeedback(GPIOFeedbackPattern{Tones: 2, Flashes: 3}, tone, led)
+	if err == nil {
+		t.Fatal("tone error was lost")
+	}
+	if tone.count != 2 || led.count != 3 {
+		t.Fatalf("feedback calls = tone %d, led %d", tone.count, led.count)
 	}
 }
 

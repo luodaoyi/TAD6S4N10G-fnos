@@ -37,6 +37,10 @@ const (
 var (
 	gpioScriptIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
 	gpioScriptTimeout   = 30 * time.Second
+	// ErrGPIOFeedbackUnavailable means that an optional feedback device is not
+	// present or cannot be opened. Callers should log and continue with the
+	// button action.
+	ErrGPIOFeedbackUnavailable = errors.New("gpio feedback is unavailable")
 )
 
 type GPIOActions struct {
@@ -89,6 +93,26 @@ type GPIOEvent struct {
 	Stage    string
 	Action   string
 	Script   *GPIOScript
+	Kind     GPIOEventKind
+	Feedback *GPIOFeedbackPattern
+}
+
+type GPIOEventKind string
+
+const (
+	GPIOEventAction   GPIOEventKind = "action"
+	GPIOEventFeedback GPIOEventKind = "feedback"
+)
+
+// GPIOFeedbackPattern is confirmation feedback emitted once when a hold
+// threshold is reached. The business action remains deferred until release.
+type GPIOFeedbackPattern struct {
+	Tones   int
+	Flashes int
+}
+
+func (event GPIOEvent) IsFeedback() bool {
+	return event.Kind == GPIOEventFeedback && event.Feedback != nil
 }
 
 type gpioButtonSpec struct {
@@ -118,6 +142,7 @@ type gpioButtonRuntime struct {
 	pressed      bool
 	pressedAt    time.Time
 	lastAction   string
+	feedbackMask uint8
 }
 
 type gpioRuntime struct {
@@ -180,8 +205,10 @@ func validateGPIOConfig(config GPIOConfig) error {
 			return fmt.Errorf("duplicate gpio button %q", button.ID)
 		}
 		seen[button.ID] = true
+		// Short is intentionally retained for decoding configurations written by
+		// earlier releases, but is never validated or executed.
 		for stage, action := range map[string]string{
-			"short": button.Actions.Short, "hold_3s": button.Actions.Hold3S,
+			"hold_3s": button.Actions.Hold3S,
 			"hold_9s": button.Actions.Hold9S, "hold_15s": button.Actions.Hold15S,
 		} {
 			if !allowedGPIOActions[action] {
@@ -307,12 +334,30 @@ func (m *Manager) PollGPIO(config GPIOConfig, reader io.ReaderAt, now time.Time)
 			state.rawChangedAt = now
 			continue
 		}
-		if now.Sub(state.rawChangedAt) < gpioDebounce || rawPressed == state.pressed {
+		if now.Sub(state.rawChangedAt) < gpioDebounce {
 			continue
 		}
-		state.pressed = rawPressed
-		if rawPressed {
-			state.pressedAt = now
+		if rawPressed != state.pressed {
+			state.pressed = rawPressed
+			if rawPressed {
+				state.pressedAt = now
+				state.feedbackMask = 0
+				continue
+			}
+		}
+		if state.pressed {
+			for _, confirmation := range gpioFeedbackForDuration(now.Sub(state.pressedAt), state.feedbackMask) {
+				state.feedbackMask |= confirmation.mask
+				events = append(events, GPIOEvent{
+					ButtonID: spec.ID,
+					Name:     spec.Name,
+					Duration: now.Sub(state.pressedAt),
+					Stage:    confirmation.stage,
+					Kind:     GPIOEventFeedback,
+					Feedback: &confirmation.pattern,
+				})
+				m.gpioRuntime.lastEvent = fmt.Sprintf("%s %s（%.1f 秒）→ 已确认", spec.Name, confirmation.stage, now.Sub(state.pressedAt).Seconds())
+			}
 			continue
 		}
 		if state.pressedAt.IsZero() {
@@ -321,8 +366,12 @@ func (m *Manager) PollGPIO(config GPIOConfig, reader io.ReaderAt, now time.Time)
 		duration := now.Sub(state.pressedAt)
 		stage, action := gpioActionForDuration(actions[spec.ID], duration)
 		state.pressedAt = time.Time{}
+		state.feedbackMask = 0
+		if stage == "" {
+			continue
+		}
 		state.lastAction = action
-		event := GPIOEvent{ButtonID: spec.ID, Name: spec.Name, Duration: duration, Stage: stage, Action: action}
+		event := GPIOEvent{ButtonID: spec.ID, Name: spec.Name, Duration: duration, Stage: stage, Action: action, Kind: GPIOEventAction}
 		event.Script = gpioScriptForAction(config, action)
 		m.gpioRuntime.lastEvent = fmt.Sprintf("%s %s（%.1f 秒）→ %s", spec.Name, stage, duration.Seconds(), gpioActionDisplay(config, action))
 		events = append(events, event)
@@ -347,8 +396,30 @@ func gpioActionForDuration(actions GPIOActions, duration time.Duration) (string,
 	case duration >= 3*time.Second:
 		return "长按 3 秒", actions.Hold3S
 	default:
-		return "短按", actions.Short
+		return "", GPIOActionNone
 	}
+}
+
+type gpioHoldConfirmation struct {
+	mask    uint8
+	stage   string
+	pattern GPIOFeedbackPattern
+}
+
+func gpioFeedbackForDuration(duration time.Duration, confirmed uint8) []gpioHoldConfirmation {
+	thresholds := []gpioHoldConfirmation{
+		{mask: 1 << 0, stage: "长按 3 秒", pattern: GPIOFeedbackPattern{Tones: 1, Flashes: 1}},
+		{mask: 1 << 1, stage: "长按 9 秒", pattern: GPIOFeedbackPattern{Tones: 2, Flashes: 2}},
+		{mask: 1 << 2, stage: "长按 15 秒", pattern: GPIOFeedbackPattern{Tones: 3, Flashes: 3}},
+	}
+	minimums := []time.Duration{3 * time.Second, 9 * time.Second, 15 * time.Second}
+	var result []gpioHoldConfirmation
+	for i, threshold := range thresholds {
+		if duration >= minimums[i] && confirmed&threshold.mask == 0 {
+			result = append(result, threshold)
+		}
+	}
+	return result
 }
 
 func (m *Manager) ExecuteGPIOAction(event GPIOEvent) error {

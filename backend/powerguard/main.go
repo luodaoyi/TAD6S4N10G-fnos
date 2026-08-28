@@ -354,6 +354,15 @@ func gpioLoop(ctx context.Context, manager *powerguard.Manager, logger *log.Logg
 			}
 			lastLoggedError = ""
 			for _, event := range events {
+				if event.IsFeedback() {
+					logger.Printf("gpio hold confirmed button=%s stage=%s", event.ButtonID, event.Stage)
+					go func(feedback powerguard.GPIOEvent) {
+						if err := manager.PlayGPIOFeedback(feedback); err != nil {
+							logger.Printf("gpio feedback unavailable button=%s stage=%s: %v", feedback.ButtonID, feedback.Stage, err)
+						}
+					}(event)
+					continue
+				}
 				logger.Printf("gpio event button=%s stage=%s duration=%s action=%s", event.ButtonID, event.Stage, event.Duration.Round(100*time.Millisecond), event.Action)
 				select {
 				case actions <- event:

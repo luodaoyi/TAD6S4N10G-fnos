@@ -1006,7 +1006,7 @@ function gpioConfigFromInputs() {
     enabled: $('gpio-enabled').checked,
     scripts: gpioScripts.map((script) => ({ ...script })),
     buttons: [...document.querySelectorAll('.gpio-table tbody tr')].map((row) => {
-      const actions = {};
+      const actions = { short: 'none' };
       row.querySelectorAll('.gpio-action').forEach((select) => { actions[select.dataset.stage] = select.value; });
       return { id: row.dataset.button, actions };
     }),

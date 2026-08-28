@@ -109,7 +109,7 @@ func TestScopedConfigSavesPreserveOtherSections(t *testing.T) {
 	}
 	cfg := DefaultConfig(profiles[0])
 	cfg.Enabled = false
-	cfg.GPIO.Buttons[0].Actions.Short = GPIOActionLog
+	cfg.GPIO.Buttons[0].Actions.Hold3S = GPIOActionLog
 	if err := writeJSONAtomic(manager.ConfigPath, cfg, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -121,7 +121,7 @@ func TestScopedConfigSavesPreserveOtherSections(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if afterGlobal.Fan.MinPWMPercent != cfg.Fan.MinPWMPercent || afterGlobal.GPIO.Buttons[0].Actions.Short != GPIOActionLog {
+	if afterGlobal.Fan.MinPWMPercent != cfg.Fan.MinPWMPercent || afterGlobal.GPIO.Buttons[0].Actions.Hold3S != GPIOActionLog {
 		t.Fatalf("global save changed another section: %+v", afterGlobal)
 	}
 
@@ -143,7 +143,7 @@ func TestScopedConfigSavesPreserveOtherSections(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if afterFan.PL1W != 12 || afterFan.GPIO.Buttons[0].Actions.Short != GPIOActionLog {
+	if afterFan.PL1W != 12 || afterFan.GPIO.Buttons[0].Actions.Hold3S != GPIOActionLog {
 		t.Fatalf("fan save changed another section: %+v", afterFan)
 	}
 

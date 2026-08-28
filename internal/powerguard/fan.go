@@ -180,6 +180,12 @@ func normalizeConfig(cfg *Config) bool {
 		cfg.GPIO = DefaultGPIOConfig()
 		changed = true
 	}
+	for index := range cfg.GPIO.Buttons {
+		if cfg.GPIO.Buttons[index].Actions.Short != GPIOActionNone {
+			cfg.GPIO.Buttons[index].Actions.Short = GPIOActionNone
+			changed = true
+		}
+	}
 	return changed
 }
 
