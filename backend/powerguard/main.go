@@ -94,7 +94,12 @@ func restore(args []string) error {
 	if err := requireRoot(); err != nil {
 		return err
 	}
-	return manager.Restore()
+	err = manager.Restore()
+	if errors.Is(err, powerguard.ErrOriginalStateCPUMismatch) {
+		fmt.Fprintln(os.Stderr, "tad-module: skipped restoring power and fan state captured on different hardware")
+		return nil
+	}
+	return err
 }
 
 func probe(args []string) error {
@@ -159,7 +164,7 @@ func serve(args []string) error {
 		return err
 	}
 	if err := manager.ApplyCurrent(); err != nil {
-		return err
+		logger.Printf("initial apply failed; continuing in degraded mode so configuration can be repaired: %v", err)
 	}
 	logger.Printf("started version=%s interval=%ds", version, cfg.ReapplySeconds)
 
@@ -179,10 +184,20 @@ func serve(args []string) error {
 	select {
 	case <-ctx.Done():
 		logger.Printf("stopping: restoring captured power and fan settings")
-		return manager.Restore()
+		err := manager.Restore()
+		if errors.Is(err, powerguard.ErrOriginalStateCPUMismatch) {
+			logger.Printf("restore skipped because saved state belongs to different hardware: %v", err)
+			return nil
+		}
+		return err
 	case err := <-done:
 		logger.Printf("server stopped: restoring captured power and fan settings")
-		return errors.Join(err, manager.Restore())
+		restoreErr := manager.Restore()
+		if errors.Is(restoreErr, powerguard.ErrOriginalStateCPUMismatch) {
+			logger.Printf("restore skipped because saved state belongs to different hardware: %v", restoreErr)
+			restoreErr = nil
+		}
+		return errors.Join(err, restoreErr)
 	}
 }
 

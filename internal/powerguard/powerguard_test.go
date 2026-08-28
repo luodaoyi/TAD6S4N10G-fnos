@@ -1,10 +1,13 @@
 package powerguard
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestDetectProfile(t *testing.T) {
@@ -178,5 +181,77 @@ func TestSummarizeCPUTemperaturesFallsBackToPackage(t *testing.T) {
 	status := summarizeCPUTemperatures([]Temperature{{Label: "Package id 0", Celsius: 64}})
 	if !status.Available || status.DisplaySource != "package_fallback" || status.DisplayC != 64 {
 		t.Fatalf("unexpected package fallback: %+v", status)
+	}
+}
+
+func TestOriginalStateCPUValidation(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "proc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "proc", "cpuinfo"), []byte("model name : Intel(R) Processor N100\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manager := &Manager{Root: root, StatePath: filepath.Join(root, "state.json")}
+
+	matching := OriginalState{Version: stateVersion, CPUModel: "  intel(r) PROCESSOR   n100  "}
+	if err := manager.validateOriginalStateCPU(matching); err != nil {
+		t.Fatalf("matching normalized CPU model was rejected: %v", err)
+	}
+
+	mismatched := OriginalState{Version: stateVersion, CPUModel: "Intel(R) Core(TM) i3-N305"}
+	err := manager.validateOriginalStateCPU(mismatched)
+	if !errors.Is(err, ErrOriginalStateCPUMismatch) {
+		t.Fatalf("mismatched CPU model error=%v, want %v", err, ErrOriginalStateCPUMismatch)
+	}
+	if !strings.Contains(err.Error(), mismatched.CPUModel) {
+		t.Fatalf("mismatch error lacks saved model: %v", err)
+	}
+}
+
+func TestCaptureAndRestoreRejectOriginalStateFromOtherCPU(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows cannot create the intel-rapl:0 fixture path")
+	}
+	root := t.TempDir()
+	procDir := filepath.Join(root, "proc")
+	raplDir := filepath.Join(root, "sys", "devices", "virtual", "powercap", "intel-rapl", "intel-rapl:0")
+	for _, dir := range []string{procDir, raplDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(procDir, "cpuinfo"), []byte("model name : Intel(R) Processor N100\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	files := map[string]string{
+		"name": "package-0", "constraint_0_name": "long_term", "constraint_0_power_limit_uw": "6000000",
+		"constraint_1_name": "short_term", "constraint_1_power_limit_uw": "15000000",
+	}
+	for name, value := range files {
+		if err := os.WriteFile(filepath.Join(raplDir, name), []byte(value), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	manager := &Manager{Root: root, StatePath: filepath.Join(root, "state.json")}
+	state := OriginalState{
+		Version: stateVersion, CPUModel: "Intel(R) Core(TM) i3-N305", CapturedAt: time.Now(),
+		Packages: []OriginalPackage{{Name: "package-0", LongUW: 15_000_000}},
+	}
+	if err := writeJSONAtomic(manager.StatePath, state, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	packages, err := manager.DiscoverPackages()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.captureOriginalLocked(packages); !errors.Is(err, ErrOriginalStateCPUMismatch) {
+		t.Fatalf("capture error=%v, want %v", err, ErrOriginalStateCPUMismatch)
+	}
+	if err := manager.restorePowerLocked(); !errors.Is(err, ErrOriginalStateCPUMismatch) {
+		t.Fatalf("restore error=%v, want %v", err, ErrOriginalStateCPUMismatch)
+	}
+	if got, err := readInt(filepath.Join(raplDir, "constraint_0_power_limit_uw")); err != nil || got != 6_000_000 {
+		t.Fatalf("restore changed current hardware power limit: got=%d err=%v", got, err)
 	}
 }

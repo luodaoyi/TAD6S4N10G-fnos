@@ -1,10 +1,33 @@
 package powerguard
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 )
+
+func TestFanStateCaptureRejectsDifferentCPU(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "proc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "proc", "cpuinfo"), []byte("model name : Intel(R) Processor N100\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manager := &Manager{Root: root, StatePath: filepath.Join(root, "original-state.json")}
+	state := OriginalState{Version: stateVersion, CPUModel: "Intel(R) Core(TM) i3-N305"}
+	if err := writeJSONAtomic(manager.StatePath, state, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := manager.captureOriginalFanLocked(FanDevice{ID: "fan1", PWM: 128, Mode: 2})
+	if !errors.Is(err, ErrOriginalStateCPUMismatch) {
+		t.Fatalf("capture error=%v, want %v", err, ErrOriginalStateCPUMismatch)
+	}
+	if _, err := os.Stat(manager.fanStatePath()); !os.IsNotExist(err) {
+		t.Fatalf("fan state was written for mismatched hardware: %v", err)
+	}
+}
 
 func TestDefaultFanConfigIsSafeAndDisabled(t *testing.T) {
 	cfg := DefaultFanConfig()

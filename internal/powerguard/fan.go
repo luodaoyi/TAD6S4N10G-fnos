@@ -654,6 +654,9 @@ func (m *Manager) fanStatePath() string {
 }
 
 func (m *Manager) captureOriginalFanLocked(fan FanDevice) error {
+	if err := m.validateSavedHardwareIfAvailable(); err != nil {
+		return err
+	}
 	state, err := m.loadFanStateLocked()
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return err
@@ -691,6 +694,9 @@ func (m *Manager) restoreFansLocked() error {
 		return nil
 	}
 	if err != nil {
+		return err
+	}
+	if err := m.validateSavedHardwareIfAvailable(); err != nil {
 		return err
 	}
 	fans, err := m.DiscoverFans()
@@ -737,6 +743,9 @@ func (m *Manager) failSafeCapturedFansLocked() error {
 		return nil
 	}
 	if err != nil {
+		return err
+	}
+	if err := m.validateSavedHardwareIfAvailable(); err != nil {
 		return err
 	}
 	fans, err := m.DiscoverFans()

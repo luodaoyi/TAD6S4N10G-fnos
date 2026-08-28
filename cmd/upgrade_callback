@@ -1,8 +1,10 @@
 #!/bin/sh
 set -eu
 
-"${TRIM_APPDEST}/bin/tad-module" apply \
+if ! "${TRIM_APPDEST}/bin/tad-module" apply \
   --config "${TRIM_PKGETC}/config.json" \
-  --state "${TRIM_PKGVAR}/original-state.json"
+  --state "${TRIM_PKGVAR}/original-state.json"; then
+  echo "现有硬件配置暂时无法应用；模块将以降级模式启动，请打开模块检查功耗与风扇配置。" >"${TRIM_TEMP_LOGFILE:-/dev/stderr}"
+fi
 
 exit 0

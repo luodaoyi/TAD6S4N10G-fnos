@@ -17,6 +17,8 @@ import (
 
 const stateVersion = 1
 
+var ErrOriginalStateCPUMismatch = errors.New("original state CPU model does not match current CPU")
+
 type Profile struct {
 	ID           string                 `json:"id"`
 	Display      string                 `json:"display"`
@@ -653,7 +655,14 @@ func applyPackage(pkg Package, desiredLong, desiredShort int64) error {
 
 func (m *Manager) captureOriginalLocked(packages []Package) error {
 	if _, err := os.Stat(m.StatePath); err == nil {
-		return nil
+		state, err := m.loadOriginalState()
+		if err != nil {
+			return err
+		}
+		if state.Version != stateVersion {
+			return fmt.Errorf("unsupported state version %d", state.Version)
+		}
+		return m.validateOriginalStateCPU(state)
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("stat state: %w", err)
 	}
@@ -684,19 +693,18 @@ func (m *Manager) restoreLocked() error {
 }
 
 func (m *Manager) restorePowerLocked() error {
-	data, err := os.ReadFile(m.StatePath)
+	state, err := m.loadOriginalState()
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil
 	}
 	if err != nil {
-		return fmt.Errorf("read state: %w", err)
-	}
-	var state OriginalState
-	if err := json.Unmarshal(data, &state); err != nil {
-		return fmt.Errorf("decode state: %w", err)
+		return err
 	}
 	if state.Version != stateVersion {
 		return fmt.Errorf("unsupported state version %d", state.Version)
+	}
+	if err := m.validateOriginalStateCPU(state); err != nil {
+		return err
 	}
 	packages, err := m.DiscoverPackages()
 	if err != nil {
@@ -718,6 +726,52 @@ func (m *Manager) restorePowerLocked() error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+func (m *Manager) loadOriginalState() (OriginalState, error) {
+	data, err := os.ReadFile(m.StatePath)
+	if err != nil {
+		return OriginalState{}, fmt.Errorf("read state: %w", err)
+	}
+	var state OriginalState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return OriginalState{}, fmt.Errorf("decode state: %w", err)
+	}
+	return state, nil
+}
+
+func (m *Manager) validateOriginalStateCPU(state OriginalState) error {
+	current, err := m.CPUModel()
+	if err != nil {
+		return err
+	}
+	savedModel := normalizeCPUModel(state.CPUModel)
+	currentModel := normalizeCPUModel(current)
+	if savedModel == "" {
+		return errors.New("original state has no CPU model; refusing to reuse it")
+	}
+	if savedModel != currentModel {
+		return fmt.Errorf("%w: state=%q current=%q", ErrOriginalStateCPUMismatch, state.CPUModel, current)
+	}
+	return nil
+}
+
+func (m *Manager) validateSavedHardwareIfAvailable() error {
+	state, err := m.loadOriginalState()
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if state.Version != stateVersion {
+		return fmt.Errorf("unsupported state version %d", state.Version)
+	}
+	return m.validateOriginalStateCPU(state)
+}
+
+func normalizeCPUModel(model string) string {
+	return strings.ToLower(strings.Join(strings.Fields(model), " "))
 }
 
 func (m *Manager) Status() Status {
