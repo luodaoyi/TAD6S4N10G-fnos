@@ -329,7 +329,6 @@ func mapStorageSlotSpecs(devices []storagePCIDevice) []storageSlotSpec {
 	// Leaf BDFs are assigned after PCI enumeration and can move with the mlx5 card.
 	var asmControllers []storagePCIDevice
 	var intelSATA *storagePCIDevice
-	rootPorts := make(map[int]bool)
 	nvmeBySlot := make(map[int][]storagePCIDevice)
 	for index := range devices {
 		device := &devices[index]
@@ -338,9 +337,6 @@ func mapStorageSlotSpecs(devices []storagePCIDevice) []storageSlotSpec {
 		}
 		if pciID(device.Vendor) == "8086" && pciClass(device.Class) == "0106" && strings.HasSuffix(strings.ToLower(device.BDF), ":00:17.0") {
 			intelSATA = device
-		}
-		if slot, ok := tadM2RootSlot(device.BDF); ok && pciClass(device.Class) == "0604" {
-			rootPorts[slot] = true
 		}
 		if pciClass(device.Class) == "0108" {
 			if slot, ok := tadM2SlotFromTopology(device.Topology); ok {
@@ -376,10 +372,10 @@ func mapStorageSlotSpecs(devices []storagePCIDevice) []storageSlotSpec {
 			if slot >= 3 && intelSATA != nil {
 				spec.MappingKnown = true
 				spec.BusPath = fmt.Sprintf("/dev/disk/by-path/pci-%s-ata-%d", strings.ToLower(intelSATA.BDF), slot-2)
-			} else if rootPorts[slot] {
-				spec.MappingKnown = true
 			} else {
-				spec.Warning = fmt.Sprintf("未识别到 M.2 %d 的 PCIe 根端口，不能确定仓位", slot)
+				// Empty M.2 root ports may not be enumerated by firmware. The fixed
+				// board wiring still makes an absent endpoint an authoritative empty bay.
+				spec.MappingKnown = true
 			}
 		default:
 			spec.Warning = fmt.Sprintf("M.2 %d 根端口下检测到多个 NVMe 控制器，不能确定仓位", slot)

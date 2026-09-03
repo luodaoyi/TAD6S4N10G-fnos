@@ -79,14 +79,48 @@ func TestStorageMappingSupportsM2SATAAndPrefersNVMe(t *testing.T) {
 	}
 }
 
-func TestStorageMappingMarksUndeterminedSlotsUnknown(t *testing.T) {
+func TestStorageMappingKeepsUnknownSATAAndAuthoritativeEmptyM2(t *testing.T) {
 	specs := mapStorageSlotSpecs(nil)
 	if len(specs) != 10 {
 		t.Fatalf("got %d slots, want 10", len(specs))
 	}
-	for _, spec := range specs {
+	for _, spec := range specs[:6] {
 		if spec.MappingKnown || spec.Warning == "" {
-			t.Fatalf("undetermined slot must carry a warning: %+v", spec)
+			t.Fatalf("undetermined SATA slot must carry a warning: %+v", spec)
+		}
+	}
+	for _, spec := range specs[6:] {
+		if !spec.MappingKnown || spec.BusPath != "" || spec.Warning != "" {
+			t.Fatalf("absent M.2 endpoint must be an empty physical bay: %+v", spec)
+		}
+	}
+}
+
+func TestStorageMappingPreservesSparseM2Slots(t *testing.T) {
+	devices := []storagePCIDevice{
+		{BDF: "0000:02:00.0", Vendor: "0x1b21", Device: "0x1166", Class: "0x010601"},
+		{BDF: "0000:06:00.0", Class: "0x010802", Topology: "/sys/devices/pci0000:00/0000:00:1d.2/0000:06:00.0"},
+	}
+	specs := mapStorageSlotSpecs(devices)
+	if specs[8].BusPath != "/dev/disk/by-path/pci-0000:06:00.0-nvme-" || !specs[8].MappingKnown {
+		t.Fatalf("physical M.2 3 was not preserved: %+v", specs[8])
+	}
+	for _, index := range []int{6, 7, 9} {
+		if !specs[index].MappingKnown || specs[index].BusPath != "" {
+			t.Fatalf("sparse empty M.2 slot was compacted or unresolved: %+v", specs[index])
+		}
+	}
+}
+
+func TestStorageMappingIgnoresUnknownNVMeRootPort(t *testing.T) {
+	devices := []storagePCIDevice{
+		{BDF: "0000:02:00.0", Vendor: "0x1b21", Device: "0x1166", Class: "0x010601"},
+		{BDF: "0000:08:00.0", Class: "0x010802", Topology: "/sys/devices/pci0000:00/0000:00:01.0/0000:08:00.0"},
+	}
+	specs := mapStorageSlotSpecs(devices)
+	for _, spec := range specs[6:] {
+		if !spec.MappingKnown || spec.BusPath != "" {
+			t.Fatalf("unknown-root NVMe must not appear in an M.2 bay: %+v", spec)
 		}
 	}
 }
