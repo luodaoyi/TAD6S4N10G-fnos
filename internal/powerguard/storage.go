@@ -67,10 +67,10 @@ type storageSlotSpec struct {
 	Prefix  bool
 }
 
-// TAD6S4N10G 的仓位模板：绝对 PCI 地址只在当前总线拓扑下成立（例如拔掉
+// TAD6S4N10G 的仓位模板：绝对 PCI 地址只在出厂总线拓扑下成立（例如拔掉
 // 与盘位共用同一 PCIe 上游交换芯片的网卡后，内核重新编号会使这些路径失效）。
-// 真正的解析优先走 discoverSlotBusPaths，按相对拓扑推导；此表仅提供
-// 兜底路径与稳定的仓位 ID/数量。
+// 真正的解析优先走 discoverSlotBusPaths（SATA 按端口拓扑推导，M.2 按根端口
+// 走线表锚定）；此表仅提供读不到 sysfs 时的兜底路径与稳定的仓位 ID/数量。
 var storageSlotSpecs = []storageSlotSpec{
 	{ID: "front-1", Kind: "front", Slot: 1, BusPath: "/dev/disk/by-path/pci-0000:02:00.0-ata-1"},
 	{ID: "front-2", Kind: "front", Slot: 2, BusPath: "/dev/disk/by-path/pci-0000:02:00.0-ata-2"},
@@ -86,11 +86,22 @@ var storageSlotSpecs = []storageSlotSpec{
 
 var pciAddrPattern = regexp.MustCompile(`^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]$`)
 
+// bayRootPorts 是实测的 M.2 仓位走线：仓 ↔ PCH 根端口是主板布线，总线重
+// 编号、换盘、空仓都不变，是唯一稳定的仓位锚点（2026-09 丝印实测：2 号仓
+// 的盘挂 1d.0、3 号仓挂 1d.2、4 号仓挂 1d.3、1 号仓空。注意 1、2 号仓与
+// 端口顺序交错，与整机 addon 的 dts 定义不同；空仓的根端口不被固件枚举，
+// 也无法靠扫描建表，只能固化实测值）。
+var bayRootPorts = map[string]string{
+	"m2-1": "0000:00:1d.1",
+	"m2-2": "0000:00:1d.0",
+	"m2-3": "0000:00:1d.2",
+	"m2-4": "0000:00:1d.3",
+}
+
 // discoverSlotBusPaths 从 sysfs 相对拓扑推导当前各仓位的 by-path 前缀。
 // SATA：取注册 ATA 端口数最多的控制器（TAD6S4N10G 为六口），按端口号升序
-// 对应 front-1..N，端口注册与是否插盘无关；M.2：按控制器地址升序对应
-// m2-1..4。拔掉网卡导致总线整体重编号时，相对顺序保持，映射自动跟随；
-// 读不到 sysfs 或结构为空时返回空表，调用方沿用模板的固定路径。
+// 对应 front-1..N，端口注册与是否插盘无关；M.2：按 bayRootPorts 走线表把
+// NVMe 控制器锚回对应仓。读不到 sysfs 时返回空表，调用方沿用模板固定路径。
 func (m *Manager) discoverSlotBusPaths() map[string]string {
 	overrides := make(map[string]string)
 	if controller, ports := bestSATAController(m.discoverSATAControllers()); controller != "" {
@@ -100,12 +111,9 @@ func (m *Manager) discoverSlotBusPaths() map[string]string {
 			}
 		}
 	}
-	if addrs := m.discoverNVMeControllers(); len(addrs) != 0 {
-		unique := orderedUniqueStrings(addrs)
-		if count := min(len(unique), 4); count != 0 {
-			for index, addr := range unique[:count] {
-				overrides[fmt.Sprintf("m2-%d", index+1)] = fmt.Sprintf("/dev/disk/by-path/pci-%s-nvme-", addr)
-			}
+	if endpoints := m.discoverNVMeEndpoints(); len(endpoints) != 0 {
+		for id, path := range assignNVMeBays(endpoints) {
+			overrides[id] = path
 		}
 	}
 	return overrides
@@ -158,38 +166,61 @@ func bestSATAController(ports map[int]string) (string, []int) {
 	return best, numbers
 }
 
-func (m *Manager) discoverNVMeControllers() []string {
+type nvmeEndpoint struct {
+	RootPort string
+	BusPath  string
+}
+
+// discoverNVMeEndpoints 枚举在位的 NVMe 控制器端点：控制器自身的 PCI 地址
+// （BusPath 用）与其直接上游根端口（仓位锚点用）。空仓控制器不出现在
+// /sys/class/nvme，空仓根端口也不被固件枚举，所以端点列表只包含插盘的仓。
+func (m *Manager) discoverNVMeEndpoints() []nvmeEndpoint {
 	dir := m.rooted("/sys/class/nvme")
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil
 	}
-	addrs := make([]string, 0, len(entries))
+	endpoints := make([]nvmeEndpoint, 0, len(entries))
 	for _, entry := range entries {
 		resolved, linkErr := filepath.EvalSymlinks(filepath.Join(dir, entry.Name()))
 		if linkErr != nil {
 			continue
 		}
 		addr := lastPCIComponent(resolved)
-		if addr != "" {
-			addrs = append(addrs, addr)
-		}
-	}
-	return addrs
-}
-
-func orderedUniqueStrings(values []string) []string {
-	seen := make(map[string]bool, len(values))
-	unique := make([]string, 0, len(values))
-	for _, value := range values {
-		if seen[value] {
+		if addr == "" {
 			continue
 		}
-		seen[value] = true
-		unique = append(unique, value)
+		endpoints = append(endpoints, nvmeEndpoint{
+			RootPort: parentPCIComponent(resolved),
+			BusPath:  fmt.Sprintf("/dev/disk/by-path/pci-%s-nvme-", addr),
+		})
 	}
-	sort.Strings(unique)
-	return unique
+	return endpoints
+}
+
+// assignNVMeBays 按走线表把 NVMe 端点锚回 M.2 仓：根端口对得上即认定该盘
+// 在该仓。表内端口没有端点的仓输出必然不存在的占位路径——既判定为空仓，
+// 也兜住模板固定路径在总线重编号后撞上别的盘、把空仓显示成幻影盘的风险。
+// 挂在未知根端口上的盘（如 PCIe 转接卡）不属于任何 M.2 仓，不参与显示。
+func assignNVMeBays(endpoints []nvmeEndpoint) map[string]string {
+	assigned := make(map[string]string, len(bayRootPorts))
+	for _, spec := range storageSlotSpecs {
+		if spec.Kind != "m2" {
+			continue
+		}
+		root := bayRootPorts[spec.ID]
+		if root == "" {
+			continue
+		}
+		assigned[spec.ID] = fmt.Sprintf("/dev/disk/by-path/pci-%s-empty-nvme-", root)
+		for _, endpoint := range endpoints {
+			if endpoint.RootPort == root {
+				assigned[spec.ID] = endpoint.BusPath
+				break
+			}
+		}
+	}
+	return assigned
 }
 
 func lastPCIComponent(path string) string {
@@ -200,6 +231,20 @@ func lastPCIComponent(path string) string {
 		}
 	}
 	return last
+}
+
+// parentPCIComponent 取路径中最后一个 PCI 地址的直接上游 PCI 地址；对
+// 直挂根端口的设备即主板走线根端口。
+func parentPCIComponent(path string) string {
+	prev := ""
+	last := ""
+	for _, part := range strings.Split(filepath.ToSlash(path), "/") {
+		if pciAddrPattern.MatchString(part) {
+			prev = last
+			last = part
+		}
+	}
+	return prev
 }
 
 type blockInfo struct {

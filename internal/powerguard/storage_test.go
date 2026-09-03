@@ -3,6 +3,8 @@ package powerguard
 import (
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -243,9 +245,9 @@ func containsString(values []string, want string) bool {
 
 func TestLastPCIComponentPicksDeepestController(t *testing.T) {
 	cases := map[string]string{
-		"/sys/devices/pci0000:00/0000:00:13.0/0000:02:00.0/ata1/ata_port/ata1": "0000:02:00.0",
+		"/sys/devices/pci0000:00/0000:00:13.0/0000:02:00.0/ata1/ata_port/ata1":      "0000:02:00.0",
 		"/sys/devices/pci0000:00/0000:00:1c.4/0000:01:00.0/0000:02:00.0/nvme/nvme0": "0000:02:00.0",
-		"/sys/devices/platform/soc/ata_port/ata3": "",
+		"/sys/devices/platform/soc/ata_port/ata3":                                   "",
 	}
 	for path, want := range cases {
 		if got := lastPCIComponent(path); got != want {
@@ -282,15 +284,62 @@ func TestBestSATAControllerBreaksTiesByLowestAddress(t *testing.T) {
 	}
 }
 
-func TestOrderedUniqueStringsSortsAndDeduplicates(t *testing.T) {
-	got := orderedUniqueStrings([]string{"0000:06:00.0", "0000:03:00.0", "0000:06:00.0", "0000:05:00.0"})
-	want := []string{"0000:03:00.0", "0000:05:00.0", "0000:06:00.0"}
+func TestParentPCIComponentReturnsUpstreamPort(t *testing.T) {
+	cases := map[string]string{
+		"/sys/devices/pci0000:00/0000:00:1d.0/0000:03:00.0/nvme/nvme0":              "0000:00:1d.0",
+		"/sys/devices/pci0000:00/0000:00:1c.4/0000:01:00.0/0000:02:00.0/nvme/nvme0": "0000:01:00.0",
+		"/sys/devices/pci0000:00/0000:00:13.0/0000:01:00.0/ata1/ata_port/ata1":      "0000:00:13.0",
+		"/sys/devices/platform/soc/nvme/nvme1":                                      "",
+	}
+	for path, want := range cases {
+		if got := parentPCIComponent(path); got != want {
+			t.Fatalf("parentPCIComponent(%q) = %q, want %q", path, got, want)
+		}
+	}
+}
+
+func TestAssignNVMeBaysMatchesMeasuredWiring(t *testing.T) {
+	// 2026-09 实测：1 号仓空（根端口 1d.1 不被枚举），2/3/4 号仓分别挂
+	// 1d.0/1d.2/1d.3；控制器地址受总线重编号影响，不得参与仓位判定。
+	endpoints := []nvmeEndpoint{
+		{RootPort: "0000:00:1d.0", BusPath: "/dev/disk/by-path/pci-0000:03:00.0-nvme-"},
+		{RootPort: "0000:00:1d.2", BusPath: "/dev/disk/by-path/pci-0000:04:00.0-nvme-"},
+		{RootPort: "0000:00:1d.3", BusPath: "/dev/disk/by-path/pci-0000:05:00.0-nvme-"},
+	}
+	got := assignNVMeBays(endpoints)
+	want := map[string]string{
+		"m2-1": "/dev/disk/by-path/pci-0000:00:1d.1-empty-nvme-",
+		"m2-2": endpoints[0].BusPath,
+		"m2-3": endpoints[1].BusPath,
+		"m2-4": endpoints[2].BusPath,
+	}
 	if len(got) != len(want) {
 		t.Fatalf("got %v, want %v", got, want)
 	}
-	for index := range want {
-		if got[index] != want[index] {
-			t.Fatalf("got[%d] = %q, want %q", index, got[index], want[index])
+	for id, path := range want {
+		if got[id] != path {
+			t.Fatalf("%s = %q, want %q", id, got[id], path)
+		}
+	}
+}
+
+func TestAssignNVMeBaysIgnoresUnknownRootPorts(t *testing.T) {
+	endpoints := []nvmeEndpoint{
+		{RootPort: "0000:00:1d.0", BusPath: "/dev/disk/by-path/pci-0000:03:00.0-nvme-"},
+		{RootPort: "0000:00:01.0", BusPath: "/dev/disk/by-path/pci-0000:08:00.0-nvme-"},
+	}
+	got := assignNVMeBays(endpoints)
+	if got["m2-2"] != endpoints[0].BusPath {
+		t.Fatalf("m2-2 = %q, want anchored endpoint", got["m2-2"])
+	}
+	for _, id := range []string{"m2-1", "m2-3", "m2-4"} {
+		if !strings.HasSuffix(got[id], "-empty-nvme-") {
+			t.Fatalf("%s = %q, want empty-bay placeholder", id, got[id])
+		}
+	}
+	for _, path := range got {
+		if path == endpoints[1].BusPath {
+			t.Fatal("unknown-port endpoint must not be mapped into any M.2 bay")
 		}
 	}
 }
@@ -304,6 +353,9 @@ func TestDiscoverSlotBusPathsFallsBackWithoutSysfs(t *testing.T) {
 }
 
 func TestDiscoverSlotBusPathsMapsPortsAndControllers(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("模拟 sysfs 目录名含冒号，Windows 文件系统无法创建")
+	}
 	root := t.TempDir()
 	sataDir := filepath.Join(root, "sys", "class", "ata_port")
 	nvmeDir := filepath.Join(root, "sys", "class", "nvme")
@@ -315,8 +367,8 @@ func TestDiscoverSlotBusPathsMapsPortsAndControllers(t *testing.T) {
 	targets := []struct{ linkDir, linkName, target string }{
 		{sataDir, "ata1", "../devices/pci0000:00/0000:00:13.0/0000:01:00.0/ata1"},
 		{sataDir, "ata2", "../devices/pci0000:00/0000:00:13.0/0000:01:00.0/ata2"},
-		{nvmeDir, "nvme0", "../devices/pci0000:00/0000:00:1c.0/0000:03:00.0/nvme"},
-		{nvmeDir, "nvme1", "../devices/pci0000:00/0000:00:1c.1/0000:04:00.0/nvme"},
+		{nvmeDir, "nvme0", "../devices/pci0000:00/0000:00:1d.0/0000:03:00.0/nvme"},
+		{nvmeDir, "nvme1", "../devices/pci0000:00/0000:00:1d.3/0000:04:00.0/nvme"},
 	}
 	for _, item := range targets {
 		if err := os.MkdirAll(filepath.Join(item.linkDir, item.target), 0o755); err != nil {
@@ -337,10 +389,16 @@ func TestDiscoverSlotBusPathsMapsPortsAndControllers(t *testing.T) {
 	if _, ok := overrides["front-3"]; ok {
 		t.Fatal("front-3 should stay unresolved with only two ports registered")
 	}
-	if got := overrides["m2-1"]; got != "/dev/disk/by-path/pci-0000:03:00.0-nvme-" {
-		t.Fatalf("m2-1 = %q", got)
-	}
-	if got := overrides["m2-2"]; got != "/dev/disk/by-path/pci-0000:04:00.0-nvme-" {
+	if got := overrides["m2-2"]; got != "/dev/disk/by-path/pci-0000:03:00.0-nvme-" {
 		t.Fatalf("m2-2 = %q", got)
+	}
+	if got := overrides["m2-4"]; got != "/dev/disk/by-path/pci-0000:04:00.0-nvme-" {
+		t.Fatalf("m2-4 = %q", got)
+	}
+	if got := overrides["m2-1"]; got != "/dev/disk/by-path/pci-0000:00:1d.1-empty-nvme-" {
+		t.Fatalf("m2-1 = %q, want empty-bay placeholder", got)
+	}
+	if got := overrides["m2-3"]; got != "/dev/disk/by-path/pci-0000:00:1d.2-empty-nvme-" {
+		t.Fatalf("m2-3 = %q, want empty-bay placeholder", got)
 	}
 }
