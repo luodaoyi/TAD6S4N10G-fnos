@@ -1,5 +1,5 @@
 appname=tad-module
-version=0.10.10
+version=0.10.11
 display_name=TAD6S4N模块
 desc=面向 TAD6S4N10G 的温度、功耗、三曲线风扇、硬盘面板、GPIO 按键与脱敏调试报告模块。
 source=thirdparty
@@ -13,4 +13,4 @@ desktop_uidir=ui
 desktop_applaunchname=tad-module.Application
 checkport=false
 disable_authorization_path=false
-changelog=按实测走线表修正 M.2 仓位显示：根端口锚定、空仓判定与幻影盘修复。
+changelog=按网卡在位状态选择实测 M.2 走线表：网卡在位用官方位序，不在位 1、2 号仓互换。

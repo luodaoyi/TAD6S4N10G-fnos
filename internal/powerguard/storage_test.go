@@ -298,15 +298,28 @@ func TestParentPCIComponentReturnsUpstreamPort(t *testing.T) {
 	}
 }
 
-func TestAssignNVMeBaysMatchesMeasuredWiring(t *testing.T) {
-	// 2026-09 实测：1 号仓空（根端口 1d.1 不被枚举），2/3/4 号仓分别挂
-	// 1d.0/1d.2/1d.3；控制器地址受总线重编号影响，不得参与仓位判定。
+func TestBayRootPortsSelectedBySATAControllerRootPort(t *testing.T) {
+	if got := bayRootPortsForSATARootPort("0000:00:1c.0"); got["m2-1"] != "0000:00:1d.1" || got["m2-2"] != "0000:00:1d.0" {
+		t.Fatalf("SATA on 1c.0 (无网卡) 应选 1/2 交错的走线表, got %v", got)
+	}
+	if got := bayRootPortsForSATARootPort("0000:00:1c.2"); got["m2-1"] != "0000:00:1d.0" || got["m2-2"] != "0000:00:1d.1" {
+		t.Fatalf("SATA on 1c.2 (网卡在位) 应选 addon 官方位序表, got %v", got)
+	}
+	if got := bayRootPortsForSATARootPort(""); got["m2-1"] != "0000:00:1d.0" {
+		t.Fatal("未知状态应回退 addon 官方位序表")
+	}
+}
+
+func TestAssignNVMeBaysMatchesMeasuredWiringNoNIC(t *testing.T) {
+	// 2026-09 实测（Mellanox 不在位，SATA 挂 1c.0）：1 号仓空（根端口
+	// 1d.1 不被枚举），2/3/4 号仓分别挂 1d.0/1d.2/1d.3；控制器地址受总线
+	// 重编号影响，不得参与仓位判定。
 	endpoints := []nvmeEndpoint{
 		{RootPort: "0000:00:1d.0", BusPath: "/dev/disk/by-path/pci-0000:03:00.0-nvme-"},
 		{RootPort: "0000:00:1d.2", BusPath: "/dev/disk/by-path/pci-0000:04:00.0-nvme-"},
 		{RootPort: "0000:00:1d.3", BusPath: "/dev/disk/by-path/pci-0000:05:00.0-nvme-"},
 	}
-	got := assignNVMeBays(endpoints)
+	got := assignNVMeBays(endpoints, bayRootPortsSATAOn1c0)
 	want := map[string]string{
 		"m2-1": "/dev/disk/by-path/pci-0000:00:1d.1-empty-nvme-",
 		"m2-2": endpoints[0].BusPath,
@@ -323,12 +336,34 @@ func TestAssignNVMeBaysMatchesMeasuredWiring(t *testing.T) {
 	}
 }
 
+func TestAssignNVMeBaysMatchesMeasuredWiringWithNIC(t *testing.T) {
+	// 2026-09 实测（Mellanox 在 1c.0，SATA 挤到 1c.2）：1/2/3 号仓分别挂
+	// 1d.0/1d.1/1d.2，4 号仓空（1d.3 不被枚举）。
+	endpoints := []nvmeEndpoint{
+		{RootPort: "0000:00:1d.0", BusPath: "/dev/disk/by-path/pci-0000:04:00.0-nvme-"},
+		{RootPort: "0000:00:1d.1", BusPath: "/dev/disk/by-path/pci-0000:05:00.0-nvme-"},
+		{RootPort: "0000:00:1d.2", BusPath: "/dev/disk/by-path/pci-0000:06:00.0-nvme-"},
+	}
+	got := assignNVMeBays(endpoints, bayRootPortsSATAOn1c2)
+	want := map[string]string{
+		"m2-1": endpoints[0].BusPath,
+		"m2-2": endpoints[1].BusPath,
+		"m2-3": endpoints[2].BusPath,
+		"m2-4": "/dev/disk/by-path/pci-0000:00:1d.3-empty-nvme-",
+	}
+	for id, path := range want {
+		if got[id] != path {
+			t.Fatalf("%s = %q, want %q", id, got[id], path)
+		}
+	}
+}
+
 func TestAssignNVMeBaysIgnoresUnknownRootPorts(t *testing.T) {
 	endpoints := []nvmeEndpoint{
 		{RootPort: "0000:00:1d.0", BusPath: "/dev/disk/by-path/pci-0000:03:00.0-nvme-"},
 		{RootPort: "0000:00:01.0", BusPath: "/dev/disk/by-path/pci-0000:08:00.0-nvme-"},
 	}
-	got := assignNVMeBays(endpoints)
+	got := assignNVMeBays(endpoints, bayRootPortsSATAOn1c0)
 	if got["m2-2"] != endpoints[0].BusPath {
 		t.Fatalf("m2-2 = %q, want anchored endpoint", got["m2-2"])
 	}
@@ -389,14 +424,15 @@ func TestDiscoverSlotBusPathsMapsPortsAndControllers(t *testing.T) {
 	if _, ok := overrides["front-3"]; ok {
 		t.Fatal("front-3 should stay unresolved with only two ports registered")
 	}
-	if got := overrides["m2-2"]; got != "/dev/disk/by-path/pci-0000:03:00.0-nvme-" {
-		t.Fatalf("m2-2 = %q", got)
+	// 检测不到 SATA 控制器根端口时回退官方位序表：m2-1↔1d.0、m2-4↔1d.3
+	if got := overrides["m2-1"]; got != "/dev/disk/by-path/pci-0000:03:00.0-nvme-" {
+		t.Fatalf("m2-1 = %q", got)
 	}
 	if got := overrides["m2-4"]; got != "/dev/disk/by-path/pci-0000:04:00.0-nvme-" {
 		t.Fatalf("m2-4 = %q", got)
 	}
-	if got := overrides["m2-1"]; got != "/dev/disk/by-path/pci-0000:00:1d.1-empty-nvme-" {
-		t.Fatalf("m2-1 = %q, want empty-bay placeholder", got)
+	if got := overrides["m2-2"]; got != "/dev/disk/by-path/pci-0000:00:1d.1-empty-nvme-" {
+		t.Fatalf("m2-2 = %q, want empty-bay placeholder", got)
 	}
 	if got := overrides["m2-3"]; got != "/dev/disk/by-path/pci-0000:00:1d.2-empty-nvme-" {
 		t.Fatalf("m2-3 = %q, want empty-bay placeholder", got)

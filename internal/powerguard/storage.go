@@ -86,25 +86,53 @@ var storageSlotSpecs = []storageSlotSpec{
 
 var pciAddrPattern = regexp.MustCompile(`^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]$`)
 
-// bayRootPorts 是实测的 M.2 仓位走线：仓 ↔ PCH 根端口是主板布线，总线重
-// 编号、换盘、空仓都不变，是唯一稳定的仓位锚点（2026-09 丝印实测：2 号仓
-// 的盘挂 1d.0、3 号仓挂 1d.2、4 号仓挂 1d.3、1 号仓空。注意 1、2 号仓与
-// 端口顺序交错，与整机 addon 的 dts 定义不同；空仓的根端口不被固件枚举，
-// 也无法靠扫描建表，只能固化实测值）。
-var bayRootPorts = map[string]string{
+// 实测两组 M.2 走线（2026-09，TAD6S4N10G 丝印对照）：固件按网卡在位重排
+// PCH 通道，SATA 控制器挪根端口的同时 M.2 的 1、2 号仓在 1d.0/1d.1 之间
+// 互换，3、4 号仓两组一致；空仓的根端口不被固件枚举，无法靠扫描建表。
+// 走线表按 SATA 控制器所在根端口选择。
+var bayRootPortsSATAOn1c0 = map[string]string{ // Mellanox 不在位（SATA 挂 1c.0）
 	"m2-1": "0000:00:1d.1",
 	"m2-2": "0000:00:1d.0",
 	"m2-3": "0000:00:1d.2",
 	"m2-4": "0000:00:1d.3",
 }
 
+var bayRootPortsSATAOn1c2 = map[string]string{ // Mellanox 在位（SATA 挂 1c.2），与整机 addon 的 dts 定义一致
+	"m2-1": "0000:00:1d.0",
+	"m2-2": "0000:00:1d.1",
+	"m2-3": "0000:00:1d.2",
+	"m2-4": "0000:00:1d.3",
+}
+
+// bayRootPortsForSATARootPort 按 SATA 控制器所在根端口选 M.2 走线表；未知
+// 状态回退与整机 addon 官方定义一致的位序。
+func bayRootPortsForSATARootPort(port string) map[string]string {
+	if port == "0000:00:1c.0" {
+		return bayRootPortsSATAOn1c0
+	}
+	return bayRootPortsSATAOn1c2
+}
+
+func (m *Manager) rootPortOfDevice(addr string) string {
+	if addr == "" {
+		return ""
+	}
+	resolved, err := filepath.EvalSymlinks(m.rooted(filepath.Join("/sys/bus/pci/devices", addr)))
+	if err != nil {
+		return ""
+	}
+	return parentPCIComponent(resolved)
+}
+
 // discoverSlotBusPaths 从 sysfs 相对拓扑推导当前各仓位的 by-path 前缀。
 // SATA：取注册 ATA 端口数最多的控制器（TAD6S4N10G 为六口），按端口号升序
-// 对应 front-1..N，端口注册与是否插盘无关；M.2：按 bayRootPorts 走线表把
-// NVMe 控制器锚回对应仓。读不到 sysfs 时返回空表，调用方沿用模板固定路径。
+// 对应 front-1..N，端口注册与是否插盘无关；M.2：按 SATA 控制器所在根端口
+// 选出的走线表把 NVMe 控制器锚回对应仓。读不到 sysfs 时返回空表，调用方
+// 沿用模板固定路径。
 func (m *Manager) discoverSlotBusPaths() map[string]string {
 	overrides := make(map[string]string)
-	if controller, ports := bestSATAController(m.discoverSATAControllers()); controller != "" {
+	controller, ports := bestSATAController(m.discoverSATAControllers())
+	if controller != "" {
 		if count := min(len(ports), 6); count != 0 {
 			for index, port := range ports[:count] {
 				overrides[fmt.Sprintf("front-%d", index+1)] = fmt.Sprintf("/dev/disk/by-path/pci-%s-ata-%d", controller, port)
@@ -112,7 +140,8 @@ func (m *Manager) discoverSlotBusPaths() map[string]string {
 		}
 	}
 	if endpoints := m.discoverNVMeEndpoints(); len(endpoints) != 0 {
-		for id, path := range assignNVMeBays(endpoints) {
+		table := bayRootPortsForSATARootPort(m.rootPortOfDevice(controller))
+		for id, path := range assignNVMeBays(endpoints, table) {
 			overrides[id] = path
 		}
 	}
@@ -202,13 +231,13 @@ func (m *Manager) discoverNVMeEndpoints() []nvmeEndpoint {
 // 在该仓。表内端口没有端点的仓输出必然不存在的占位路径——既判定为空仓，
 // 也兜住模板固定路径在总线重编号后撞上别的盘、把空仓显示成幻影盘的风险。
 // 挂在未知根端口上的盘（如 PCIe 转接卡）不属于任何 M.2 仓，不参与显示。
-func assignNVMeBays(endpoints []nvmeEndpoint) map[string]string {
-	assigned := make(map[string]string, len(bayRootPorts))
+func assignNVMeBays(endpoints []nvmeEndpoint, table map[string]string) map[string]string {
+	assigned := make(map[string]string, len(table))
 	for _, spec := range storageSlotSpecs {
 		if spec.Kind != "m2" {
 			continue
 		}
-		root := bayRootPorts[spec.ID]
+		root := table[spec.ID]
 		if root == "" {
 			continue
 		}
