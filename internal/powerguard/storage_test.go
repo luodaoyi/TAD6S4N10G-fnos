@@ -298,33 +298,21 @@ func TestParentPCIComponentReturnsUpstreamPort(t *testing.T) {
 	}
 }
 
-func TestBayRootPortsSelectedBySATAControllerRootPort(t *testing.T) {
-	if got := bayRootPortsForSATARootPort("0000:00:1c.0"); got["m2-1"] != "0000:00:1d.1" || got["m2-2"] != "0000:00:1d.0" {
-		t.Fatalf("SATA on 1c.0 (无网卡) 应选 1/2 交错的走线表, got %v", got)
-	}
-	if got := bayRootPortsForSATARootPort("0000:00:1c.2"); got["m2-1"] != "0000:00:1d.0" || got["m2-2"] != "0000:00:1d.1" {
-		t.Fatalf("SATA on 1c.2 (网卡在位) 应选 addon 官方位序表, got %v", got)
-	}
-	if got := bayRootPortsForSATARootPort(""); got["m2-1"] != "0000:00:1d.0" {
-		t.Fatal("未知状态应回退 addon 官方位序表")
-	}
-}
-
-func TestAssignNVMeBaysMatchesMeasuredWiringNoNIC(t *testing.T) {
-	// 2026-09 实测（Mellanox 不在位，SATA 挂 1c.0）：1 号仓空（根端口
-	// 1d.1 不被枚举），2/3/4 号仓分别挂 1d.0/1d.2/1d.3；控制器地址受总线
-	// 重编号影响，不得参与仓位判定。
+func TestAssignNVMeBaysMatchesMeasuredWiring(t *testing.T) {
+	// 2026-09 四轮丝印实测（插拔网卡、换盘、空仓复核）：仓位 N ↔ 根端口
+	// 1d.(N-1)，与整机 addon 官方定义一致；控制器地址受总线重编号影响，
+	// 不得参与仓位判定。网卡在位与否不改变 M.2 绑定。
 	endpoints := []nvmeEndpoint{
-		{RootPort: "0000:00:1d.0", BusPath: "/dev/disk/by-path/pci-0000:03:00.0-nvme-"},
-		{RootPort: "0000:00:1d.2", BusPath: "/dev/disk/by-path/pci-0000:04:00.0-nvme-"},
-		{RootPort: "0000:00:1d.3", BusPath: "/dev/disk/by-path/pci-0000:05:00.0-nvme-"},
+		{RootPort: "0000:00:1d.0", BusPath: "/dev/disk/by-path/pci-0000:04:00.0-nvme-"},
+		{RootPort: "0000:00:1d.1", BusPath: "/dev/disk/by-path/pci-0000:05:00.0-nvme-"},
+		{RootPort: "0000:00:1d.2", BusPath: "/dev/disk/by-path/pci-0000:06:00.0-nvme-"},
 	}
-	got := assignNVMeBays(endpoints, bayRootPortsSATAOn1c0)
+	got := assignNVMeBays(endpoints)
 	want := map[string]string{
-		"m2-1": "/dev/disk/by-path/pci-0000:00:1d.1-empty-nvme-",
-		"m2-2": endpoints[0].BusPath,
-		"m2-3": endpoints[1].BusPath,
-		"m2-4": endpoints[2].BusPath,
+		"m2-1": endpoints[0].BusPath,
+		"m2-2": endpoints[1].BusPath,
+		"m2-3": endpoints[2].BusPath,
+		"m2-4": "/dev/disk/by-path/pci-0000:00:1d.3-empty-nvme-",
 	}
 	if len(got) != len(want) {
 		t.Fatalf("got %v, want %v", got, want)
@@ -336,25 +324,19 @@ func TestAssignNVMeBaysMatchesMeasuredWiringNoNIC(t *testing.T) {
 	}
 }
 
-func TestAssignNVMeBaysMatchesMeasuredWiringWithNIC(t *testing.T) {
-	// 2026-09 实测（Mellanox 在 1c.0，SATA 挤到 1c.2）：1/2/3 号仓分别挂
-	// 1d.0/1d.1/1d.2，4 号仓空（1d.3 不被枚举）。
+func TestAssignNVMeBaysLeavesMidBayEmpty(t *testing.T) {
+	// 空仓在中间（如 2 号仓）：表内端口 1d.1 无端点，其余仓正常锚定
 	endpoints := []nvmeEndpoint{
-		{RootPort: "0000:00:1d.0", BusPath: "/dev/disk/by-path/pci-0000:04:00.0-nvme-"},
-		{RootPort: "0000:00:1d.1", BusPath: "/dev/disk/by-path/pci-0000:05:00.0-nvme-"},
-		{RootPort: "0000:00:1d.2", BusPath: "/dev/disk/by-path/pci-0000:06:00.0-nvme-"},
+		{RootPort: "0000:00:1d.0", BusPath: "/dev/disk/by-path/pci-0000:03:00.0-nvme-"},
+		{RootPort: "0000:00:1d.2", BusPath: "/dev/disk/by-path/pci-0000:04:00.0-nvme-"},
+		{RootPort: "0000:00:1d.3", BusPath: "/dev/disk/by-path/pci-0000:05:00.0-nvme-"},
 	}
-	got := assignNVMeBays(endpoints, bayRootPortsSATAOn1c2)
-	want := map[string]string{
-		"m2-1": endpoints[0].BusPath,
-		"m2-2": endpoints[1].BusPath,
-		"m2-3": endpoints[2].BusPath,
-		"m2-4": "/dev/disk/by-path/pci-0000:00:1d.3-empty-nvme-",
+	got := assignNVMeBays(endpoints)
+	if got["m2-1"] != endpoints[0].BusPath || got["m2-3"] != endpoints[1].BusPath || got["m2-4"] != endpoints[2].BusPath {
+		t.Fatalf("occupied bays misanchored: %v", got)
 	}
-	for id, path := range want {
-		if got[id] != path {
-			t.Fatalf("%s = %q, want %q", id, got[id], path)
-		}
+	if got["m2-2"] != "/dev/disk/by-path/pci-0000:00:1d.1-empty-nvme-" {
+		t.Fatalf("m2-2 = %q, want empty-bay placeholder", got["m2-2"])
 	}
 }
 
@@ -363,11 +345,11 @@ func TestAssignNVMeBaysIgnoresUnknownRootPorts(t *testing.T) {
 		{RootPort: "0000:00:1d.0", BusPath: "/dev/disk/by-path/pci-0000:03:00.0-nvme-"},
 		{RootPort: "0000:00:01.0", BusPath: "/dev/disk/by-path/pci-0000:08:00.0-nvme-"},
 	}
-	got := assignNVMeBays(endpoints, bayRootPortsSATAOn1c0)
-	if got["m2-2"] != endpoints[0].BusPath {
-		t.Fatalf("m2-2 = %q, want anchored endpoint", got["m2-2"])
+	got := assignNVMeBays(endpoints)
+	if got["m2-1"] != endpoints[0].BusPath {
+		t.Fatalf("m2-1 = %q, want anchored endpoint", got["m2-1"])
 	}
-	for _, id := range []string{"m2-1", "m2-3", "m2-4"} {
+	for _, id := range []string{"m2-2", "m2-3", "m2-4"} {
 		if !strings.HasSuffix(got[id], "-empty-nvme-") {
 			t.Fatalf("%s = %q, want empty-bay placeholder", id, got[id])
 		}
