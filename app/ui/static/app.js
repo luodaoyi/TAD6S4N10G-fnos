@@ -1179,12 +1179,12 @@ function renderFanChart(kind = 'cpu') {
   svg.replaceChildren();
 
   [20, 40, 60, 80, 100].forEach((temp) => {
-    svg.append(svgElement('line', { x1: x(temp), y1: top, x2: x(temp), y2: bottom, stroke: 'rgba(72,82,102,.12)' }));
-    svg.append(svgElement('text', { x: x(temp), y: CURVE_VIEWBOX.height - 14 / chartScale, fill: '#7b8290', 'font-size': textSize, 'text-anchor': 'middle' }, `${temp}°`));
+    svg.append(svgElement('line', { x1: x(temp), y1: top, x2: x(temp), y2: bottom, style: 'stroke: var(--chart-grid)' }));
+    svg.append(svgElement('text', { x: x(temp), y: CURVE_VIEWBOX.height - 14 / chartScale, style: 'fill: var(--muted)', 'font-size': textSize, 'text-anchor': 'middle' }, `${temp}°`));
   });
   [30, 50, 70, 100].forEach((speed) => {
-    svg.append(svgElement('line', { x1: left, y1: y(speed), x2: right, y2: y(speed), stroke: 'rgba(72,82,102,.12)' }));
-    svg.append(svgElement('text', { x: left - 8 / chartScale, y: y(speed) + textSize * 0.35, fill: '#7b8290', 'font-size': textSize, 'text-anchor': 'end' }, `${speed}%`));
+    svg.append(svgElement('line', { x1: left, y1: y(speed), x2: right, y2: y(speed), style: 'stroke: var(--chart-grid)' }));
+    svg.append(svgElement('text', { x: left - 8 / chartScale, y: y(speed) + textSize * 0.35, style: 'fill: var(--muted)', 'font-size': textSize, 'text-anchor': 'end' }, `${speed}%`));
   });
   svg.append(svgElement('polyline', {
     points: curve.map((point) => `${x(point.temp_c)},${y(point.pwm_percent)}`).join(' '),
@@ -1200,8 +1200,8 @@ function renderFanChart(kind = 'cpu') {
     const currentLabel = `当前 ${actualTemp.toFixed(1)}°C`;
     const currentLabelWidth = Math.max(72 / chartScale, currentLabel.length * textSize * 0.6);
     const currentX = clamp(x(actualTemp), currentLabelWidth / 2 + 4 / chartScale, CURVE_VIEWBOX.width - currentLabelWidth / 2 - 4 / chartScale);
-    svg.append(svgElement('line', { x1: x(actualTemp), y1: top, x2: x(actualTemp), y2: bottom, stroke: '#e89b24', 'stroke-width': 2, 'stroke-dasharray': '6 5' }));
-    svg.append(svgElement('text', { x: currentX, y: textSize + 4 / chartScale, fill: '#b96f00', 'font-size': textSize, 'text-anchor': 'middle' }, currentLabel));
+    svg.append(svgElement('line', { x1: x(actualTemp), y1: top, x2: x(actualTemp), y2: bottom, style: 'stroke: var(--warning)', 'stroke-width': 2, 'stroke-dasharray': '6 5' }));
+    svg.append(svgElement('text', { x: currentX, y: textSize + 4 / chartScale, style: 'fill: var(--warning)', 'font-size': textSize, 'text-anchor': 'middle' }, currentLabel));
   }
   curve.forEach((point, index) => {
     const selected = index === editor.selectedIndex;
@@ -1216,7 +1216,7 @@ function renderFanChart(kind = 'cpu') {
     svg.append(hitTarget);
     const node = svgElement('circle', {
       cx: nodeX, cy: nodeY, r: selected ? 9 : 7,
-      fill: selected ? editor.color : '#ffffff', stroke: editor.color, 'stroke-width': 3,
+      style: `fill: ${selected ? editor.color : 'var(--surface)'};`, stroke: editor.color, 'stroke-width': 3,
       class: `curve-node curve-node-control${selected ? ' selected' : ''}`, 'data-index': index,
       tabindex: 0, role: 'button', 'aria-label': `节点 ${index + 1}，${point.temp_c} 摄氏度，转速 ${point.pwm_percent}%`,
     });
@@ -1226,7 +1226,7 @@ function renderFanChart(kind = 'cpu') {
     const labelX = clamp(nodeX, 8 / chartScale + labelWidth / 2, CURVE_VIEWBOX.width - 8 / chartScale - labelWidth / 2);
     const labelY = nodeY < 50 / chartScale ? nodeY + 26 / chartScale : nodeY - 16 / chartScale;
     svg.append(svgElement('text', {
-      x: labelX, y: labelY, fill: selected ? editor.color : '#596273',
+      x: labelX, y: labelY, style: `fill: ${selected ? editor.color : 'var(--text-body)'};`,
       'font-size': 12, 'font-weight': selected ? 800 : 600, 'text-anchor': 'middle', class: 'curve-node-label',
     }, label));
   });
@@ -1824,6 +1824,48 @@ $('gpio-script-body').addEventListener('keydown', (event) => {
 document.querySelectorAll('.gpio-action').forEach((select) => {
   select.addEventListener('change', renderGPIOScriptList);
 });
+
+const THEME_STORAGE_KEY = 'tad-theme';
+const THEME_ORDER = ['auto', 'light', 'dark'];
+const THEME_META = {
+  auto: { label: '主题：跟随系统', icon: '🌗' },
+  light: { label: '主题：浅色', icon: '☀️' },
+  dark: { label: '主题：深色', icon: '🌙' },
+};
+
+function currentThemeMode() {
+  try {
+    const saved = window.localStorage.getItem(THEME_STORAGE_KEY);
+    return THEME_ORDER.includes(saved) ? saved : 'auto';
+  } catch (error) {
+    return 'auto';
+  }
+}
+
+function applyTheme(mode) {
+  if (typeof window === 'undefined' || !window.matchMedia) return;
+  const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+  document.documentElement.dataset.theme = mode === 'auto' && prefersDark ? 'dark' : mode === 'dark' ? 'dark' : 'light';
+  const meta = THEME_META[mode];
+  const button = $('theme-toggle');
+  if (button) {
+    button.textContent = meta.icon;
+    button.title = meta.label;
+    button.setAttribute('aria-label', meta.label);
+  }
+}
+
+applyTheme(currentThemeMode());
+const themeToggle = $('theme-toggle');
+if (themeToggle) {
+  themeToggle.addEventListener('click', () => {
+    const next = THEME_ORDER[(THEME_ORDER.indexOf(currentThemeMode()) + 1) % THEME_ORDER.length];
+    try { window.localStorage.setItem(THEME_STORAGE_KEY, next); } catch (error) { /* 隐私模式等场景下仅本次生效 */ }
+    applyTheme(next);
+  });
+  window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => applyTheme(currentThemeMode()));
+}
+
 CURVE_KINDS.forEach(renderFanChart);
 refresh();
 setInterval(() => refresh(true), 5000);
