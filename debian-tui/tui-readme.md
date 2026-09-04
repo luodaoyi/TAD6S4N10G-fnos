@@ -17,7 +17,7 @@ app/ui/static  → 浏览器渲染         debian-tui/tank → curses 终端渲�
 |---|---|
 | `tank` | 终端面板前端（Python + curses）。只读 `/api/status` 并画面板：窗口检测、仓格、明细表、温度/功耗，`q`/`r`/`F1`/`F2` 按键。`tank --once` 输出纯文本快照。 |
 | `tank.service` | systemd 单元，把作者的 Go 二进制跑起来，提供 `/api/status` 这个 unix-socket 接口。 |
-| `install.sh` | 一键构建 + 安装：编译作者 Go 后端、写监控模式配置、装 `tank`、落地并启动 systemd 服务。 |
+| `install-tui.sh` | 一键构建 + 安装：编译作者 Go 后端、写监控模式配置、装 `tank`、落地并启动 systemd 服务。 |
 | `tui-readme.md` | 本说明。 |
 
 > 作者 Go 源码、`internal/powerguard`、`cmd/*`、`app/*`、`manifest` 均未改动；本目录只是**新增**。
@@ -42,12 +42,12 @@ GET /api/status    (server.go)
 
 ```bash
 cd TAD6S4N10G-fnos/debian-tui
-sudo ./install.sh
+sudo ./install-tui.sh
 ```
 
 依赖：`go`（构建后端）、`curl`、`python3`（Debian 自带）。
 
-`install.sh` 做的事：
+`install-tui.sh` 做的事：
 1. `go build ./backend/powerguard`（依赖 `go.mod` 无外部包，可离线）。
 2. 复制 `app/ui/static` 为浏览器版静态资源（可选，TUI 不需要）。
 3. 写 `/etc/tank/config.json`（**监控模式**：`enabled=false`，不改功耗/风扇/GPIO）。

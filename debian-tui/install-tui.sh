@@ -7,7 +7,7 @@
 # limits are NOT changed until you enable them from the panel (F1/F2) or the
 # web UI.
 #
-# Usage:  sudo ./install.sh
+# Usage:  sudo ./install-tui.sh
 # Env:    TANK_LIB=/usr/local/libexec  TANK_ETC=/etc/tank  TANK_VAR=/var/lib/tank
 set -euo pipefail
 
