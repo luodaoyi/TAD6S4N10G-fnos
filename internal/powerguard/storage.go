@@ -163,8 +163,10 @@ func (m *Manager) StorageStatus() StorageStatus {
 }
 
 // RefreshStorageActivity 由 2 秒后台循环调用，是共享采样时间线的唯一写入者：
-// sysfs 读取在锁外完成，锁内只合并结果，不做文件 I/O；合并时重新校验目标
-// 仓位仍持有采样时的设备且未在期间进入休眠，避免与全量扫描竞态错写。
+// sysfs 读取在锁外完成，锁内只合并结果，不做文件 I/O。休眠盘也参与采样——
+// 读 /sys/class/block/*/stat 只是内核计数、不会唤醒硬盘，且保证唤醒前后
+// 时间线连续（Δ 窗口不被休眠时长稀释）；合并时重新校验仓位仍持有采样时的
+// 设备，避免与全量扫描竞态错写。
 func (m *Manager) RefreshStorageActivity() {
 	type target struct {
 		id, kname string
@@ -173,7 +175,7 @@ func (m *Manager) RefreshStorageActivity() {
 	targets := make([]target, 0, len(m.storageStatus.Slots))
 	for index := range m.storageStatus.Slots {
 		slot := &m.storageStatus.Slots[index]
-		if slot.Device == "" || slot.State == StorageEmpty || slot.Activity == StorageActivitySleeping {
+		if slot.Device == "" || slot.State == StorageEmpty {
 			continue
 		}
 		targets = append(targets, target{id: slot.ID, kname: filepath.Base(slot.Device)})
@@ -194,17 +196,26 @@ func (m *Manager) RefreshStorageActivity() {
 	defer m.storageMu.Unlock()
 	for index := range m.storageStatus.Slots {
 		slot := &m.storageStatus.Slots[index]
-		if slot.Device == "" || slot.State == StorageEmpty || slot.Activity == StorageActivitySleeping {
+		if slot.Device == "" || slot.State == StorageEmpty {
 			continue
 		}
 		for _, item := range results {
 			if item.id == slot.ID && item.kname == filepath.Base(slot.Device) {
-				slot.Activity = item.activity
-				slot.Utilization = item.utilization
+				slot.Activity, slot.Utilization = mergeStorageActivity(slot.Activity, item.activity, item.utilization)
 				break
 			}
 		}
 	}
+}
+
+// mergeStorageActivity 合并循环采样结果：休眠中的盘 io_ticks 冻结、只会
+// 采出空闲，没有 I/O 证据（工作/繁忙）时保留"休眠"标签；静默唤醒（盘转
+// 起来了但暂无 I/O）由全量扫描按 SMART 电源模式清除。
+func mergeStorageActivity(current, sampled string, utilization *float64) (string, *float64) {
+	if current == StorageActivitySleeping && sampled != StorageActivityWorking && sampled != StorageActivityBusy {
+		return current, nil
+	}
+	return sampled, utilization
 }
 
 func cloneStorageStatus(status StorageStatus) StorageStatus {
@@ -322,6 +333,11 @@ func (m *Manager) collectStorage(forceSMART bool) StorageStatus {
 		slot.TemperatureC = result.TemperatureC
 		if powerModeIsSleeping(result.PowerMode) {
 			slot.Activity = StorageActivitySleeping
+			slot.Utilization = nil
+		} else if slot.Activity == StorageActivitySleeping {
+			// 静默唤醒（盘已转起但暂无 I/O 证据）：清掉过期的休眠标记，
+			// 活动循环下一拍会重新给出真实忙闲。
+			slot.Activity = StorageActivityUnknown
 			slot.Utilization = nil
 		}
 		slot.Health = "正常"

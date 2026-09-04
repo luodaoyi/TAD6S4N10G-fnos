@@ -376,6 +376,30 @@ func TestActivityFromUtilizationBoundaries(t *testing.T) {
 	}
 }
 
+func TestMergeStorageActivityPreservesSleepUntilIOEvidence(t *testing.T) {
+	util := 7.0
+	cases := []struct {
+		current, sampled string
+		want             string
+		wantUtil         bool
+		note             string
+	}{
+		{StorageActivitySleeping, StorageActivityIdle, StorageActivitySleeping, false, "休眠中 io_ticks 冻结采出空闲，保留休眠"},
+		{StorageActivitySleeping, StorageActivityUnknown, StorageActivitySleeping, false, "采样读失败不覆盖休眠"},
+		{StorageActivitySleeping, StorageActivityWorking, StorageActivityWorking, true, "唤醒后出现 I/O 立即覆盖"},
+		{StorageActivitySleeping, StorageActivityBusy, StorageActivityBusy, true, "繁忙同样覆盖"},
+		{StorageActivityUnknown, StorageActivityIdle, StorageActivityIdle, true, "非休眠状态直接采用采样（idle 带 0% 指针也透传）"},
+		{StorageActivityIdle, StorageActivityWorking, StorageActivityWorking, true, "空闲→工作"},
+	}
+	for _, item := range cases {
+		got, utilOut := mergeStorageActivity(item.current, item.sampled, &util)
+		if got != item.want || (utilOut != nil) != item.wantUtil {
+			t.Fatalf("mergeStorageActivity(%q, %q) = (%q, util=%v), want %q util=%v（%s）",
+				item.current, item.sampled, got, utilOut, item.want, item.wantUtil, item.note)
+		}
+	}
+}
+
 func TestReadBlockActivitySubHalfPercentIsIdle(t *testing.T) {
 	resetBlockIOStates()
 	root := t.TempDir()
