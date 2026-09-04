@@ -1843,16 +1843,21 @@ function currentThemeMode() {
 }
 
 // fnOS 没有公开的插件主题接口；插件页与 fnOS 桌面同源内嵌时，读取父窗口
-// 明暗（主题属性/类名，退而求其次按根元素背景亮度判断）实现自动跟随。
-// fnOS 实测（v0.10.x）：桌面在 <html> 上挂 class="light"/"dark"。
-// 跨域或无父窗口时返回 null，退回浏览器 prefers-color-scheme。
+// 明暗实现自动跟随。fnOS 实测（1.2.0505）：桌面主题挂在 <body theme-mode=
+// "dark|light"> 属性上（Semi Design 的暗色选择器即 body[theme-mode=dark]），
+// <html> 的 class="light" 是引导脚本默认值、从不随主题变；body 无该属性时
+// 按根元素背景亮度兜底。跨域或无父窗口时返回 null，退回 prefers-color-scheme。
 function detectParentTheme() {
   try {
     if (window.parent === window || !window.parent.document) return null;
     const parent = window.parent;
     const root = parent.document.documentElement;
+    const body = parent.document.body;
+    const bodyMode = (body.getAttribute('theme-mode') || '').trim().toLowerCase();
+    if (bodyMode === 'dark') return 'dark';
+    if (bodyMode === 'light') return 'light';
     const themeAttr = `${root.getAttribute('data-theme') || ''} ${root.getAttribute('data-bs-theme') || ''}`;
-    const className = `${root.className || ''} ${parent.document.body.className || ''}`;
+    const className = `${root.className || ''} ${body.className || ''}`;
     const tokens = `${themeAttr} ${className}`;
     if (/(^|\s)(dark|night)(\s|$)/i.test(tokens)) return 'dark';
     if (/(^|\s)light(\s|$)/i.test(tokens)) return 'light';
@@ -1895,12 +1900,16 @@ if (themeToggle) {
     applyTheme(next);
   });
   window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => applyTheme(currentThemeMode()));
-  // 跟随系统档下监听 fnOS 桌面主题变化（同源时可监听到父窗口 class/属性变动）
+  // 跟随档下监听 fnOS 桌面主题变化（同源时监听父窗口 html/body 属性变动）
   try {
     if (window.parent !== window && window.parent.MutationObserver) {
       const reapply = () => applyTheme(currentThemeMode());
-      new window.parent.MutationObserver(reapply).observe(window.parent.document.documentElement, {
+      const observer = new window.parent.MutationObserver(reapply);
+      observer.observe(window.parent.document.documentElement, {
         attributes: true, attributeFilter: ['class', 'data-theme', 'data-bs-theme', 'style'],
+      });
+      observer.observe(window.parent.document.body, {
+        attributes: true, attributeFilter: ['class', 'theme-mode', 'style'],
       });
     }
   } catch (error) { /* 父窗口不可读时仅跟随浏览器偏好 */ }
