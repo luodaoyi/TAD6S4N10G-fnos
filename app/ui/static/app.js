@@ -595,7 +595,8 @@ function healthIssues(status, fanStatus, storageStatus, gpioStatus) {
   if (storageStatus.updated_at && !detectedSlots.length) {
     issues.push('未检测到任何已插入硬盘；若机器实际装有硬盘，请检查 AHCI/NVMe 驱动和槽位映射');
   }
-  const missingTemperatureSlots = detectedSlots.filter((slot) => !(Number(slot.temperature_c) > 0));
+  // 休眠盘不读取温度是设计行为（避免唤醒），不构成温度接口故障
+  const missingTemperatureSlots = detectedSlots.filter((slot) => slot.activity !== 'sleeping' && !(Number(slot.temperature_c) > 0));
   if (missingTemperatureSlots.length) {
     const labels = missingTemperatureSlots.map((slot) => (slot.kind === 'front' ? `SATA ${slot.slot}` : `NVMe ${slot.slot}`));
     issues.push(`${labels.join('、')} 未读取到温度；请检查 SMART/NVMe 温度接口与相关驱动`);
