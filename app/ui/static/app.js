@@ -484,8 +484,14 @@ function renderStorageVisual(storage = {}) {
       marker.querySelector('.storage-slot-text b').textContent = id.split('-').pop();
       const compact = window.matchMedia('(max-width: 599px)').matches;
       const hasTemperature = Number(slot.temperature_c) > 0;
-      if (tone === 'empty' || !hasTemperature) {
+      if (tone === 'empty') {
         temperature.textContent = '';
+      } else if (!hasTemperature) {
+        // 手机版前置仓没有独立状态行（CSS 隐藏），休眠等无温度状态借用温
+        // 度位显示，否则休眠盘在盘位图上与空仓无从区分；桌面端状态由 small 行显示。
+        temperature.textContent = compact && group.kind === 'front'
+          ? storageSlotStatusLabel(slot, tone)
+          : '';
       } else if (compact && group.kind === 'front') {
         temperature.textContent = `${Math.round(Number(slot.temperature_c))}\n°C`;
       } else if (compact) {
