@@ -400,6 +400,94 @@ func TestMergeStorageActivityPreservesSleepUntilIOEvidence(t *testing.T) {
 	}
 }
 
+func seededActivityManager(t *testing.T, statLine string) (*Manager, string) {
+	t.Helper()
+	resetBlockIOStates()
+	root := t.TempDir()
+	statPath := filepath.Join(root, "sys", "class", "block", "sda", "stat")
+	if err := os.MkdirAll(filepath.Dir(statPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeBlockStat(t, statPath, statLine)
+	return &Manager{Root: root}, statPath
+}
+
+func (m *Manager) seedSlot(t *testing.T, slot StorageSlot) {
+	t.Helper()
+	m.storageMu.Lock()
+	defer m.storageMu.Unlock()
+	m.storageStatus = StorageStatus{Slots: []StorageSlot{slot}}
+}
+
+func TestCachedStorageActivityCarriesOverOnlyForSameDevice(t *testing.T) {
+	manager, _ := seededActivityManager(t, "1 0 8 2 3 0 9 4 0 100 0\n")
+	util := 7.0
+	manager.seedSlot(t, StorageSlot{
+		ID: "front-1", Kind: "front", Slot: 1, State: StorageUsed,
+		Device: "/dev/sda", Activity: StorageActivityWorking, Utilization: &util,
+	})
+
+	if activity, got := manager.cachedStorageActivity("front-1", "sda"); activity != StorageActivityWorking || got == nil || *got != 7 {
+		t.Fatalf("cached carry-over = (%q, %v), want working/7", activity, got)
+	}
+	if activity, got := manager.cachedStorageActivity("front-1", "sdb"); activity != StorageActivityUnknown || got != nil {
+		t.Fatalf("device swap must not carry over, got (%q, %v)", activity, got)
+	}
+	if activity, got := manager.cachedStorageActivity("front-2", "sda"); activity != StorageActivityUnknown || got != nil {
+		t.Fatalf("unknown slot must not carry over, got (%q, %v)", activity, got)
+	}
+}
+
+func TestRefreshStorageActivityMergesWithoutLockHeldIO(t *testing.T) {
+	manager, statPath := seededActivityManager(t, "1 0 8 2 3 0 9 4 0 100 0\n")
+	manager.seedSlot(t, StorageSlot{
+		ID: "front-1", Kind: "front", Slot: 1, State: StorageUsed,
+		Device: "/dev/sda", Activity: StorageActivityUnknown,
+	})
+
+	manager.RefreshStorageActivity() // 首拍：无前序样本，写入时间线
+	if activity, util := manager.storageStatus.Slots[0].Activity, manager.storageStatus.Slots[0].Utilization; activity != StorageActivityIdle || util != nil {
+		t.Fatalf("first tick: got (%q, %v), want idle/nil", activity, util)
+	}
+
+	sample, ok := loadBlockIO("sda")
+	if !ok {
+		t.Fatal("timeline not seeded by first tick")
+	}
+	sample.SampledAt = sample.SampledAt.Add(-time.Second)
+	storeBlockIO("sda", sample)
+	writeBlockStat(t, statPath, "1 0 8 2 3 0 9 4 0 170 0\n")
+
+	manager.RefreshStorageActivity() // 第二拍：Δ=70ms io_ticks / 1s ≈ 7%
+	slot := manager.storageStatus.Slots[0]
+	if slot.Activity != StorageActivityWorking || slot.Utilization == nil || *slot.Utilization < 6 || *slot.Utilization > 8 {
+		t.Fatalf("second tick: got (%q, %v), want working ≈7%%", slot.Activity, slot.Utilization)
+	}
+}
+
+func TestRefreshStorageActivityPreservesSleepingUntilIO(t *testing.T) {
+	manager, statPath := seededActivityManager(t, "1 0 8 2 3 0 9 4 0 100 0\n")
+	manager.seedSlot(t, StorageSlot{
+		ID: "front-1", Kind: "front", Slot: 1, State: StorageUsed,
+		Device: "/dev/sda", Activity: StorageActivitySleeping,
+	})
+
+	manager.RefreshStorageActivity() // 休眠中 io_ticks 冻结 → 采出空闲 → 保留休眠
+	if activity, util := manager.storageStatus.Slots[0].Activity, manager.storageStatus.Slots[0].Utilization; activity != StorageActivitySleeping || util != nil {
+		t.Fatalf("sleeping slot: got (%q, %v), want sleeping/nil", activity, util)
+	}
+
+	sample, _ := loadBlockIO("sda") // 休眠期间时间线仍被推进（不丢更新）
+	sample.SampledAt = sample.SampledAt.Add(-time.Second)
+	storeBlockIO("sda", sample)
+	writeBlockStat(t, statPath, "1 0 8 2 3 0 9 4 0 880 0\n") // 唤醒后 78% I/O
+
+	manager.RefreshStorageActivity()
+	if activity := manager.storageStatus.Slots[0].Activity; activity != StorageActivityBusy {
+		t.Fatalf("woken slot with IO: got %q, want busy", activity)
+	}
+}
+
 func TestReadBlockActivitySubHalfPercentIsIdle(t *testing.T) {
 	resetBlockIOStates()
 	root := t.TempDir()
