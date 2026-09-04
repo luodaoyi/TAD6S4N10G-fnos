@@ -254,7 +254,7 @@ func sampleUtil(t *testing.T, manager *Manager, path, kname, line string, elapse
 		storeBlockIO(kname, sample)
 	}
 	writeBlockStat(t, path, line)
-	return manager.readBlockActivity(kname, "front")
+	return manager.readBlockActivity(kname)
 }
 
 func TestReadBlockActivityUsesUtilizationBands(t *testing.T) {
@@ -302,7 +302,7 @@ func TestReadBlockActivityUtilizationMatchesDiskstatsUtil(t *testing.T) {
 	}
 	manager := &Manager{Root: root}
 	writeBlockStat(t, statPath, "1 0 8 2 3 0 9 4 0 100 0\n")
-	if _, util := manager.readBlockActivity("sda", "front"); util != nil {
+	if _, util := manager.readBlockActivity("sda"); util != nil {
 		t.Fatalf("first sample should not have utilization, got %v", *util)
 	}
 	sample, ok := loadBlockIO("sda")
@@ -312,7 +312,7 @@ func TestReadBlockActivityUtilizationMatchesDiskstatsUtil(t *testing.T) {
 	sample.SampledAt = sample.SampledAt.Add(-time.Second)
 	storeBlockIO("sda", sample)
 	writeBlockStat(t, statPath, "2 0 8 12 4 0 9 14 0 830 0\n")
-	got, util := manager.readBlockActivity("sda", "front")
+	got, util := manager.readBlockActivity("sda")
 	if util == nil {
 		t.Fatal("expected utilization")
 	}
@@ -333,12 +333,12 @@ func TestReadBlockActivityWorkingWhenUtilIsNonzero(t *testing.T) {
 	}
 	manager := &Manager{Root: root}
 	writeBlockStat(t, statPath, "10 0 8 2 3 0 9 4 0 100 0\n")
-	manager.readBlockActivity("sdb", "front")
+	manager.readBlockActivity("sdb")
 	sample, _ := loadBlockIO("sdb")
 	sample.SampledAt = sample.SampledAt.Add(-time.Second)
 	storeBlockIO("sdb", sample)
 	writeBlockStat(t, statPath, "10 0 8 2 3 0 9 4 0 170 0\n")
-	got, util := manager.readBlockActivity("sdb", "front")
+	got, util := manager.readBlockActivity("sdb")
 	if got != StorageActivityWorking {
 		t.Fatalf("util 7%% without new r/w: got %q, want working", got)
 	}
@@ -356,17 +356,23 @@ func containsString(values []string, want string) bool {
 	return false
 }
 
-func TestReadBlockActivityBusyOnFirstSampleWithInFlight(t *testing.T) {
-	resetBlockIOStates()
-	root := t.TempDir()
-	statPath := filepath.Join(root, "sys", "class", "block", "sdc", "stat")
-	if err := os.MkdirAll(filepath.Dir(statPath), 0o755); err != nil {
-		t.Fatal(err)
+func TestActivityFromUtilizationBoundaries(t *testing.T) {
+	cases := []struct {
+		util float64
+		want string
+		note string
+	}{
+		{0.4, StorageActivityIdle, "低于 0.5 经前端取整显示 0%，归空闲"},
+		{0.5, StorageActivityWorking, "0.5 恰好进入工作带"},
+		{0.51, StorageActivityWorking, "0.51 工作带"},
+		{70, StorageActivityWorking, "70 仍属工作带"},
+		{70.01, StorageActivityBusy, "刚超过 70 判繁忙"},
+		{100, StorageActivityBusy, "100 繁忙"},
 	}
-	manager := &Manager{Root: root}
-	got, util := sampleUtil(t, manager, statPath, "sdc", "1 0 8 2 3 0 9 4 7 100 0\n", 0)
-	if got != StorageActivityBusy || util != nil {
-		t.Fatalf("first sample with in-flight IO: got %q util %v, want busy and nil", got, util)
+	for _, item := range cases {
+		if got := activityFromUtilization(item.util); got != item.want {
+			t.Fatalf("activityFromUtilization(%.2f) = %q, want %q（%s）", item.util, got, item.want, item.note)
+		}
 	}
 }
 

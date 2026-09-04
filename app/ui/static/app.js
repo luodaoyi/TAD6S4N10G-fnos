@@ -253,13 +253,21 @@ function storageSlotStatusLabel(slot = {}, tone = '') {
   if (isStorageHot(slot)) return '高温';
   if (slot.state === 'present') return '未使用';
   if (slot.state === 'unknown') return STORAGE_STATE_LABELS.unknown;
+  // used 只代表"已使用"，不等于 SMART 健康；无活动读数时回退状态标签。
   return STORAGE_ACTIVITY_LABELS[slot.activity]
-    || (slot.state === 'used' ? '健康' : (STORAGE_STATE_LABELS[slot.state] || STORAGE_STATE_LABELS.unknown));
+    || STORAGE_STATE_LABELS[slot.state]
+    || STORAGE_STATE_LABELS.unknown;
 }
 
 function connectedFans(fanStatus = {}, limit = 0) {
   const fans = (fanStatus.fans || []).filter((fan) => Number(fan.rpm) >= 0);
   return limit > 0 ? fans.slice(0, limit) : fans;
+}
+
+// 选择器签名只由风扇集合决定、与转速无关：瞬时 0 转（停转或故障保护）
+// 不会触发列表重建，未保存的勾选因此不会丢。
+function fanListSignature(fans = []) {
+  return fans.map((fan) => fan.id).join('|');
 }
 
 function fanLabel(fan, fans = []) {
@@ -1253,7 +1261,7 @@ function populateFanDevices(status, keepInputs) {
   const select = $('fan-device');
   const fans = connectedFans(status.fan_control);
   const config = status.config?.fan || {};
-  const signature = fans.map((fan) => fan.id).join('|');
+  const signature = fanListSignature(fans);
   const rebuild = signature !== fanSelectorSignature;
   if (rebuild) {
     fanSelectorSignature = signature;
