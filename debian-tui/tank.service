@@ -1,0 +1,24 @@
+[Unit]
+Description=TAD6S4N fnOS powerguard module backend (provides /api/status for the tank TUI)
+After=syslog.target
+RequiresMountsFor=/run/tank
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/local/libexec/tank/tad-module serve \
+    --config /etc/tank/config.json \
+    --state /var/lib/tank/original-state.json \
+    --socket /run/tank/tad-module.sock \
+    --web-root /usr/local/libexec/tank/ui \
+    --log /var/log/tank/tad-module.log
+RuntimeDirectory=tank
+RuntimeDirectoryMode=0755
+StateDirectory=tank
+LogsDirectory=tank
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

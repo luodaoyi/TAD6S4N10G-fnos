@@ -1,0 +1,636 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""tank - TAD6S4N Hardware Monitor TUI (native Debian).
+
+Pure presentation shell. All hardware data comes from the fnOS TAD6S4N10G
+module's Go service via its Unix-socket HTTP API (/api/status). No hardware
+reading, bay mapping or power/fan logic lives here; that all stays in the
+author's `internal/powerguard` code.
+
+Usage:
+    tank                 interactive panel (auto-resize)
+    tank --once          print one snapshot and exit (non-interactive)
+
+Environment:
+    TANK_SOCKET   Unix socket of the Go service (default /run/tank/tad-module.sock)
+    TANK_MIN_W    minimum terminal width  (default 85)
+    TANK_MIN_H    minimum terminal height (default 24)
+    TANK_REFRESH  auto-refresh seconds    (default 2)
+"""
+
+import curses
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import unicodedata
+
+SOCKET = os.environ.get("TANK_SOCKET", "/run/tank/tad-module.sock")
+MIN_W = int(os.environ.get("TANK_MIN_W", "85"))
+MIN_H = int(os.environ.get("TANK_MIN_H", "24"))
+REFRESH = float(os.environ.get("TANK_REFRESH", "2"))
+BASE_URL = "http://localhost"
+# Temporarily disable the "window too small" check by default. Set
+# TANK_CHECK_SIZE=1 to re-enable the warning box.
+CHECK_SIZE = os.environ.get("TANK_CHECK_SIZE", "").strip().lower() in ("1", "true", "yes")
+
+STATE_STYLE = {
+    "used":     ("green",  "使用"),
+    "present":  ("gray",   "未用"),
+    "sleeping": ("blue",   "休眠"),
+    "warning":  ("red",    "告警"),
+    "unknown":  ("yellow", "未知"),
+    "empty":    ("dim",    "空置"),
+}
+ACTIVITY_LABEL = {
+    "busy": "繁忙", "working": "工作", "idle": "空闲",
+    "sleeping": "休眠", "unknown": "未知", "": "未知",
+}
+FAN_MODE = {0: "满载", 1: "手动", 2: "自动", 3: "自动"}
+
+C_TITLE, C_GREEN, C_RED, C_GRAY, C_BLUE = 1, 2, 3, 4, 5
+C_YELLOW, C_DIM, C_CYAN = 6, 7, 8
+
+
+def fetch(path="/api/status", method="GET", payload=None, admin=False):
+    args = [
+        "curl", "--unix-socket", SOCKET, "-s", "--max-time", "3",
+        "-X", method, BASE_URL + path,
+    ]
+    if admin:
+        args += ["-H", "X-Trim-Isadmin: true"]
+    if payload is not None:
+        args += ["-H", "Content-Type: application/json", "--data", json.dumps(payload)]
+    try:
+        proc = subprocess.run(args, capture_output=True, text=True, timeout=5)
+    except FileNotFoundError:
+        return None, "curl 未安装"
+    except Exception as exc:
+        return None, str(exc)
+    if proc.returncode != 0:
+        return None, (proc.stderr.strip() or "curl 退出码 %d" % proc.returncode)
+    try:
+        return json.loads(proc.stdout), None
+    except json.JSONDecodeError as exc:
+        return None, "响应不是 JSON: %s" % exc
+
+
+def human_size(num):
+    try:
+        num = float(num or 0)
+    except (TypeError, ValueError):
+        return "-"
+    for unit in ("B", "KB", "MB", "GB", "TB", "PB"):
+        if num < 1024 or unit == "PB":
+            break
+        num /= 1024
+    return "%d B" % int(num) if unit == "B" else "%.1f %s" % (num, unit)
+
+
+def disp_width(text):
+    """Display width in terminal cells (CJK/wide chars = 2)."""
+    return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1 for ch in text)
+
+
+def trim_display(text, width):
+    """Truncate text to 'width' terminal cells (CJK = 2)."""
+    out, w = "", 0
+    for ch in text:
+        cw = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        if w + cw > width:
+            break
+        out += ch
+        w += cw
+    return out
+
+
+def pad_display(text, width):
+    """Left-align + pad/trim by DISPLAY width, so mixed CJK/ASCII and box glyphs
+    never misalign the borders."""
+    if width <= 0:
+        return text
+    out, w = "", 0
+    for ch in text:
+        cw = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        if w + cw > width:
+            break
+        out += ch
+        w += cw
+    if w < width:
+        out += " " * (width - w)
+    return out
+
+
+def temp_str(c):
+    if c is None:
+        return "--"
+    try:
+        return "%04.1f°C" % float(c)  # 00.0 / 35.0 / 100.0 (aligns columns)
+    except (TypeError, ValueError):
+        return "--"
+
+
+def glyph_for(state):
+    # matched filled/hollow rectangle pair (█ / □): same visual width, so bays align.
+    return "█" if state in ("used", "present", "sleeping", "warning") else "□"
+
+
+def slot_style(state):
+    return STATE_STYLE.get(state, STATE_STYLE["unknown"])
+
+
+def setup_colors():
+    if curses.has_colors():
+        curses.start_color()
+        curses.use_default_colors()
+        curses.init_pair(C_TITLE, curses.COLOR_WHITE, curses.COLOR_BLUE)
+        curses.init_pair(C_GREEN, curses.COLOR_GREEN, -1)
+        curses.init_pair(C_RED, curses.COLOR_RED, -1)
+        curses.init_pair(C_GRAY, curses.COLOR_WHITE, curses.COLOR_BLACK)
+        curses.init_pair(C_BLUE, curses.COLOR_CYAN, -1)
+        curses.init_pair(C_YELLOW, curses.COLOR_YELLOW, -1)
+        curses.init_pair(C_DIM, curses.COLOR_WHITE, -1)
+        curses.init_pair(C_CYAN, curses.COLOR_CYAN, -1)
+
+
+def color_for(name):
+    return {
+        "green": C_GREEN, "red": C_RED, "gray": C_GRAY, "blue": C_BLUE,
+        "yellow": C_YELLOW, "dim": C_DIM,
+    }.get(name, 0)
+
+
+def addclamp(win, y, x, text, attr=0):
+    try:
+        h, w = win.getmaxyx()
+    except curses.error:
+        return
+    if y < 0 or y >= h or x < 0 or x >= w:
+        return
+    text = str(text)
+    if x + len(text) > w:
+        text = text[: max(0, w - x)]
+    try:
+        win.addstr(y, x, text, attr)
+    except curses.error:
+        pass
+
+
+def box(win, y, x, w, h, attr=0):
+    """Simple rectangle, used by the warning screen."""
+    if w < 2:
+        return
+    try:
+        win.addstr(y, x, "┌" + "─" * (w - 2) + "┐", attr)
+        win.addstr(y + h, x, "└" + "─" * (w - 2) + "┘", attr)
+        for yy in range(y + 1, y + h):
+            addclamp(win, yy, x, "│", attr)
+            addclamp(win, yy, x + w - 1, "│", attr)
+    except curses.error:
+        pass
+
+
+def grid_lines(cells2d, wid, hgt):
+    """Render a 2D grid of cells as a list of box-drawing strings.
+
+    cells2d[r][c] = list of content lines (strings) drawn inside cell (r,c).
+    wid  = fixed inner width of every cell; hgt = fixed inner height.
+    Returns list[str], each line has box borders (┌┬┬┐ / │  │ / ├┼┤ / └┴┴┘).
+    """
+    rows, cols = len(cells2d), len(cells2d[0])
+    top = "┌" + "┬".join("─" * wid for _ in range(cols)) + "┐"
+    bottom = "└" + "┴".join("─" * wid for _ in range(cols)) + "┘"
+    divider = "├" + "┼".join("─" * wid for _ in range(cols)) + "┤"
+    lines = [top]
+    for r in range(rows):
+        for ri in range(hgt):
+            seg = []
+            for c in range(cols):
+                content = cells2d[r][c]
+                text = content[ri] if ri < len(content) else ""
+                text = pad_display(text, wid)
+                seg.append("│" + text)
+            lines.append("".join(seg) + "│")
+        if r < rows - 1:
+            lines.append(divider)
+    lines.append(bottom)
+    return lines
+
+
+def stack_h(lines_a, lines_b, pad=3, limit=10_000):
+    """Place two boxes side by side; returns list of joined lines or None."""
+    if not lines_a or not lines_b:
+        return None
+    total = len(lines_a[0]) + pad + len(lines_b[0])
+    if total > limit:
+        return None
+    out = []
+    n = max(len(lines_a), len(lines_b))
+    for i in range(n):
+        a = lines_a[i] if i < len(lines_a) else " " * len(lines_a[0])
+        b = lines_b[i] if i < len(lines_b) else " " * len(lines_b[0])
+        out.append(a + " " * pad + b)
+    return out
+
+
+def front_box_lines(slots, wid=6):
+    """front slots 6..1 left-to-right, two content rows: number+glyph, state/temp."""
+    order = sorted(slots, key=lambda s: -s.get("slot", 0))  # 6,5,4,3,2,1
+    cells = []
+    for s in order:
+        num = s.get("slot", 0)
+        gly = glyph_for(s.get("state", "unknown"))
+        line0 = "%d%s" % (num, gly)
+        # always a fixed-width temperature (00.0°C for empty) -> cells align
+        line1 = temp_str(s.get("temperature_c") or 0.0)
+        cells.append([line0, line1])
+    return grid_lines([cells], wid, 2)
+
+
+def m2_box_lines(slots, wid=9):
+    """m2 2x2 grid, slot layout [[4,2],[3,1]]; number+glyph / temp, no words."""
+    by = {s.get("slot", 0): s for s in slots}
+    layout = [[4, 2], [3, 1]]
+    cells2d = []
+    for row in layout:
+        cells = []
+        for num in row:
+            s = by.get(num)
+            gly = glyph_for(s.get("state", "unknown")) if s else "○"
+            temp = temp_str((s.get("temperature_c") or 0.0) if s else 0.0)
+            cells.append(["%d%s" % (num, gly), temp])
+        cells2d.append(cells)
+    return grid_lines(cells2d, wid, 2)
+
+
+def draw_warning(win, h, w, need_w=85, need_h=24):
+    title = "⚠  终端窗口太小无法显示完整面板"
+    body = [
+        "当前尺寸: %d x %d" % (w, h),
+        "需要尺寸: %d x %d 以上" % (need_w, need_h),
+        "",
+        "请将 SSH 终端窗口拉大后重试...",
+    ]
+    bw = max(len(title) + 4, min(w - 4, 46))
+    bh = 3 + len(body) + 1
+    bx = max(0, (w - bw) // 2)
+    by = max(0, (h - bh) // 2)
+    if w - bx < bw:
+        bx = 0
+    if h - by < bh:
+        by = 0
+    box(win, by, bx, bw, bh)
+    addclamp(win, by + 1, bx + 1, title, curses.A_BOLD | color_for("yellow"))
+    for i, line in enumerate(body):
+        addclamp(win, by + 2 + i, bx + 1, line)
+    addclamp(win, by + bh - 1, bx + 1, "拉大后自动重绘  |  q 退出  |  tank --once 看文字面板", curses.A_DIM)
+
+
+def build_stats(status):
+    if not status:
+        return {}
+    cow = status.get("cpu_temperature") or {}
+    fan = status.get("fan_control") or {}
+    pl1 = pl2 = pl1m = pl2m = 0
+    for pkg in status.get("packages") or []:
+        pl1 = max(pl1, int(pkg.get("pl1_w", 0) or 0))
+        pl1m = max(pl1m, int(pkg.get("pl1_max_w", 0) or 0))
+        pl2 = max(pl2, int(pkg.get("pl2_w", 0) or 0))
+        pl2m = max(pl2m, int(pkg.get("pl2_max_w", 0) or 0))
+    return {
+        "name": status.get("device_name") or "",
+        "os": ("%s %s" % (status.get("os_name", ""), status.get("os_version", ""))).strip(),
+        "cpu": status.get("cpu_model") or "",
+        "profile": (status.get("profile") or {}).get("display") or "",
+        "core": cow.get("core_max_c"),
+        "package": cow.get("package_max_c"),
+        "fan_driver": fan.get("driver_detected", False),
+        "fan_active": fan.get("active", False),
+        "fan_rpm": 0, "fan_pct": None, "fan_mode": None,
+        "fan_err": fan.get("last_error") or "",
+        "pl1": pl1, "pl2": pl2, "pl1m": pl1m, "pl2m": pl2m,
+        "slots": (status.get("storage") or {}).get("slots") or [],
+        "storage_err": (status.get("storage") or {}).get("last_error") or "",
+        "gpio_err": (status.get("gpio") or {}).get("last_error") or "",
+        "last_error": status.get("last_error") or "",
+        "config": status.get("config") or {},
+    }
+
+
+def read_drivetemp():
+    """Map kernel 'drivetemp' hwmon -> {blockdev: celsius}.
+
+    The author reads HDD temperature via smartctl -n standby, which skips
+    sleeping drives (so temperature_c is omitted -> '--'). The kernel's
+    drivetemp driver reports SATA temperature without waking drives, so we
+    supplement it here (read-only; the author's Go code is untouched).
+    Returns {"sda": 44.0, ...}.
+    """
+    result = {}
+    pattern = "/sys/class/hwmon/hwmon*/name"
+    for name_path in glob.glob(pattern):
+        try:
+            name = open(name_path).read().strip()
+        except OSError:
+            continue
+        if name != "drivetemp":
+            continue
+        hw = os.path.dirname(name_path)
+        dev = os.path.realpath(os.path.join(hw, "device"))
+        sid = re.search(r"(?:\d+-)?(\d+:\d+:\d+:\d+)$", dev)
+        if not sid:
+            continue
+        scsi = sid.group(1)
+        try:
+            blocks = os.listdir("/sys/class/scsi_device/%s/device/block/" % scsi)
+        except OSError:
+            continue
+        if not blocks:
+            continue
+        try:
+            temp = int(open(os.path.join(hw, "temp1_input")).read().strip()) / 1000.0
+        except (OSError, ValueError):
+            continue
+        result[blocks[0]] = temp
+    return result
+
+
+def best_fan(fan):
+    fans = fan.get("fans") or []
+    if not fans:
+        return 0, None, None
+    best = fans[0]
+    for f in fans:
+        if (f.get("rpm", 0) or 0) > (best.get("rpm", 0) or 0):
+            best = f
+    return best.get("rpm", 0) or 0, best.get("pwm_percent"), best.get("mode")
+
+
+def header_lines(st):
+    """Two header rows: line1 = CPU/Fan/Power, line2 = Core/Package temps.
+    Splitting Core onto its own row shortens the widest line so the panel fits
+    a normal SSH window."""
+    cpu = st.get("cpu") or "-"
+    core = temp_str(st.get("core"))
+    pkg = temp_str(st.get("package"))
+    if st.get("fan_driver") and st.get("fan_rpm"):
+        mode = FAN_MODE.get(st.get("fan_mode"), "?")
+        pct = "?" if st.get("fan_pct") is None else str(st["fan_pct"])
+        fan = "Fan: %dRPM(%s/%s%%)" % (st["fan_rpm"], mode, pct)
+    else:
+        fan = "Fan: N/A"
+    if st.get("pl1") or st.get("pl2"):
+        pw = "PL %02d/%02dW" % (st.get("pl1", 0), st.get("pl2", 0))
+    else:
+        pw = "PL N/A"
+    line1 = "CPU: %s | %s | %s" % (cpu, fan, pw)
+    line2 = "Core: %s | Package: %s" % (core, pkg)
+    return [(line1, 0), (line2, 0)]
+
+
+def compose_panel(status, err):
+    """Build content rows (text, color) and return (rows, inner_width).
+
+    The panel has a FIXED natural size; the terminal is only checked to see
+    whether it fits (window resize does not stretch the panel).
+    """
+    st = build_stats(status)
+    fan = (status.get("fan_control") or {}) if status else {}
+    if fan:
+        st["fan_rpm"], st["fan_pct"], st["fan_mode"] = best_fan(fan)
+
+    if not err:
+        content = list(header_lines(st))
+    else:
+        content = [(header_lines(st)[0][0], 0)]
+    content.append(("", 0))
+    if err:
+        content.append(("取数失败: %s" % err, color_for("red") | curses.A_BOLD))
+
+    slots = st.get("slots") or []
+    # Supplement missing SATA (front) temperatures from the kernel drivetemp
+    # hwmon, so sleeping drives still show a reading instead of "--".
+    try:
+        dtemp = read_drivetemp()
+        for s in slots:
+            if (s.get("kind") == "front" and s.get("device")):
+                dev = os.path.basename(s["device"])
+                if not s.get("temperature_c") and dev in dtemp:
+                    s["temperature_c"] = dtemp[dev]
+    except Exception:
+        pass
+    front = [s for s in slots if s.get("kind") == "front"]
+    m2 = [s for s in slots if s.get("kind") == "m2"]
+    if front and m2:
+        # stacked vertically: front bay on top, M.2 below (simpler than side-by-side)
+        content.append(("[ 前置 3.5\" 硬盘槽位 ]", 0))
+        content += [(c, 0) for c in front_box_lines(front)]
+        content.append(("", 0))
+        content.append(("[ 内置 M.2 NVMe 槽位 ]", 0))
+        content += [(c, 0) for c in m2_box_lines(m2)]
+    elif front:
+        content.append(("[ 前置 3.5\" 硬盘槽位 ]", 0))
+        content += [(c, 0) for c in front_box_lines(front)]
+    elif m2:
+        content.append(("[ 内置 M.2 NVMe 槽位 ]", 0))
+        content += [(c, 0) for c in m2_box_lines(m2)]
+
+    content.append(("", 0))
+    if slots and not err:
+        content.append(("槽位" + pad_display("设备", 16) + pad_display("状态", 8) +
+                        pad_display("温度", 8) + "容量 / 型号", curses.A_UNDERLINE))
+        order = sorted(slots, key=lambda s: (0 if s.get("kind") == "front" else 1, s.get("slot", 0)))
+        for slot in order:
+            kind = "[M.2 %d]" % slot.get("slot", 0) if slot.get("kind") == "m2" else "前置 %d" % slot.get("slot", 0)
+            dev = (slot.get("device") or "-").replace("/dev/", "")
+            clabel = slot_style(slot.get("state", ""))[1]
+            model = trim_display("%s - %s" % (human_size(slot.get("size_bytes")), slot.get("model", "?")), 30)
+            temp = temp_str(slot.get("temperature_c"))
+            line = (pad_display(kind, 10) + pad_display(dev, 16) + pad_display(clabel, 8)
+                    + pad_display(temp, 8) + model)
+            attr = color_for(slot_style(slot.get("state", ""))[0])
+            if slot.get("warning"):
+                attr = color_for("red")
+            content.append((line, attr))
+
+    inner = max([disp_width(t) for t, _ in content] + [64])
+    inner = max(inner, disp_width("┌─ TAD6S4N Hardware Monitor ─"))
+    hdr = " F1 自动风扇   F2 手动风扇   r 刷新   q 退出   Ctrl+C 退出"
+    content.append((hdr, curses.A_DIM))
+    return content, inner
+
+
+def needed_size(content, inner):
+    """Terminal size required to fully display the fixed-size panel."""
+    w = inner + 2
+    h = len(content) + 2
+    return w, h
+
+
+def draw_panel_frame(win, content, inner, err):
+    h, w = win.getmaxyx()
+    xoff = max(0, (w - (inner + 2)) // 2)
+    top = "┌─ TAD6S4N Hardware Monitor ─"
+    try:
+        win.addstr(0, xoff, top.ljust(inner, "─") + "┐")
+    except curses.error:
+        pass
+    row = 1
+    for text, attr in content:
+        body = pad_display(text, inner)
+        try:
+            win.addstr(row, xoff, "│" + body + "│", attr)
+        except curses.error:
+            pass
+        row += 1
+    try:
+        win.addstr(row, xoff, "└" + "─" * inner + "┘")
+    except curses.error:
+        pass
+    return row + 1
+
+
+def draw_footer(win, y, w, st, err, error=False):
+    if y >= curses.LINES - 1:
+        return
+    if error or err:
+        addclamp(win, y, 0, "取数失败: %s" % err, color_for("red") | curses.A_BOLD)
+        return
+    msgs = []
+    for key in ("gpio_err", "storage_err", "last_error"):
+        if st.get(key):
+            msgs.append(st[key])
+    if msgs:
+        addclamp(win, y, 0, "注意: " + " ; ".join(msgs)[:w], color_for("yellow"))
+        y += 1
+    if y < curses.LINES - 1:
+        addclamp(win, y, 0, " F1 自动风扇   F2 手动风扇   r 刷新   q 退出   Ctrl+C 退出", curses.A_DIM)
+
+
+def cycle_fan(status, enable):
+    if not status:
+        return "尚无数据"
+    payload = dict((status.get("config") or {}).get("fan") or {})
+    payload["enabled"] = bool(enable)
+    data, err = fetch("/api/config/fan", method="POST", payload=payload, admin=True)
+    if err:
+        return "写风扇失败: %s" % err
+    if isinstance(data, dict) and data.get("error"):
+        return "写风扇失败: %s" % data["error"]
+    return "风扇已设置: %s" % ("自动曲线" if enable else "BIOS/手动 (关闭曲线)")
+
+
+def run(stdscr):
+    try:
+        curses.curs_set(0)
+    except curses.error:
+        pass
+    setup_colors()
+    try:
+        stdscr.keypad(True)
+    except curses.error:
+        pass
+    status = None
+    err = None
+    last = 0.0
+    notify = ""
+    notify_at = 0.0
+
+    while True:
+        h, w = stdscr.getmaxyx()
+        stdscr.erase()
+        now = time.time()
+        if status is None or (now - last) >= REFRESH:
+            status, err = fetch()
+            last = now
+        content, inner = compose_panel(status, err)
+        if CHECK_SIZE:
+            need_w, need_h = needed_size(content, inner)
+            if h < need_h or w < need_w:
+                draw_warning(stdscr, h, w, need_w, need_h)
+                try:
+                    stdscr.refresh()
+                except curses.error:
+                    pass
+                stdscr.timeout(200)
+                try:
+                    ch = stdscr.getch()
+                except curses.error:
+                    ch = -1
+                if ch in (ord("q"), 3):
+                    break
+                continue
+        draw_panel_frame(stdscr, content, inner, err)
+        if notify and time.time() < notify_at:
+            addclamp(stdscr, h - 1, 0, notify, color_for("yellow") | curses.A_REVERSE)
+        try:
+            stdscr.refresh()
+        except curses.error:
+            pass
+        stdscr.timeout(200)
+        try:
+            ch = stdscr.getch()
+        except curses.error:
+            ch = -1
+        if ch in (ord("q"), 3):
+            break
+        elif ch == ord("r"):
+            status, err = fetch()
+            last = time.time()
+        elif ch == curses.KEY_F1:
+            notify, notify_at = cycle_fan(status, True), time.time() + 3
+        elif ch == curses.KEY_F2:
+            notify, notify_at = cycle_fan(status, False), time.time() + 3
+
+
+def once():
+    status, err = fetch()
+    if err:
+        print("tank: 无法连接 %s — %s" % (SOCKET, err))
+        print("提示: 先在 Debian 上运行 systemctl start tank.service")
+        sys.exit(1)
+    st = build_stats(status)
+    print("CPU    : %s" % (st.get("cpu") or "--"))
+    print("Core   : %s   Package: %s" % (temp_str(st.get("core")), temp_str(st.get("package"))))
+    fan = (status.get("fan_control") or {})
+    if fan.get("fans"):
+        rpm = max((f.get("rpm", 0) or 0) for f in fan["fans"])
+        print("Fan    : %d RPM (%s%s)" % (rpm, "加载" if fan.get("driver_detected") else "无 it87", " *曲线" if fan.get("active") else ""))
+    else:
+        print("Fan    : N/A (it87 未加载)")
+    print("功耗   : PL1 %02dW / PL2 %02dW" % (st.get("pl1", 0), st.get("pl2", 0)))
+    print("槽位   :")
+    try:
+        dtemp = read_drivetemp()
+        for slot in (status.get("storage") or {}).get("slots", []):
+            if slot.get("kind") == "front" and slot.get("device"):
+                dev = os.path.basename(slot["device"])
+                if not slot.get("temperature_c") and dev in dtemp:
+                    slot["temperature_c"] = dtemp[dev]
+    except Exception:
+        pass
+    for slot in sorted((status.get("storage") or {}).get("slots", []), key=lambda s: (0 if s.get("kind") == "front" else 1, s.get("slot", 0))):
+        k = "M.2 %d" % slot["slot"] if slot.get("kind") == "m2" else "前 %d" % slot["slot"]
+        print("  %-6s %-12s %-6s %-6s %s" % (k, slot.get("device", "-"), slot.get("state", "?"), temp_str(slot.get("temperature_c")), slot.get("model", "")))
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] in ("--once", "txt"):
+        once()
+        return
+    if not os.path.exists(SOCKET):
+        print("未找到 Go 服务 socket: %s\n请在 Debian 上先执行: systemctl start tank.service" % SOCKET, file=sys.stderr)
+        sys.exit(1)
+    try:
+        curses.wrapper(run)
+    except KeyboardInterrupt:
+        pass
+    except curses.error:
+        pass
+
+
+if __name__ == "__main__":
+    main()
