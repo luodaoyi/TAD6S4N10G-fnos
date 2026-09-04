@@ -19,8 +19,10 @@
   --text-body: #2f3642;
   --text-secondary: #3a404c;
   --chart-grid: rgba(72, 82, 102, .12);
+  --sidebar-hover: rgba(255, 255, 255, .55);
   --radius: 10px;
   --radius-sm: 6px;
+
   font-family: "PingFang SC", "Microsoft YaHei UI", "Microsoft YaHei", system-ui, sans-serif;
   color: var(--text);
   background: var(--bg);
@@ -47,6 +49,7 @@
   --text-body: #cfd3d9;
   --text-secondary: #b4bac3;
   --chart-grid: rgba(255, 255, 255, .1);
+  --sidebar-hover: rgba(255, 255, 255, .08);
 }
 
 * { box-sizing: border-box; }
@@ -157,7 +160,7 @@ button, input, select, textarea { font: inherit; }
   filter: invert(39%) sepia(86%) saturate(1804%) hue-rotate(201deg) brightness(98%) contrast(96%);
 }
 
-.app-tabs button:hover:not([aria-selected="true"]) { background: rgba(255, 255, 255, .55); }
+.app-tabs button:hover:not([aria-selected="true"]) { background: var(--sidebar-hover); }
 .app-tabs button:focus-visible,
 button:focus-visible,
 select:focus-visible,
@@ -921,7 +924,7 @@ body.modal-open { overflow: hidden; }
   padding: 10px 12px;
   border-radius: 8px;
   color: var(--muted);
-  background: #f4f6f8;
+  background: var(--surface-muted);
   font-size: 12px;
   line-height: 1.6;
 }
@@ -1322,7 +1325,7 @@ body.modal-open { overflow: hidden; }
 }
 .about-health-detail {
   margin: 6px 0 0 !important;
-  color: #4b5360 !important;
+  color: var(--text-secondary) !important;
   font-size: 12px !important;
   line-height: 1.55 !important;
   white-space: pre-line;
@@ -1719,6 +1722,10 @@ button.danger {
 [data-theme="dark"] .fan-driver-warning a { color: #f0918a; }
 [data-theme="dark"] .script-risk-notice { color: #e2a49f; background: #2c1615; }
 [data-theme="dark"] .gpio-script-card .delete-script { color: #f39a9a; border-color: #6b3532; background: #2c1615; }
+[data-theme="dark"] #curve-remove,
+[data-theme="dark"] #disk-curve-remove,
+[data-theme="dark"] #nvme-curve-remove,
+[data-theme="dark"] button.danger { color: #f39a9a; border-color: #6b3532; background: #2c1615; }
 [data-theme="dark"] .curve-slot-option.storage-warning { border-color: #6b3532; background: #2c1615; }
 [data-theme="dark"] .status-table .storage-present td:nth-child(2) { color: #6cc0e8; }
 [data-theme="dark"] .curve-node-label { stroke: var(--surface); }

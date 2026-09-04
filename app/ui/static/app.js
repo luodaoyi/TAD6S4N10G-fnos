@@ -1891,28 +1891,47 @@ function applyTheme(mode) {
   }
 }
 
+// 仅跟随档需要监听 fnOS 桌面主题变化；观察器注册在父窗口节点上，不随
+// 本 iframe 销毁回收，固定浅/深档或页面卸载时必须显式断开，否则会在
+// fnOS 桌面上累积观察器并在父窗口属性变动时对已销毁文档反复取主题。
+let parentThemeObserver = null;
+
+function syncParentThemeObserver() {
+  if (parentThemeObserver) {
+    parentThemeObserver.disconnect();
+    parentThemeObserver = null;
+  }
+  if (currentThemeMode() !== 'auto') return;
+  try {
+    if (window.parent === window || !window.parent.MutationObserver) return;
+    const observer = new window.parent.MutationObserver(() => applyTheme(currentThemeMode()));
+    observer.observe(window.parent.document.documentElement, {
+      attributes: true, attributeFilter: ['class', 'data-theme', 'data-bs-theme', 'style'],
+    });
+    observer.observe(window.parent.document.body, {
+      attributes: true, attributeFilter: ['class', 'theme-mode', 'style'],
+    });
+    parentThemeObserver = observer;
+  } catch (error) { /* 父窗口不可读时仅跟随浏览器偏好 */ }
+}
+
 applyTheme(currentThemeMode());
+syncParentThemeObserver();
+window.addEventListener('pagehide', () => {
+  if (parentThemeObserver) {
+    parentThemeObserver.disconnect();
+    parentThemeObserver = null;
+  }
+});
 const themeToggle = $('theme-toggle');
 if (themeToggle) {
   themeToggle.addEventListener('click', () => {
     const next = THEME_ORDER[(THEME_ORDER.indexOf(currentThemeMode()) + 1) % THEME_ORDER.length];
     try { window.localStorage.setItem(THEME_STORAGE_KEY, next); } catch (error) { /* 隐私模式等场景下仅本次生效 */ }
     applyTheme(next);
+    syncParentThemeObserver();
   });
   window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => applyTheme(currentThemeMode()));
-  // 跟随档下监听 fnOS 桌面主题变化（同源时监听父窗口 html/body 属性变动）
-  try {
-    if (window.parent !== window && window.parent.MutationObserver) {
-      const reapply = () => applyTheme(currentThemeMode());
-      const observer = new window.parent.MutationObserver(reapply);
-      observer.observe(window.parent.document.documentElement, {
-        attributes: true, attributeFilter: ['class', 'data-theme', 'data-bs-theme', 'style'],
-      });
-      observer.observe(window.parent.document.body, {
-        attributes: true, attributeFilter: ['class', 'theme-mode', 'style'],
-      });
-    }
-  } catch (error) { /* 父窗口不可读时仅跟随浏览器偏好 */ }
 }
 
 CURVE_KINDS.forEach(renderFanChart);
