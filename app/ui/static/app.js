@@ -1844,6 +1844,7 @@ function currentThemeMode() {
 
 // fnOS 没有公开的插件主题接口；插件页与 fnOS 桌面同源内嵌时，读取父窗口
 // 明暗（主题属性/类名，退而求其次按根元素背景亮度判断）实现自动跟随。
+// fnOS 实测（v0.10.x）：桌面在 <html> 上挂 class="light"/"dark"。
 // 跨域或无父窗口时返回 null，退回浏览器 prefers-color-scheme。
 function detectParentTheme() {
   try {
@@ -1852,11 +1853,12 @@ function detectParentTheme() {
     const root = parent.document.documentElement;
     const themeAttr = `${root.getAttribute('data-theme') || ''} ${root.getAttribute('data-bs-theme') || ''}`;
     const className = `${root.className || ''} ${parent.document.body.className || ''}`;
-    if (/dark/i.test(themeAttr) || /(^|\s)dark[-_ ]?mode(\s|$)/i.test(className)) return 'dark';
-    if (/light/i.test(themeAttr)) return 'light';
+    const tokens = `${themeAttr} ${className}`;
+    if (/(^|\s)(dark|night)(\s|$)/i.test(tokens)) return 'dark';
+    if (/(^|\s)light(\s|$)/i.test(tokens)) return 'light';
     const background = parent.getComputedStyle(root).backgroundColor;
-    const rgb = background.match(/(\d+),\s*(\d+),\s*(\d+)/);
-    if (rgb) {
+    const rgb = background.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?\)/);
+    if (rgb && (rgb[4] === undefined || Number(rgb[4]) > 0.5)) {
       const luminance = 0.2126 * Number(rgb[1]) + 0.7152 * Number(rgb[2]) + 0.0722 * Number(rgb[3]);
       if (luminance < 90) return 'dark';
       if (luminance > 150) return 'light';
