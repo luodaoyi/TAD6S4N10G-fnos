@@ -24,14 +24,23 @@ const (
 	StorageWarning = "warning"
 	StorageUnknown = "unknown"
 
-	StorageActivityBusy     = "busy"
-	StorageActivityWorking  = "working"
 	StorageActivityIdle     = "idle"
+	StorageActivityLight    = "light"
+	StorageActivityMedium   = "medium"
+	StorageActivityHeavy    = "heavy"
+	StorageActivityBusy     = "busy"
+	StorageActivityFull     = "full"
 	StorageActivitySleeping = "sleeping"
 	StorageActivityUnknown  = "unknown"
 
-	storageWorkingUtilMax    = 70.0
-	storageWorkingDisplayMin = 0.5
+	// 负载分档边界按"界面四舍五入后的百分比"取值，保证标签与显示数值
+	// 一致：<0.5%（显示 0%）空闲；0.5–10.5% 轻载；10.5–50.5% 中载；
+	// 50.5–70.5% 高载；70.5–99.5% 繁忙；≥99.5%（显示 100%）满载。
+	storageUtilLightMin  = 0.5
+	storageUtilMediumMin = 10.5
+	storageUtilHeavyMin  = 50.5
+	storageUtilBusyMin   = 70.5
+	storageUtilFullMin   = 99.5
 )
 
 type StorageSlot struct {
@@ -209,13 +218,24 @@ func (m *Manager) RefreshStorageActivity() {
 }
 
 // mergeStorageActivity 合并循环采样结果：休眠中的盘 io_ticks 冻结、只会
-// 采出空闲，没有 I/O 证据（工作/繁忙）时保留"休眠"标签；静默唤醒（盘转
+// 采出空闲，没有 I/O 证据（任意负载档）时保留"休眠"标签；静默唤醒（盘转
 // 起来了但暂无 I/O）由全量扫描按 SMART 电源模式清除。
 func mergeStorageActivity(current, sampled string, utilization *float64) (string, *float64) {
-	if current == StorageActivitySleeping && sampled != StorageActivityWorking && sampled != StorageActivityBusy {
+	if current == StorageActivitySleeping && !activityHasIOEvidence(sampled) {
 		return current, nil
 	}
 	return sampled, utilization
+}
+
+// activityHasIOEvidence 采样活动是否足以证明盘发生 I/O：任意负载档算，
+// 空闲与未知不算（休眠标签因此得以保留）。
+func activityHasIOEvidence(activity string) bool {
+	switch activity {
+	case StorageActivityLight, StorageActivityMedium, StorageActivityHeavy,
+		StorageActivityBusy, StorageActivityFull:
+		return true
+	}
+	return false
 }
 
 func cloneStorageStatus(status StorageStatus) StorageStatus {
@@ -622,14 +642,21 @@ func (m *Manager) readBlockInfoFromSysfs(kname string) blockInfo {
 }
 
 func activityFromUtilization(util float64) string {
-	if util > storageWorkingUtilMax {
+	switch {
+	case util >= storageUtilFullMin:
+		return StorageActivityFull
+	case util >= storageUtilBusyMin:
 		return StorageActivityBusy
+	case util >= storageUtilHeavyMin:
+		return StorageActivityHeavy
+	case util >= storageUtilMediumMin:
+		return StorageActivityMedium
+	// 低于 0.5 的繁忙度经前端 Math.round 显示为 0%，归为空闲。
+	case util >= storageUtilLightMin:
+		return StorageActivityLight
+	default:
+		return StorageActivityIdle
 	}
-	// 低于 0.5 的繁忙度经前端 Math.round 显示为 0%，按 README 约定归为空闲。
-	if util >= storageWorkingDisplayMin {
-		return StorageActivityWorking
-	}
-	return StorageActivityIdle
 }
 
 func storageUtilization(previous, sample blockIOSample) *float64 {

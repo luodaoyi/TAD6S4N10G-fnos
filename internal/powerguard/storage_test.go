@@ -280,8 +280,8 @@ func TestReadBlockActivityUsesUtilizationBands(t *testing.T) {
 	}
 
 	got, util = sampleUtil(t, manager, statPath, "sda", "1 0 8 2 3 0 9 4 0 170 0\n", time.Second)
-	if got != StorageActivityWorking {
-		t.Fatalf("7%% util: got %q, want working", got)
+	if got != StorageActivityLight {
+		t.Fatalf("7%% util: got %q, want light", got)
 	}
 	if util == nil || *util < 6 || *util > 8 {
 		t.Fatalf("7%% util value: got %v", util)
@@ -324,7 +324,7 @@ func TestReadBlockActivityUtilizationMatchesDiskstatsUtil(t *testing.T) {
 	}
 }
 
-func TestReadBlockActivityWorkingWhenUtilIsNonzero(t *testing.T) {
+func TestReadBlockActivityLightWhenUtilIsNonzero(t *testing.T) {
 	resetBlockIOStates()
 	root := t.TempDir()
 	statPath := filepath.Join(root, "sys", "class", "block", "sdb", "stat")
@@ -339,8 +339,8 @@ func TestReadBlockActivityWorkingWhenUtilIsNonzero(t *testing.T) {
 	storeBlockIO("sdb", sample)
 	writeBlockStat(t, statPath, "10 0 8 2 3 0 9 4 0 170 0\n")
 	got, util := manager.readBlockActivity("sdb")
-	if got != StorageActivityWorking {
-		t.Fatalf("util 7%% without new r/w: got %q, want working", got)
+	if got != StorageActivityLight {
+		t.Fatalf("util 7%% without new r/w: got %q, want light", got)
 	}
 	if util == nil || *util < 6 || *util > 8 {
 		t.Fatalf("utilization = %v, want about 7", util)
@@ -363,11 +363,16 @@ func TestActivityFromUtilizationBoundaries(t *testing.T) {
 		note string
 	}{
 		{0.4, StorageActivityIdle, "低于 0.5 经前端取整显示 0%，归空闲"},
-		{0.5, StorageActivityWorking, "0.5 恰好进入工作带"},
-		{0.51, StorageActivityWorking, "0.51 工作带"},
-		{70, StorageActivityWorking, "70 仍属工作带"},
-		{70.01, StorageActivityBusy, "刚超过 70 判繁忙"},
-		{100, StorageActivityBusy, "100 繁忙"},
+		{0.5, StorageActivityLight, "0.5 取整显示 1%，进入轻载"},
+		{10.49, StorageActivityLight, "显示 10% 仍属轻载"},
+		{10.5, StorageActivityMedium, "10.5 取整显示 11%，进入中载"},
+		{50.49, StorageActivityMedium, "显示 50% 仍属中载"},
+		{50.5, StorageActivityHeavy, "50.5 取整显示 51%，进入高载"},
+		{70.49, StorageActivityHeavy, "显示 70% 仍属高载"},
+		{70.5, StorageActivityBusy, "70.5 取整显示 71%，进入繁忙"},
+		{99.49, StorageActivityBusy, "显示 99% 仍属繁忙"},
+		{99.5, StorageActivityFull, "99.5 取整显示 100%，满载"},
+		{100, StorageActivityFull, "100 满载"},
 	}
 	for _, item := range cases {
 		if got := activityFromUtilization(item.util); got != item.want {
@@ -386,10 +391,11 @@ func TestMergeStorageActivityPreservesSleepUntilIOEvidence(t *testing.T) {
 	}{
 		{StorageActivitySleeping, StorageActivityIdle, StorageActivitySleeping, false, "休眠中 io_ticks 冻结采出空闲，保留休眠"},
 		{StorageActivitySleeping, StorageActivityUnknown, StorageActivitySleeping, false, "采样读失败不覆盖休眠"},
-		{StorageActivitySleeping, StorageActivityWorking, StorageActivityWorking, true, "唤醒后出现 I/O 立即覆盖"},
+		{StorageActivitySleeping, StorageActivityLight, StorageActivityLight, true, "唤醒后出现 I/O 立即覆盖"},
 		{StorageActivitySleeping, StorageActivityBusy, StorageActivityBusy, true, "繁忙同样覆盖"},
+		{StorageActivitySleeping, StorageActivityFull, StorageActivityFull, true, "满载同样覆盖"},
 		{StorageActivityUnknown, StorageActivityIdle, StorageActivityIdle, true, "非休眠状态直接采用采样（idle 带 0% 指针也透传）"},
-		{StorageActivityIdle, StorageActivityWorking, StorageActivityWorking, true, "空闲→工作"},
+		{StorageActivityIdle, StorageActivityMedium, StorageActivityMedium, true, "空闲→中载"},
 	}
 	for _, item := range cases {
 		got, utilOut := mergeStorageActivity(item.current, item.sampled, &util)
@@ -424,11 +430,11 @@ func TestCachedStorageActivityCarriesOverOnlyForSameDevice(t *testing.T) {
 	util := 7.0
 	manager.seedSlot(t, StorageSlot{
 		ID: "front-1", Kind: "front", Slot: 1, State: StorageUsed,
-		Device: "/dev/sda", Activity: StorageActivityWorking, Utilization: &util,
+		Device: "/dev/sda", Activity: StorageActivityLight, Utilization: &util,
 	})
 
-	if activity, got := manager.cachedStorageActivity("front-1", "sda"); activity != StorageActivityWorking || got == nil || *got != 7 {
-		t.Fatalf("cached carry-over = (%q, %v), want working/7", activity, got)
+	if activity, got := manager.cachedStorageActivity("front-1", "sda"); activity != StorageActivityLight || got == nil || *got != 7 {
+		t.Fatalf("cached carry-over = (%q, %v), want light/7", activity, got)
 	}
 	if activity, got := manager.cachedStorageActivity("front-1", "sdb"); activity != StorageActivityUnknown || got != nil {
 		t.Fatalf("device swap must not carry over, got (%q, %v)", activity, got)
@@ -460,8 +466,8 @@ func TestRefreshStorageActivityMergesWithoutLockHeldIO(t *testing.T) {
 
 	manager.RefreshStorageActivity() // 第二拍：Δ=70ms io_ticks / 1s ≈ 7%
 	slot := manager.storageStatus.Slots[0]
-	if slot.Activity != StorageActivityWorking || slot.Utilization == nil || *slot.Utilization < 6 || *slot.Utilization > 8 {
-		t.Fatalf("second tick: got (%q, %v), want working ≈7%%", slot.Activity, slot.Utilization)
+	if slot.Activity != StorageActivityLight || slot.Utilization == nil || *slot.Utilization < 6 || *slot.Utilization > 8 {
+		t.Fatalf("second tick: got (%q, %v), want light ≈7%%", slot.Activity, slot.Utilization)
 	}
 }
 

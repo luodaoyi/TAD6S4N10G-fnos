@@ -24,7 +24,8 @@ const STORAGE_STATE_LABELS = {
   empty: '空置', present: '已插入', used: '已使用', warning: '告警', unknown: '未知',
 };
 const STORAGE_ACTIVITY_LABELS = {
-  busy: '繁忙', working: '工作', idle: '空闲', sleeping: '休眠', unknown: '未知',
+  idle: '空闲', light: '轻载', medium: '中载', heavy: '高载', busy: '繁忙', full: '满载',
+  sleeping: '休眠', unknown: '未知',
 };
 const STORAGE_HOT_C = { front: 55, m2: 70 };
 const CURVE_MIN_POINTS = 2;
@@ -54,6 +55,7 @@ const STORAGE_VISUAL_GROUPS = [
       blue: 'images/panel/SATA蓝-休眠.svg',
       red: 'images/panel/SATA红-报警.svg',
       green: 'images/panel/SATA绿-正常健康.svg',
+      empty: 'images/panel/SATA空置.svg',
     },
   },
   {
@@ -63,6 +65,7 @@ const STORAGE_VISUAL_GROUPS = [
       blue: 'images/panel/M2蓝-休眠.svg',
       red: 'images/panel/M2红-报警.svg',
       green: 'images/panel/M2绿-正常健康.svg',
+      empty: 'images/panel/M2空置.svg',
     },
   },
 ];
@@ -469,40 +472,31 @@ function renderStorageVisual(storage = {}) {
         delete marker.dataset.title;
       }
       const overlay = marker.querySelector('.storage-slot-overlay');
-      if (tone === 'empty') {
-        overlay.hidden = true;
-      } else {
-        const source = baseUrl(group.assets[tone] || group.assets.gray);
-        if (overlay.dataset.source !== source) {
-          overlay.src = source;
-          overlay.dataset.source = source;
-        }
-        overlay.hidden = false;
+      // 空仓也铺"空置"托盘底图：机箱底图自带的空槽比托盘矮，不铺会让
+      // 空仓与在位仓的可见高度不一致
+      const source = baseUrl(group.assets[tone] || group.assets.gray);
+      if (overlay.dataset.source !== source) {
+        overlay.src = source;
+        overlay.dataset.source = source;
       }
+      overlay.hidden = false;
       const temperature = marker.querySelector('.storage-slot-text span');
       const status = marker.querySelector('.storage-slot-text small');
       marker.querySelector('.storage-slot-text b').textContent = id.split('-').pop();
-      const compact = window.matchMedia('(max-width: 599px)').matches;
       const hasTemperature = Number(slot.temperature_c) > 0;
-      if (tone === 'empty') {
+      // 前置仓固定三行槽位（数字/状态/温度，与 M.2 顺序一致），温度为空
+      // 也保留槽位：空仓的"空置"与在位盘的状态词落在同一高度，不随内容行数漂移。
+      if (tone === 'empty' || !hasTemperature) {
         temperature.textContent = '';
-      } else if (!hasTemperature) {
-        // 手机版前置仓没有独立状态行（CSS 隐藏），休眠等无温度状态借用温
-        // 度位显示，否则休眠盘在盘位图上与空仓无从区分；桌面端状态由 small 行显示。
-        temperature.textContent = compact && group.kind === 'front'
-          ? storageSlotStatusLabel(slot, tone)
-          : '';
-      } else if (compact && group.kind === 'front') {
-        temperature.textContent = `${Math.round(Number(slot.temperature_c))}\n°C`;
-      } else if (compact) {
-        temperature.textContent = `${Math.round(Number(slot.temperature_c))}°C`;
+      } else if (group.kind === 'front') {
+        // 前置仓窄（12.5% 宽），单行"35.5 °C"必被省略号截断：数值（一位
+        // 小数，与详情表格一致）与单位分两行完整显示
+        temperature.textContent = `${Number(slot.temperature_c).toFixed(1)}\n°C`;
       } else {
         temperature.textContent = formatTemperature(slot.temperature_c);
       }
       if (status) {
-        status.textContent = compact && group.kind === 'front'
-          ? ''
-          : storageSlotStatusLabel(slot, tone);
+        status.textContent = storageSlotStatusLabel(slot, tone);
       }
     });
   });

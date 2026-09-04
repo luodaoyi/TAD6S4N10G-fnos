@@ -580,14 +580,14 @@ small {
 }
 .storage-slot-text span {
   color: #353b45;
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 700;
   line-height: 1.15;
 }
 .storage-slot-text small {
   display: block;
   color: #4b5360;
-  font-size: 10px;
+  font-size: 12px;
   font-weight: 650;
   line-height: 1.1;
 }
@@ -605,7 +605,30 @@ small {
 }
 .storage-visual-slot.is-empty .storage-slot-text span { display: none; }
 
-.storage-visual-front .storage-visual-slot { width: 12.5%; height: 67.8%; top: 47.85%; }
+.storage-visual-front .storage-visual-slot { width: 12.5%; height: 67.8%; top:  47.85%; }
+/* 前置仓固定三行槽位（数字/状态/温度，与 M.2 的状态在上、温度在下一致）：
+   各行锚定固定高度，温度为空或空仓也保留槽位，空仓的"空置"与在位盘的
+   状态词对齐在同一行 */
+.storage-visual-front .storage-slot-text b {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 12%;
+}
+.storage-visual-front .storage-slot-text span {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 66%;
+  white-space: pre-line;
+  line-height: 1.05;
+}
+.storage-visual-front .storage-slot-text small {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 36%;
+}
 .storage-visual-front .storage-visual-slot[data-slot="front-6"] { left: 15.5%; }
 .storage-visual-front .storage-visual-slot[data-slot="front-5"] { left: 29.3%; }
 .storage-visual-front .storage-visual-slot[data-slot="front-4"] { left: 43.1%; }
@@ -633,14 +656,12 @@ small {
 .storage-visual-m2 .storage-slot-text b {
   grid-column: 1;
   grid-row: 1 / span 2;
-  font-size: 26px;
   line-height: 1;
 }
 .storage-visual-m2 .storage-slot-text small {
   display: block;
   grid-column: 2;
   grid-row: 1;
-  font-size: 13px;
   line-height: 1.05;
   white-space: nowrap;
   transform: translateY(-3px);
@@ -648,9 +669,15 @@ small {
 .storage-visual-m2 .storage-slot-text span {
   grid-column: 2;
   grid-row: 2;
-  font-size: 13px;
   line-height: 1.05;
   transform: translateY(-3px);
+}
+/* 第二列固定最小宽度：内容宽窄不一（"- °C" 与 "40.0 °C"、空与有）会使
+   居中栅格整块平移，仓号数字横向错位；锁宽后数字列起点恒定，上下排
+   仓号同一条竖线 */
+.storage-visual-m2 .storage-slot-text span,
+.storage-visual-m2 .storage-slot-text small {
+  min-width: 5.2em;
 }
 
 .table-meta {
@@ -1511,21 +1538,14 @@ button.danger {
     z-index: 2;
     inset: 0;
   }
-  .storage-visual-front .storage-slot-text small { display: none; }
   .storage-slot-text b {
     font-size: clamp(16px, 5vw, 22px);
   }
-  .storage-slot-text span {
+  .storage-slot-text span,
+  .storage-slot-text small {
     font-size: clamp(10px, 2.8vw, 12px);
   }
-  .storage-visual-front .storage-slot-text span {
-    white-space: pre-line;
-    line-height: 1.05;
-  }
   .storage-visual-m2 .storage-slot-text { inset: 10% 10%; }
-  .storage-visual-m2 .storage-slot-text b { font-size: clamp(18px, 5.5vw, 24px); }
-  .storage-visual-m2 .storage-slot-text small,
-  .storage-visual-m2 .storage-slot-text span { font-size: clamp(10px, 2.8vw, 12px); }
   .storage-visual-m2 .storage-visual-caption {
     font-size: clamp(12px, 3.4vw, 15px);
   }
