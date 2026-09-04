@@ -1828,7 +1828,7 @@ document.querySelectorAll('.gpio-action').forEach((select) => {
 const THEME_STORAGE_KEY = 'tad-theme';
 const THEME_ORDER = ['auto', 'light', 'dark'];
 const THEME_META = {
-  auto: { label: '主题：跟随系统', icon: '🌗' },
+  auto: { label: '主题：跟随 fnOS/系统', icon: '🌗' },
   light: { label: '主题：浅色', icon: '☀️' },
   dark: { label: '主题：深色', icon: '🌙' },
 };
@@ -1842,10 +1842,39 @@ function currentThemeMode() {
   }
 }
 
+// fnOS 没有公开的插件主题接口；插件页与 fnOS 桌面同源内嵌时，读取父窗口
+// 明暗（主题属性/类名，退而求其次按根元素背景亮度判断）实现自动跟随。
+// 跨域或无父窗口时返回 null，退回浏览器 prefers-color-scheme。
+function detectParentTheme() {
+  try {
+    if (window.parent === window || !window.parent.document) return null;
+    const parent = window.parent;
+    const root = parent.document.documentElement;
+    const themeAttr = `${root.getAttribute('data-theme') || ''} ${root.getAttribute('data-bs-theme') || ''}`;
+    const className = `${root.className || ''} ${parent.document.body.className || ''}`;
+    if (/dark/i.test(themeAttr) || /(^|\s)dark[-_ ]?mode(\s|$)/i.test(className)) return 'dark';
+    if (/light/i.test(themeAttr)) return 'light';
+    const background = parent.getComputedStyle(root).backgroundColor;
+    const rgb = background.match(/(\d+),\s*(\d+),\s*(\d+)/);
+    if (rgb) {
+      const luminance = 0.2126 * Number(rgb[1]) + 0.7152 * Number(rgb[2]) + 0.0722 * Number(rgb[3]);
+      if (luminance < 90) return 'dark';
+      if (luminance > 150) return 'light';
+    }
+  } catch (error) {
+    return null; // 父窗口跨域不可读
+  }
+  return null;
+}
+
+function resolveAutoTheme() {
+  return detectParentTheme() || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+}
+
 function applyTheme(mode) {
   if (typeof window === 'undefined' || !window.matchMedia) return;
-  const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-  document.documentElement.dataset.theme = mode === 'auto' && prefersDark ? 'dark' : mode === 'dark' ? 'dark' : 'light';
+  const theme = mode === 'auto' ? resolveAutoTheme() : mode;
+  document.documentElement.dataset.theme = theme;
   const meta = THEME_META[mode];
   const button = $('theme-toggle');
   if (button) {
@@ -1864,6 +1893,15 @@ if (themeToggle) {
     applyTheme(next);
   });
   window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => applyTheme(currentThemeMode()));
+  // 跟随系统档下监听 fnOS 桌面主题变化（同源时可监听到父窗口 class/属性变动）
+  try {
+    if (window.parent !== window && window.parent.MutationObserver) {
+      const reapply = () => applyTheme(currentThemeMode());
+      new window.parent.MutationObserver(reapply).observe(window.parent.document.documentElement, {
+        attributes: true, attributeFilter: ['class', 'data-theme', 'data-bs-theme', 'style'],
+      });
+    }
+  } catch (error) { /* 父窗口不可读时仅跟随浏览器偏好 */ }
 }
 
 CURVE_KINDS.forEach(renderFanChart);
