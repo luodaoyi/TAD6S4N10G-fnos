@@ -30,8 +30,8 @@ const (
 	StorageActivitySleeping = "sleeping"
 	StorageActivityUnknown  = "unknown"
 
-	storageIdleUtilMax    = 0.0
-	storageWorkingUtilMax = 70.0
+	storageWorkingUtilMax    = 70.0
+	storageWorkingDisplayMin = 0.5
 )
 
 type StorageSlot struct {
@@ -127,16 +127,10 @@ type smartResult struct {
 }
 
 type blockIOSample struct {
-	Reads      uint64
-	Writes     uint64
-	ReadTicks  uint64
-	WriteTicks uint64
-	IOTicks    uint64
-	InFlight   uint64
-	StallCount int
-	SampledAt  time.Time
-	Util       float64
-	HasUtil    bool
+	IOTicks   uint64
+	SampledAt time.Time
+	Util      float64
+	HasUtil   bool
 }
 
 var blockIOStates sync.Map
@@ -152,7 +146,6 @@ func (m *Manager) RefreshStorage(forceSMART bool) StorageStatus {
 }
 
 func (m *Manager) StorageStatus() StorageStatus {
-	m.RefreshStorageActivity()
 	m.storageMu.RLock()
 	defer m.storageMu.RUnlock()
 	status := cloneStorageStatus(m.storageStatus)
@@ -169,21 +162,80 @@ func (m *Manager) StorageStatus() StorageStatus {
 	return status
 }
 
+// RefreshStorageActivity 由 2 秒后台循环调用，是共享采样时间线的唯一写入者：
+// sysfs 读取在锁外完成，锁内只合并结果，不做文件 I/O。休眠盘也参与采样——
+// 读 /sys/class/block/*/stat 只是内核计数、不会唤醒硬盘，且保证唤醒前后
+// 时间线连续（Δ 窗口不被休眠时长稀释）；合并时重新校验仓位仍持有采样时的
+// 设备，避免与全量扫描竞态错写。
 func (m *Manager) RefreshStorageActivity() {
+	type target struct {
+		id, kname string
+	}
+	m.storageMu.RLock()
+	targets := make([]target, 0, len(m.storageStatus.Slots))
+	for index := range m.storageStatus.Slots {
+		slot := &m.storageStatus.Slots[index]
+		if slot.Device == "" || slot.State == StorageEmpty {
+			continue
+		}
+		targets = append(targets, target{id: slot.ID, kname: filepath.Base(slot.Device)})
+	}
+	m.storageMu.RUnlock()
+
+	type result struct {
+		id, kname, activity string
+		utilization         *float64
+	}
+	results := make([]result, 0, len(targets))
+	for _, item := range targets {
+		activity, utilization := m.readBlockActivity(item.kname)
+		results = append(results, result{id: item.id, kname: item.kname, activity: activity, utilization: utilization})
+	}
+
 	m.storageMu.Lock()
 	defer m.storageMu.Unlock()
 	for index := range m.storageStatus.Slots {
 		slot := &m.storageStatus.Slots[index]
-		if slot.Device == "" || slot.State == StorageEmpty || slot.Activity == StorageActivitySleeping {
+		if slot.Device == "" || slot.State == StorageEmpty {
 			continue
 		}
-		slot.Activity, slot.Utilization = m.readBlockActivity(filepath.Base(slot.Device), slot.Kind)
+		for _, item := range results {
+			if item.id == slot.ID && item.kname == filepath.Base(slot.Device) {
+				slot.Activity, slot.Utilization = mergeStorageActivity(slot.Activity, item.activity, item.utilization)
+				break
+			}
+		}
 	}
+}
+
+// mergeStorageActivity 合并循环采样结果：休眠中的盘 io_ticks 冻结、只会
+// 采出空闲，没有 I/O 证据（工作/繁忙）时保留"休眠"标签；静默唤醒（盘转
+// 起来了但暂无 I/O）由全量扫描按 SMART 电源模式清除。
+func mergeStorageActivity(current, sampled string, utilization *float64) (string, *float64) {
+	if current == StorageActivitySleeping && sampled != StorageActivityWorking && sampled != StorageActivityBusy {
+		return current, nil
+	}
+	return sampled, utilization
 }
 
 func cloneStorageStatus(status StorageStatus) StorageStatus {
 	status.Slots = append([]StorageSlot(nil), status.Slots...)
 	return status
+}
+
+// cachedStorageActivity 供全量扫描继承后台循环已缓存的忙闲状态：扫描本身
+// 不再推进共享采样时间线，避免与 2 秒循环交叠采样破坏 Δ 窗口。仓位换了
+// 盘或尚无缓存时返回未知，等待循环下一拍填充。
+func (m *Manager) cachedStorageActivity(id, kname string) (string, *float64) {
+	m.storageMu.RLock()
+	defer m.storageMu.RUnlock()
+	for index := range m.storageStatus.Slots {
+		slot := &m.storageStatus.Slots[index]
+		if slot.ID == id && slot.Device != "" && filepath.Base(slot.Device) == kname {
+			return slot.Activity, slot.Utilization
+		}
+	}
+	return StorageActivityUnknown, nil
 }
 
 func (m *Manager) collectStorage(forceSMART bool) StorageStatus {
@@ -254,7 +306,7 @@ func (m *Manager) collectStorage(forceSMART bool) StorageStatus {
 			slot.State = StorageUsed
 		}
 		slot.Purpose = strings.Join(info.Purposes, "、")
-		slot.Activity, slot.Utilization = m.readBlockActivity(kname, spec.Kind)
+		slot.Activity, slot.Utilization = m.cachedStorageActivity(spec.ID, kname)
 		if warning := m.mdWarning(info.Purposes); warning != "" {
 			slot.State = StorageWarning
 			slot.Warning = warning
@@ -281,6 +333,11 @@ func (m *Manager) collectStorage(forceSMART bool) StorageStatus {
 		slot.TemperatureC = result.TemperatureC
 		if powerModeIsSleeping(result.PowerMode) {
 			slot.Activity = StorageActivitySleeping
+			slot.Utilization = nil
+		} else if slot.Activity == StorageActivitySleeping {
+			// 静默唤醒（盘已转起但暂无 I/O 证据）：清掉过期的休眠标记，
+			// 活动循环下一拍会重新给出真实忙闲。
+			slot.Activity = StorageActivityUnknown
 			slot.Utilization = nil
 		}
 		slot.Health = "正常"
@@ -568,7 +625,8 @@ func activityFromUtilization(util float64) string {
 	if util > storageWorkingUtilMax {
 		return StorageActivityBusy
 	}
-	if util > storageIdleUtilMax {
+	// 低于 0.5 的繁忙度经前端 Math.round 显示为 0%，按 README 约定归为空闲。
+	if util >= storageWorkingDisplayMin {
 		return StorageActivityWorking
 	}
 	return StorageActivityIdle
@@ -610,7 +668,9 @@ func utilizationPointer(sample blockIOSample) *float64 {
 	return &value
 }
 
-func (m *Manager) readBlockActivity(kname, kind string) (string, *float64) {
+// readBlockActivity 只由后台活动循环调用（见 RefreshStorageActivity）。
+// 首个样本没有 Δ 窗口，按空闲处理、不给出利用率，下一拍起才有读数。
+func (m *Manager) readBlockActivity(kname string) (string, *float64) {
 	data, err := os.ReadFile(filepath.Join(m.rooted("/sys/class/block"), kname, "stat"))
 	if err != nil {
 		return StorageActivityUnknown, nil
@@ -619,21 +679,14 @@ func (m *Manager) readBlockActivity(kname, kind string) (string, *float64) {
 	if len(fields) < 10 {
 		return StorageActivityUnknown, nil
 	}
-	reads, readErr := strconv.ParseUint(fields[0], 10, 64)
-	writes, writeErr := strconv.ParseUint(fields[4], 10, 64)
-	readTicks, readTickErr := strconv.ParseUint(fields[3], 10, 64)
-	writeTicks, writeTickErr := strconv.ParseUint(fields[7], 10, 64)
-	inFlight, flightErr := strconv.ParseUint(fields[8], 10, 64)
 	ioTicks, ioTickErr := strconv.ParseUint(fields[9], 10, 64)
-	if readErr != nil || writeErr != nil || readTickErr != nil || writeTickErr != nil || flightErr != nil || ioTickErr != nil {
+	if ioTickErr != nil {
 		return StorageActivityUnknown, nil
 	}
 	sample := blockIOSample{
-		Reads: reads, Writes: writes, ReadTicks: readTicks, WriteTicks: writeTicks,
-		IOTicks: ioTicks, InFlight: inFlight, SampledAt: time.Now(),
+		IOTicks: ioTicks, SampledAt: time.Now(),
 	}
 	previous, hadPrevious := loadBlockIO(kname)
-	_ = kind
 	if !hadPrevious {
 		storeBlockIO(kname, sample)
 		return StorageActivityIdle, nil
