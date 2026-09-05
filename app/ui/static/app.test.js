@@ -124,12 +124,15 @@ test('已勾选风扇 1200→0→1200 仍可见；未勾选的 0 RPM / 负值通
   const connectedFans = resolve('connectedFans');
   const fans = [
     { id: 'fan0', channel: 0, rpm: 1200 },
-    { id: 'fan1', channel: 1, rpm: 0, selected: true },
+    { id: 'fan1', channel: 1, rpm: 1200, selected: true },
     { id: 'fan2', channel: 2, rpm: 0 },
     { id: 'fan3', channel: 3, rpm: -1 },
   ];
-  const visible = connectedFans({ fans });
-  assert.deepEqual(visible.map((fan) => fan.id), ['fan0', 'fan1']);
+  assert.deepEqual(connectedFans({ fans }).map((fan) => fan.id), ['fan0', 'fan1']);
+  fans[1].rpm = 0;
+  assert.deepEqual(connectedFans({ fans }).map((fan) => fan.id), ['fan0', 'fan1']);
+  fans[1].rpm = 1200;
+  assert.deepEqual(connectedFans({ fans }).map((fan) => fan.id), ['fan0', 'fan1']);
   assert.equal(connectedFans({ fans: [{ id: 'fan1', rpm: 0 }] }).length, 0);
   assert.equal(connectedFans({ fans: [{ id: 'fan1', rpm: 0, selected: true }] }).length, 1);
 });
