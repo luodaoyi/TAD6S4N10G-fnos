@@ -120,14 +120,19 @@ test('风扇 1200→0→1200：选择器签名不变，未保存的勾选不触�
   assert.notEqual(fanListSignature([{ id: 'fan0' }, { id: 'fan2' }]), baseline);
 });
 
-test('风扇 1200→0→1200：0 RPM 风扇保持可见，负值仍被过滤', () => {
+test('已勾选风扇 1200→0→1200 仍可见；未勾选的 0 RPM / 负值通道隐藏', () => {
   const connectedFans = resolve('connectedFans');
   const fans = [
     { id: 'fan0', channel: 0, rpm: 1200 },
-    { id: 'fan1', channel: 1, rpm: 0 },
-    { id: 'fan2', channel: 2, rpm: -1 },
+    { id: 'fan1', channel: 1, rpm: 1200, selected: true },
+    { id: 'fan2', channel: 2, rpm: 0 },
+    { id: 'fan3', channel: 3, rpm: -1 },
   ];
-  const visible = connectedFans({ fans });
-  assert.deepEqual(visible.map((fan) => fan.id), ['fan0', 'fan1']);
-  assert.equal(connectedFans({ fans: [{ id: 'fan1', rpm: 0 }] }).length, 1);
+  assert.deepEqual(connectedFans({ fans }).map((fan) => fan.id), ['fan0', 'fan1']);
+  fans[1].rpm = 0;
+  assert.deepEqual(connectedFans({ fans }).map((fan) => fan.id), ['fan0', 'fan1']);
+  fans[1].rpm = 1200;
+  assert.deepEqual(connectedFans({ fans }).map((fan) => fan.id), ['fan0', 'fan1']);
+  assert.equal(connectedFans({ fans: [{ id: 'fan1', rpm: 0 }] }).length, 0);
+  assert.equal(connectedFans({ fans: [{ id: 'fan1', rpm: 0, selected: true }] }).length, 1);
 });
