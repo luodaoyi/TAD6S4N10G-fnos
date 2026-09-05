@@ -1,2 +1,9 @@
 #!/bin/sh
+set -u
+
+# 不 rmmod it87；仅清理本插件可识别的 DKMS/conf（若当初由我们托管）
+# shellcheck source=it87_dkms.sh
+. "$(CDPATH= cd -- "$(dirname "$0")" && pwd)/it87_dkms.sh"
+it87_cleanup_ours || true
+
 exit 0

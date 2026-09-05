@@ -60,6 +60,9 @@ jobs:
           tar -tf tad-module.fpk | grep -Fx manifest
           tar -tf tad-module.fpk | grep -Fx app.tgz
           tar -tf tad-module.fpk | grep -Fx cmd/main
+          tar -tf tad-module.fpk | grep -Fx cmd/it87_dkms.sh
+          tar -xOf tad-module.fpk app.tgz | tar -tz | grep -E '(^|/)it87-src/dkms\.conf$'
+          tar -xOf tad-module.fpk app.tgz | tar -tz | grep -E '(^|/)it87-src/it87\.c$'
           sha256sum tad-module.fpk > tad-module.fpk.sha256
 
       - name: Upload workflow artifact

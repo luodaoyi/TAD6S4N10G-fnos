@@ -112,7 +112,7 @@
               <div class="diagnostic-card diagnostic-wide"><dt>原始 coretemp</dt><dd id="temperature-sensors" class="diagnostic-chips sensor-chips">—</dd></div>
             </dl>
             <p class="notice temperature-notice">插件仿照 RR CPUinfo，只用标签为 Core N 的传感器最大值作为 CPU 显示温度；Package 热点原值单独保留。插件不会修改飞牛内置资源监控，因此飞牛桌面的原有温度和告警颜色不会改变。</p>
-            <p class="notice">降低功耗可能减少极限性能。风扇曲线依赖已安装的 IT87 驱动，插件不会加载或强制识别硬件；停止或卸载时会恢复首次捕获的功耗限制与 BIOS 风扇模式。</p>
+            <p class="notice">降低功耗可能减少极限性能。风扇曲线依赖 IT87 驱动（安装/启动时由本插件尝试内置 DKMS 安装，已有独立驱动则跳过）；停止或卸载时会恢复首次捕获的功耗限制与 BIOS 风扇模式，但不会卸载 it87 内核模块。</p>
           </section>
         </section>
 
@@ -121,7 +121,7 @@
             <span class="warning-icon" aria-hidden="true">!</span>
             <div>
               <strong id="fan-warning-title">未检测到或未加载 IT87 风扇驱动</strong>
-              <p><span id="fan-warning-description">风扇转速和 PWM 控制暂不可用。</span> <a id="fan-warning-driver-link" href="https://github.com/IamAyang233/fnos-it87-kmod" target="_blank" rel="noopener noreferrer">前往 GitHub 下载并安装 IT87 驱动</a></p>
+              <p><span id="fan-warning-description">风扇转速和 PWM 控制暂不可用。请确认已安装 dkms、gcc、make 与当前内核的 linux-headers，然后重启本模块。</span> <a id="fan-warning-driver-link" href="https://github.com/IamAyang233/fnos-it87-kmod" target="_blank" rel="noopener noreferrer">仍可用独立 IT87 驱动包（可选）</a></p>
             </div>
           </div>
           <section class="card fan-editor" aria-labelledby="fan-heading">
@@ -363,7 +363,7 @@
               </div>
               <p id="update-status" class="update-status" role="status" aria-live="polite">点击检查是否有新版本</p>
             </section>
-            <p class="notice">风扇功能需要先安装 IT87 驱动。插件开发：<a href="https://mi-d.cn" target="_blank" rel="noopener noreferrer">mi-d.cn</a> · <a href="https://tank-g.taobao.com/" target="_blank" rel="noopener noreferrer">TANK</a></p>
+            <p class="notice">风扇功能依赖 IT87 驱动（本插件安装时会尝试内置 DKMS）。插件开发：<a href="https://mi-d.cn" target="_blank" rel="noopener noreferrer">mi-d.cn</a> · <a href="https://tank-g.taobao.com/" target="_blank" rel="noopener noreferrer">TANK</a></p>
           </section>
         </section>
       </form>
