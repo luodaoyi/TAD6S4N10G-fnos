@@ -263,11 +263,12 @@ function storageSlotStatusLabel(slot = {}, tone = '') {
 }
 
 function connectedFans(fanStatus = {}, limit = 0) {
-  const fans = (fanStatus.fans || []).filter((fan) => Number(fan.rpm) >= 0);
+  // 有转速，或已勾选（瞬时 0 转停转/故障保护仍可见）；未接线且持续 0 RPM 的通道不列出。
+  const fans = (fanStatus.fans || []).filter((fan) => Number(fan.rpm) > 0 || fan.selected === true);
   return limit > 0 ? fans.slice(0, limit) : fans;
 }
 
-// 选择器签名只由风扇集合决定、与转速无关：瞬时 0 转（停转或故障保护）
+// 选择器签名只由可见风扇集合决定、与转速无关：已勾选风扇瞬时 0 转
 // 不会触发列表重建，未保存的勾选因此不会丢。
 function fanListSignature(fans = []) {
   return fans.map((fan) => fan.id).join('|');
