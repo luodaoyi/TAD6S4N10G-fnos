@@ -79,8 +79,12 @@ test('盘位覆盖层标签：empty/present/used/warning/unknown 各状态文案
   const storageSlotStatusLabel = resolve('storageSlotStatusLabel');
   assert.equal(storageSlotStatusLabel({ state: 'empty' }, 'empty'), '空置');
   assert.equal(storageSlotStatusLabel({ state: 'present' }), '未使用');
-  assert.equal(storageSlotStatusLabel({ state: 'used', activity: 'working' }), '工作');
   assert.equal(storageSlotStatusLabel({ state: 'used', activity: 'idle' }), '空闲');
+  assert.equal(storageSlotStatusLabel({ state: 'used', activity: 'light' }), '轻载');
+  assert.equal(storageSlotStatusLabel({ state: 'used', activity: 'medium' }), '中载');
+  assert.equal(storageSlotStatusLabel({ state: 'used', activity: 'heavy' }), '高载');
+  assert.equal(storageSlotStatusLabel({ state: 'used', activity: 'busy' }), '繁忙');
+  assert.equal(storageSlotStatusLabel({ state: 'used', activity: 'full' }), '满载');
   assert.equal(storageSlotStatusLabel({ state: 'used', activity: 'sleeping' }), '休眠');
   assert.equal(storageSlotStatusLabel({ state: 'warning' }), '告警');
   assert.equal(storageSlotStatusLabel({ state: 'unknown' }), '未知');

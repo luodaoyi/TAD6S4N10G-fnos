@@ -24,7 +24,8 @@ const STORAGE_STATE_LABELS = {
   empty: '空置', present: '已插入', used: '已使用', warning: '告警', unknown: '未知',
 };
 const STORAGE_ACTIVITY_LABELS = {
-  busy: '繁忙', working: '工作', idle: '空闲', sleeping: '休眠', unknown: '未知',
+  idle: '空闲', light: '轻载', medium: '中载', heavy: '高载', busy: '繁忙', full: '满载',
+  sleeping: '休眠', unknown: '未知',
 };
 const STORAGE_HOT_C = { front: 55, m2: 70 };
 const CURVE_MIN_POINTS = 2;
@@ -54,6 +55,7 @@ const STORAGE_VISUAL_GROUPS = [
       blue: 'images/panel/SATA蓝-休眠.svg',
       red: 'images/panel/SATA红-报警.svg',
       green: 'images/panel/SATA绿-正常健康.svg',
+      empty: 'images/panel/SATA空置.svg',
     },
   },
   {
@@ -63,6 +65,7 @@ const STORAGE_VISUAL_GROUPS = [
       blue: 'images/panel/M2蓝-休眠.svg',
       red: 'images/panel/M2红-报警.svg',
       green: 'images/panel/M2绿-正常健康.svg',
+      empty: 'images/panel/M2空置.svg',
     },
   },
 ];
@@ -469,40 +472,31 @@ function renderStorageVisual(storage = {}) {
         delete marker.dataset.title;
       }
       const overlay = marker.querySelector('.storage-slot-overlay');
-      if (tone === 'empty') {
-        overlay.hidden = true;
-      } else {
-        const source = baseUrl(group.assets[tone] || group.assets.gray);
-        if (overlay.dataset.source !== source) {
-          overlay.src = source;
-          overlay.dataset.source = source;
-        }
-        overlay.hidden = false;
+      // 空仓也铺"空置"托盘底图：机箱底图自带的空槽比托盘矮，不铺会让
+      // 空仓与在位仓的可见高度不一致
+      const source = baseUrl(group.assets[tone] || group.assets.gray);
+      if (overlay.dataset.source !== source) {
+        overlay.src = source;
+        overlay.dataset.source = source;
       }
+      overlay.hidden = false;
       const temperature = marker.querySelector('.storage-slot-text span');
       const status = marker.querySelector('.storage-slot-text small');
       marker.querySelector('.storage-slot-text b').textContent = id.split('-').pop();
-      const compact = window.matchMedia('(max-width: 599px)').matches;
       const hasTemperature = Number(slot.temperature_c) > 0;
-      if (tone === 'empty') {
+      // 前置仓固定三行槽位（数字/状态/温度，与 M.2 顺序一致），温度为空
+      // 也保留槽位：空仓的"空置"与在位盘的状态词落在同一高度，不随内容行数漂移。
+      if (tone === 'empty' || !hasTemperature) {
         temperature.textContent = '';
-      } else if (!hasTemperature) {
-        // 手机版前置仓没有独立状态行（CSS 隐藏），休眠等无温度状态借用温
-        // 度位显示，否则休眠盘在盘位图上与空仓无从区分；桌面端状态由 small 行显示。
-        temperature.textContent = compact && group.kind === 'front'
-          ? storageSlotStatusLabel(slot, tone)
-          : '';
-      } else if (compact && group.kind === 'front') {
-        temperature.textContent = `${Math.round(Number(slot.temperature_c))}\n°C`;
-      } else if (compact) {
-        temperature.textContent = `${Math.round(Number(slot.temperature_c))}°C`;
+      } else if (group.kind === 'front') {
+        // 前置仓窄（12.5% 宽），单行"35.5 °C"必被省略号截断：数值（一位
+        // 小数，与详情表格一致）与单位分两行完整显示
+        temperature.textContent = `${Number(slot.temperature_c).toFixed(1)}\n°C`;
       } else {
         temperature.textContent = formatTemperature(slot.temperature_c);
       }
       if (status) {
-        status.textContent = compact && group.kind === 'front'
-          ? ''
-          : storageSlotStatusLabel(slot, tone);
+        status.textContent = storageSlotStatusLabel(slot, tone);
       }
     });
   });
@@ -1185,12 +1179,12 @@ function renderFanChart(kind = 'cpu') {
   svg.replaceChildren();
 
   [20, 40, 60, 80, 100].forEach((temp) => {
-    svg.append(svgElement('line', { x1: x(temp), y1: top, x2: x(temp), y2: bottom, stroke: 'rgba(72,82,102,.12)' }));
-    svg.append(svgElement('text', { x: x(temp), y: CURVE_VIEWBOX.height - 14 / chartScale, fill: '#7b8290', 'font-size': textSize, 'text-anchor': 'middle' }, `${temp}°`));
+    svg.append(svgElement('line', { x1: x(temp), y1: top, x2: x(temp), y2: bottom, style: 'stroke: var(--chart-grid)' }));
+    svg.append(svgElement('text', { x: x(temp), y: CURVE_VIEWBOX.height - 14 / chartScale, style: 'fill: var(--muted)', 'font-size': textSize, 'text-anchor': 'middle' }, `${temp}°`));
   });
   [30, 50, 70, 100].forEach((speed) => {
-    svg.append(svgElement('line', { x1: left, y1: y(speed), x2: right, y2: y(speed), stroke: 'rgba(72,82,102,.12)' }));
-    svg.append(svgElement('text', { x: left - 8 / chartScale, y: y(speed) + textSize * 0.35, fill: '#7b8290', 'font-size': textSize, 'text-anchor': 'end' }, `${speed}%`));
+    svg.append(svgElement('line', { x1: left, y1: y(speed), x2: right, y2: y(speed), style: 'stroke: var(--chart-grid)' }));
+    svg.append(svgElement('text', { x: left - 8 / chartScale, y: y(speed) + textSize * 0.35, style: 'fill: var(--muted)', 'font-size': textSize, 'text-anchor': 'end' }, `${speed}%`));
   });
   svg.append(svgElement('polyline', {
     points: curve.map((point) => `${x(point.temp_c)},${y(point.pwm_percent)}`).join(' '),
@@ -1206,8 +1200,8 @@ function renderFanChart(kind = 'cpu') {
     const currentLabel = `当前 ${actualTemp.toFixed(1)}°C`;
     const currentLabelWidth = Math.max(72 / chartScale, currentLabel.length * textSize * 0.6);
     const currentX = clamp(x(actualTemp), currentLabelWidth / 2 + 4 / chartScale, CURVE_VIEWBOX.width - currentLabelWidth / 2 - 4 / chartScale);
-    svg.append(svgElement('line', { x1: x(actualTemp), y1: top, x2: x(actualTemp), y2: bottom, stroke: '#e89b24', 'stroke-width': 2, 'stroke-dasharray': '6 5' }));
-    svg.append(svgElement('text', { x: currentX, y: textSize + 4 / chartScale, fill: '#b96f00', 'font-size': textSize, 'text-anchor': 'middle' }, currentLabel));
+    svg.append(svgElement('line', { x1: x(actualTemp), y1: top, x2: x(actualTemp), y2: bottom, style: 'stroke: var(--warning)', 'stroke-width': 2, 'stroke-dasharray': '6 5' }));
+    svg.append(svgElement('text', { x: currentX, y: textSize + 4 / chartScale, style: 'fill: var(--warning)', 'font-size': textSize, 'text-anchor': 'middle' }, currentLabel));
   }
   curve.forEach((point, index) => {
     const selected = index === editor.selectedIndex;
@@ -1222,7 +1216,7 @@ function renderFanChart(kind = 'cpu') {
     svg.append(hitTarget);
     const node = svgElement('circle', {
       cx: nodeX, cy: nodeY, r: selected ? 9 : 7,
-      fill: selected ? editor.color : '#ffffff', stroke: editor.color, 'stroke-width': 3,
+      style: `fill: ${selected ? editor.color : 'var(--surface)'};`, stroke: editor.color, 'stroke-width': 3,
       class: `curve-node curve-node-control${selected ? ' selected' : ''}`, 'data-index': index,
       tabindex: 0, role: 'button', 'aria-label': `节点 ${index + 1}，${point.temp_c} 摄氏度，转速 ${point.pwm_percent}%`,
     });
@@ -1232,7 +1226,7 @@ function renderFanChart(kind = 'cpu') {
     const labelX = clamp(nodeX, 8 / chartScale + labelWidth / 2, CURVE_VIEWBOX.width - 8 / chartScale - labelWidth / 2);
     const labelY = nodeY < 50 / chartScale ? nodeY + 26 / chartScale : nodeY - 16 / chartScale;
     svg.append(svgElement('text', {
-      x: labelX, y: labelY, fill: selected ? editor.color : '#596273',
+      x: labelX, y: labelY, style: `fill: ${selected ? editor.color : 'var(--text-body)'};`,
       'font-size': 12, 'font-weight': selected ? 800 : 600, 'text-anchor': 'middle', class: 'curve-node-label',
     }, label));
   });
@@ -1830,6 +1824,122 @@ $('gpio-script-body').addEventListener('keydown', (event) => {
 document.querySelectorAll('.gpio-action').forEach((select) => {
   select.addEventListener('change', renderGPIOScriptList);
 });
+
+const THEME_STORAGE_KEY = 'tad-theme';
+const THEME_ORDER = ['auto', 'light', 'dark'];
+const THEME_META = {
+  auto: { label: '主题：跟随 fnOS/系统', icon: '🌗' },
+  light: { label: '主题：浅色', icon: '☀️' },
+  dark: { label: '主题：深色', icon: '🌙' },
+};
+
+function currentThemeMode() {
+  try {
+    const saved = window.localStorage.getItem(THEME_STORAGE_KEY);
+    return THEME_ORDER.includes(saved) ? saved : 'auto';
+  } catch (error) {
+    return 'auto';
+  }
+}
+
+// fnOS 没有公开的插件主题接口；插件页与 fnOS 桌面同源内嵌时，读取父窗口
+// 明暗实现自动跟随。fnOS 实测（1.2.0505）：桌面主题挂在 <body theme-mode=
+// "dark|light"> 属性上（Semi Design 的暗色选择器即 body[theme-mode=dark]），
+// <html> 的 class="light" 是引导脚本默认值、从不随主题变；body 无该属性时
+// 按根元素背景亮度兜底。跨域或无父窗口时返回 null，退回 prefers-color-scheme。
+function detectParentTheme() {
+  try {
+    if (window.parent === window || !window.parent.document) return null;
+    const parent = window.parent;
+    const root = parent.document.documentElement;
+    const body = parent.document.body;
+    const bodyMode = (body.getAttribute('theme-mode') || '').trim().toLowerCase();
+    if (bodyMode === 'dark') return 'dark';
+    if (bodyMode === 'light') return 'light';
+    const themeAttr = `${root.getAttribute('data-theme') || ''} ${root.getAttribute('data-bs-theme') || ''}`;
+    const className = `${root.className || ''} ${body.className || ''}`;
+    const tokens = `${themeAttr} ${className}`;
+    if (/(^|\s)(dark|night)(\s|$)/i.test(tokens)) return 'dark';
+    if (/(^|\s)light(\s|$)/i.test(tokens)) return 'light';
+    const background = parent.getComputedStyle(root).backgroundColor;
+    const rgb = background.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?\)/);
+    if (rgb && (rgb[4] === undefined || Number(rgb[4]) > 0.5)) {
+      const luminance = 0.2126 * Number(rgb[1]) + 0.7152 * Number(rgb[2]) + 0.0722 * Number(rgb[3]);
+      if (luminance < 90) return 'dark';
+      if (luminance > 150) return 'light';
+    }
+  } catch (error) {
+    return null; // 父窗口跨域不可读
+  }
+  return null;
+}
+
+function resolveAutoTheme() {
+  return detectParentTheme() || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+}
+
+function applyTheme(mode) {
+  if (typeof window === 'undefined' || !window.matchMedia) return;
+  const theme = mode === 'auto' ? resolveAutoTheme() : mode;
+  document.documentElement.dataset.theme = theme;
+  const meta = THEME_META[mode];
+  const button = $('theme-toggle');
+  if (button) {
+    button.textContent = meta.icon;
+    button.title = meta.label;
+    button.setAttribute('aria-label', meta.label);
+  }
+}
+
+// 仅跟随档需要监听 fnOS 桌面主题变化；观察器注册在父窗口节点上，不随
+// 本 iframe 销毁回收，固定浅/深档或页面卸载时必须显式断开，否则会在
+// fnOS 桌面上累积观察器并在父窗口属性变动时对已销毁文档反复取主题。
+let parentThemeObserver = null;
+
+function syncParentThemeObserver() {
+  if (parentThemeObserver) {
+    parentThemeObserver.disconnect();
+    parentThemeObserver = null;
+  }
+  if (currentThemeMode() !== 'auto') return;
+  try {
+    if (window.parent === window || !window.parent.MutationObserver) return;
+    const observer = new window.parent.MutationObserver(() => applyTheme(currentThemeMode()));
+    observer.observe(window.parent.document.documentElement, {
+      attributes: true, attributeFilter: ['class', 'data-theme', 'data-bs-theme', 'style'],
+    });
+    observer.observe(window.parent.document.body, {
+      attributes: true, attributeFilter: ['class', 'theme-mode', 'style'],
+    });
+    parentThemeObserver = observer;
+  } catch (error) { /* 父窗口不可读时仅跟随浏览器偏好 */ }
+}
+
+applyTheme(currentThemeMode());
+syncParentThemeObserver();
+window.addEventListener('pagehide', () => {
+  if (parentThemeObserver) {
+    parentThemeObserver.disconnect();
+    parentThemeObserver = null;
+  }
+});
+// bfcache 恢复不会重新执行脚本，而 pagehide 已断开观察器：pageshow 时重挂，
+// 并重取一次主题（恢复期间 fnOS 桌面可能已切换明暗）。
+window.addEventListener('pageshow', () => {
+  applyTheme(currentThemeMode());
+  syncParentThemeObserver();
+});
+const themeToggle = $('theme-toggle');
+if (themeToggle) {
+  themeToggle.addEventListener('click', () => {
+    const next = THEME_ORDER[(THEME_ORDER.indexOf(currentThemeMode()) + 1) % THEME_ORDER.length];
+    try { window.localStorage.setItem(THEME_STORAGE_KEY, next); } catch (error) { /* 隐私模式等场景下仅本次生效 */ }
+    applyTheme(next);
+    syncParentThemeObserver();
+  });
+  window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => applyTheme(currentThemeMode()));
+}
+
 CURVE_KINDS.forEach(renderFanChart);
 refresh();
 setInterval(() => refresh(true), 5000);
