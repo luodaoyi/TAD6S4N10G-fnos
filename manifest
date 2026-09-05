@@ -1,5 +1,5 @@
 appname=tad-module
-version=0.10.13
+version=0.10.14
 display_name=TAD6S4N模块
 desc=面向 TAD6S4N10G 的温度、功耗、三曲线风扇、硬盘面板、GPIO 按键与脱敏调试报告模块。
 source=thirdparty
@@ -13,4 +13,4 @@ desktop_uidir=ui
 desktop_applaunchname=tad-module.Application
 checkport=false
 disable_authorization_path=false
-changelog=盘位三行对齐、负载六档与夜间模式（跟随 fnOS 主题）。
+changelog=隐藏未接线的持续 0 RPM 风扇通道；已勾选通道瞬时 0 转仍保留。
