@@ -43,18 +43,18 @@ it87_module_loaded() {
 }
 
 it87_external_managed() {
-  # 对方独立 FPK 的内核版本记录
-  if [ -f "${IT87_EXT_KVER_FILE}" ] && [ ! -f "${IT87_OUR_MARKER}" ]; then
+  # 对方独立 FPK 的内核版本记录 / conf：只要存在即视为外部优先（不依赖无 OUR_MARKER）
+  if [ -f "${IT87_EXT_KVER_FILE}" ]; then
     return 0
   fi
   # 对方写入的 modules-load / modprobe（非我们的 tad-module-* 文件名）
-  if [ -f "${IT87_EXT_LOADCONF}" ] && [ ! -f "${IT87_OUR_MARKER}" ]; then
+  if [ -f "${IT87_EXT_LOADCONF}" ]; then
     return 0
   fi
-  if [ -f "${IT87_EXT_MODCONF}" ] && [ ! -f "${IT87_OUR_MARKER}" ]; then
+  if [ -f "${IT87_EXT_MODCONF}" ]; then
     return 0
   fi
-  # DKMS 已注册但不是我们托管的
+  # DKMS 已注册但不是我们托管的（仍用 marker 区分自建残留）
   if command -v dkms >/dev/null 2>&1; then
     if dkms status -m "${IT87_DKMS_NAME}" -v "${IT87_DKMS_VER}" >/dev/null 2>&1 \
       && [ ! -f "${IT87_OUR_MARKER}" ]; then
@@ -258,10 +258,11 @@ it87_ensure() {
   fi
 
   if [ -f "${IT87_OUR_MARKER}" ]; then
-    it87_ensure_built_for_current_kernel || true
+    it87_ensure_built_for_current_kernel || return 1
     if ! it87_module_loaded; then
-      modprobe "${IT87_DKMS_NAME}" 2>/dev/null || true
+      modprobe "${IT87_DKMS_NAME}" 2>/dev/null || return 1
     fi
+    it87_module_loaded || return 1
     return 0
   fi
 
@@ -289,16 +290,19 @@ it87_cleanup_ours() {
     return 0
   fi
 
-  it87_log "卸载：清理本插件 conf/标记（明确不 rmmod it87）"
-  rm -f "${IT87_OUR_MODCONF}" "${IT87_OUR_LOADCONF}" "${IT87_OUR_KVER_FILE}" "${IT87_OUR_MARKER}"
-  # 模块仍在用时不 dkms remove / 不删 SRC，避免影响已加载模块或其他依赖
+  it87_log "卸载：清理本插件 DKMS/conf/标记（明确不 rmmod it87）"
+  # 模块仍在用时不 dkms remove；保留 marker/conf/SRC，便于后续卸载或启动重试清理
   if it87_module_loaded; then
-    it87_log "it87 仍在加载中，跳过 dkms remove 与 SRC 删除"
+    it87_log "it87 仍在加载中，跳过 dkms remove；保留 marker/conf/SRC"
     return 0
   fi
   if command -v dkms >/dev/null 2>&1; then
-    dkms remove -m "${IT87_DKMS_NAME}" -v "${IT87_DKMS_VER}" --all >>"$(it87_pkg_var)/tad-module.log" 2>&1 || true
+    if ! dkms remove -m "${IT87_DKMS_NAME}" -v "${IT87_DKMS_VER}" --all >>"$(it87_pkg_var)/tad-module.log" 2>&1; then
+      it87_log "WARN: dkms remove 失败，保留 marker/conf/SRC 以便后续重试"
+      return 1
+    fi
   fi
+  rm -f "${IT87_OUR_MODCONF}" "${IT87_OUR_LOADCONF}" "${IT87_OUR_KVER_FILE}" "${IT87_OUR_MARKER}"
   rm -rf "${IT87_SRC_DIR}"
   it87_log "卸载清理完成"
   return 0
