@@ -107,23 +107,21 @@ Authors:
     Guenter Roeck <linux@roeck-us.net>
 
 
-Building & Installing
----------------------
+Building & Installing (upstream / source maintainers only)
+----------------------------------------------------------
+
+This tree is shipped inside the TAD FPK. End users and FPK installs must **not**
+run `make` / `make install` / `make dkms` here — those paths bypass plugin
+markers and leave unmanaged modules the lifecycle cannot clean up.
+
+DKMS registration, build, load, and cleanup are owned by the TAD plugin
+lifecycle (`cmd/it87_dkms.sh`). Manual build commands below are for upstream
+driver development only, on a standalone checkout that is not the packaged
+`${IT87_SRC_DIR}` copy.
 
 * make clean
 * make
-* sudo make install
-
-
-Using DKMS
-----------
-
-This tree is shipped inside the TAD FPK. DKMS registration, build, load, and
-cleanup are owned by the TAD plugin lifecycle (`cmd/it87_dkms.sh`).
-
-Do **not** run `make dkms` / `make dkms_clean` (or other manual DKMS commands)
-on systems where this packaged copy is installed; doing so can fight the
-plugin-managed state.
+# Do not `sudo make install` against the FPK-managed tree.
 
 
 Module Parameters

@@ -296,11 +296,13 @@ it87_cleanup_ours() {
     it87_log "it87 仍在加载中，跳过 dkms remove；保留 marker/conf/SRC"
     return 0
   fi
-  if command -v dkms >/dev/null 2>&1; then
-    if ! dkms remove -m "${IT87_DKMS_NAME}" -v "${IT87_DKMS_VER}" --all >>"$(it87_pkg_var)/tad-module.log" 2>&1; then
-      it87_log "WARN: dkms remove 失败，保留 marker/conf/SRC 以便后续重试"
-      return 1
-    fi
+  if ! command -v dkms >/dev/null 2>&1; then
+    it87_log "WARN: dkms 不可用，跳过 dkms remove；保留 marker/conf/SRC 以便后续重试"
+    return 1
+  fi
+  if ! dkms remove -m "${IT87_DKMS_NAME}" -v "${IT87_DKMS_VER}" --all >>"$(it87_pkg_var)/tad-module.log" 2>&1; then
+    it87_log "WARN: dkms remove 失败，保留 marker/conf/SRC 以便后续重试"
+    return 1
   fi
   rm -f "${IT87_OUR_MODCONF}" "${IT87_OUR_LOADCONF}" "${IT87_OUR_KVER_FILE}" "${IT87_OUR_MARKER}"
   rm -rf "${IT87_SRC_DIR}"
