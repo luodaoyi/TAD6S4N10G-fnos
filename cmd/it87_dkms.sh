@@ -42,6 +42,16 @@ it87_module_loaded() {
   lsmod 2>/dev/null | grep -q "^${IT87_DKMS_NAME} "
 }
 
+# dkms status 是否已登记本模块：看输出有效行，不看 exit code。
+# fnOS 未注册时常 exit 0 + 空输出；若仅凭 exit code 会误判「外部/已有」→ 永久跳过自建。
+# 自检（冷路径期望）：无 EXT 文件、无 OUR_MARKER、本函数假、模块未加载 → it87_ensure 走 add/install。
+it87_dkms_registered() {
+  command -v dkms >/dev/null 2>&1 || return 1
+  _st="$(dkms status -m "${IT87_DKMS_NAME}" -v "${IT87_DKMS_VER}" 2>/dev/null || true)"
+  [ -n "${_st}" ] || return 1
+  printf '%s\n' "${_st}" | grep -q "${IT87_DKMS_NAME}"
+}
+
 it87_external_managed() {
   # 对方独立 FPK 的内核版本记录 / conf：只要存在即视为外部优先（不依赖无 OUR_MARKER）
   if [ -f "${IT87_EXT_KVER_FILE}" ]; then
@@ -54,12 +64,9 @@ it87_external_managed() {
   if [ -f "${IT87_EXT_MODCONF}" ]; then
     return 0
   fi
-  # DKMS 已注册但不是我们托管的（仍用 marker 区分自建残留）
-  if command -v dkms >/dev/null 2>&1; then
-    if dkms status -m "${IT87_DKMS_NAME}" -v "${IT87_DKMS_VER}" >/dev/null 2>&1 \
-      && [ ! -f "${IT87_OUR_MARKER}" ]; then
-      return 0
-    fi
+  # DKMS 已登记该模块且非我们托管 → 外部/已有（空输出不算）
+  if it87_dkms_registered && [ ! -f "${IT87_OUR_MARKER}" ]; then
+    return 0
   fi
   return 1
 }
@@ -165,7 +172,7 @@ it87_register_and_build() {
   cp -r "${_bundled}" "${IT87_SRC_DIR}"
   chmod -R u+rwX,go+rX "${IT87_SRC_DIR}"
 
-  if ! dkms status -m "${IT87_DKMS_NAME}" -v "${IT87_DKMS_VER}" >/dev/null 2>&1; then
+  if ! it87_dkms_registered; then
     it87_log "dkms add ${IT87_DKMS_NAME} ${IT87_DKMS_VER}"
     dkms add -m "${IT87_DKMS_NAME}" -v "${IT87_DKMS_VER}" >>"$(it87_pkg_var)/tad-module.log" 2>&1 || true
   fi
@@ -231,7 +238,7 @@ it87_ensure_built_for_current_kernel() {
   fi
 
   it87_log "内核变化: 上次=[${_built:-无}] 当前=[${_cur}]，重新编译"
-  if [ ! -d "${IT87_SRC_DIR}" ] || ! dkms status -m "${IT87_DKMS_NAME}" -v "${IT87_DKMS_VER}" >/dev/null 2>&1; then
+  if [ ! -d "${IT87_SRC_DIR}" ] || ! it87_dkms_registered; then
     it87_register_and_build || return 1
   else
     it87_check_toolchain || return 1
