@@ -1923,6 +1923,12 @@ window.addEventListener('pagehide', () => {
     parentThemeObserver = null;
   }
 });
+// bfcache 恢复不会重新执行脚本，而 pagehide 已断开观察器：pageshow 时重挂，
+// 并重取一次主题（恢复期间 fnOS 桌面可能已切换明暗）。
+window.addEventListener('pageshow', () => {
+  applyTheme(currentThemeMode());
+  syncParentThemeObserver();
+});
 const themeToggle = $('theme-toggle');
 if (themeToggle) {
   themeToggle.addEventListener('click', () => {
