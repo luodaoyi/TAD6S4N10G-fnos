@@ -7,4 +7,11 @@ if ! "${TRIM_APPDEST}/bin/tad-module" apply \
   echo "现有硬件配置暂时无法应用；模块将以降级模式启动，请打开模块检查功耗与风扇配置。" >"${TRIM_TEMP_LOGFILE:-/dev/stderr}"
 fi
 
+# shellcheck source=it87_dkms.sh
+. "$(CDPATH= cd -- "$(dirname "$0")" && pwd)/it87_dkms.sh"
+if ! it87_ensure; then
+  echo "升级后 IT87 驱动自愈未完成（请确认 dkms/gcc/linux-headers）。" \
+    >"${TRIM_TEMP_LOGFILE:-/dev/stderr}"
+fi
+
 exit 0

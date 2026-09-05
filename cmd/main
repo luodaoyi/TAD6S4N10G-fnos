@@ -9,14 +9,23 @@ PID_FILE="${PKG_VAR}/tad-module.pid"
 SOCKET="${APP_DEST}/tad-module.sock"
 LOG_FILE="${PKG_VAR}/tad-module.log"
 
+# shellcheck source=it87_dkms.sh
+. "$(CDPATH= cd -- "$(dirname "$0")" && pwd)/it87_dkms.sh"
+
 is_running() {
   [ -f "${PID_FILE}" ] || return 1
   pid="$(cat "${PID_FILE}" 2>/dev/null || true)"
   [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null
 }
 
+ensure_it87_soft() {
+  # 启动路径：内核升级自愈；失败不阻断 tad-module 服务
+  it87_ensure || true
+}
+
 start_service() {
   mkdir -p "${PKG_ETC}" "${PKG_VAR}"
+  ensure_it87_soft
   if is_running; then
     exit 0
   fi
@@ -52,6 +61,7 @@ start_service() {
 }
 
 stop_service() {
+  # 明确不 rmmod it87（风扇驱动可继续供系统或其他组件使用）
   if ! is_running; then
     rm -f "${PID_FILE}"
     exit 0

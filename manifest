@@ -1,5 +1,5 @@
 appname=tad-module
-version=0.10.14
+version=0.10.15
 display_name=TAD6S4N模块
 desc=面向 TAD6S4N10G 的温度、功耗、三曲线风扇、硬盘面板、GPIO 按键与脱敏调试报告模块。
 source=thirdparty
@@ -13,4 +13,4 @@ desktop_uidir=ui
 desktop_applaunchname=tad-module.Application
 checkport=false
 disable_authorization_path=false
-changelog=隐藏未接线的持续 0 RPM 风扇通道；已勾选通道瞬时 0 转仍保留。
+changelog=安装时内置 IT87 DKMS 驱动，新装不必再单独装 it87 FPK；与独立驱动共存并跳过双开；内核升级自愈；停止/卸载不 rmmod。

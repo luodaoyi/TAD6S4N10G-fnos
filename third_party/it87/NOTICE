@@ -1,0 +1,28 @@
+第三方组件 NOTICE
+================
+
+本仓库主体（TAD6S4N模块及其 Go/UI/脚本）以 MIT License 发布，见根目录 LICENSE。
+MIT 主体许可不变。
+
+本仓库额外包含第三方 IT87 硬件监控内核驱动源码（打包路径 app/it87-src/），
+用于在 fnOS 上经 DKMS 编译加载，以便风扇转速与 PWM 控制无需再单独安装
+it87 FPK。该驱动源码及其衍生 DKMS 打包材料以 GNU General Public License
+version 2 (GPL-2.0) 发布；完整文本见同目录 COPYING。
+
+来源与版权
+----------
+- 驱动实现源自 lm_sensors / Linux hwmon 的 it87 内核模块，以及
+  frankcrawford/it87 等社区维护分支中的对应源码与头文件版权声明。
+- 原始作者与贡献者包括但不限于：Christophe Gauthron、Jean Delvare
+  (SUSE Labs)、Guenter Roeck，以及其他 it87 源文件头中列明的贡献者。
+- fnOS DKMS/FPK 集成逻辑参考 IamAyang233/fnos-it87-kmod（打包发布者
+  Panda / https://www.aykeji.cn），该打包项目亦以 GPL-2.0 发布。
+
+共存与生命周期
+--------------
+- 若检测到独立 it87-kmod FPK 的标记（如 /etc/it87-kmod-kver）或 it87
+  模块已加载且非本插件托管，则跳过自建 DKMS，避免双开。
+- 本插件 stop / uninstall **不会** rmmod it87；仅在确认由本插件写入的
+  情况下，才可选清理本插件创建的 DKMS 注册与 modules-load/modprobe 片段。
+
+风扇控制业务逻辑仍只读写标准 sysfs hwmon 节点，不替代上述 GPL 驱动本身的许可义务。

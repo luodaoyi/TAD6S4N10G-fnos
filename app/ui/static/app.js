@@ -633,7 +633,7 @@ function renderFanHardwareWarning(fanStatus = {}) {
   $('fan-warning-driver-link').hidden = !missingDriver;
   if (missingDriver) {
     $('fan-warning-title').textContent = '未检测到或未加载 IT87 风扇驱动';
-    $('fan-warning-description').textContent = '风扇转速和 PWM 控制暂不可用。';
+    $('fan-warning-description').textContent = '风扇转速和 PWM 控制暂不可用。本插件安装时应已尝试内置 DKMS；请确认 dkms/gcc/make/linux-headers 后重启模块。';
   } else if (noChannel) {
     $('fan-warning-title').textContent = '未发现可控风扇通道';
     $('fan-warning-description').textContent = 'IT87 驱动已检测，但没有同时暴露 fan、pwm 与 pwm_enable 的通道，请检查驱动适配。';

@@ -11,4 +11,12 @@ if ! "${TRIM_APPDEST}/bin/tad-module" init \
   exit 1
 fi
 
+# 内置 IT87 DKMS：无独立 FPK 时编装并加载；失败不阻断功耗安装，但给出可操作错误
+# shellcheck source=it87_dkms.sh
+. "$(CDPATH= cd -- "$(dirname "$0")" && pwd)/it87_dkms.sh"
+if ! it87_ensure; then
+  echo "IT87 内置驱动未能就绪（常见原因：缺少 dkms/gcc/linux-headers）。功耗功能仍可用；风扇页会提示，修复工具链后重启本模块即可重试。" \
+    >"${TRIM_TEMP_LOGFILE:-/dev/stderr}"
+fi
+
 exit 0
