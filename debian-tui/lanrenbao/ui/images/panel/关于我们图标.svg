@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<!-- Creator: CorelDRAW X8 -->
+<svg xmlns="http://www.w3.org/2000/svg" xml:space="preserve" width="3.8mm" height="3.8mm" version="1.1" style="shape-rendering:geometricPrecision; text-rendering:geometricPrecision; image-rendering:optimizeQuality; fill-rule:evenodd; clip-rule:evenodd"
+viewBox="0 0 106 106"
+ xmlns:xlink="http://www.w3.org/1999/xlink">
+ <defs>
+  <font id="FontID0" horiz-adv-x="667" font-variant="normal" style="fill-rule:nonzero" font-weight="700">
+	<font-face
+		font-family="Dubai">
+		<font-face-src>
+			<font-face-name name="Dubai Bold"/>
+		</font-face-src>
+	</font-face>
+   <missing-glyph><path d="M0 0z"/></missing-glyph>
+   <glyph unicode="i" horiz-adv-x="255" d="M126.013 517.003c-15.3517,0 -29.6713,3.81857 -43.0105,11.5073 -13.3392,7.66293 -23.995,17.8286 -31.9934,30.4969 -7.99835,12.6684 -11.9975,26.6526 -11.9975,42.0042 0,15.3259 3.99917,29.4907 11.9975,42.4945 7.99835,13.0038 18.6542,23.3242 31.9934,30.9872 13.3392,7.66293 27.6588,11.5073 43.0105,11.5073 15.9967,0 30.8323,-3.84437 44.4811,-11.5073 13.6746,-7.66293 24.5111,-17.9834 32.5094,-30.9872 7.99835,-13.0038 11.9975,-27.1686 11.9975,-42.4945 0,-15.3517 -3.99917,-29.3359 -11.9975,-42.0042 -7.99835,-12.6684 -18.8348,-22.834 -32.5094,-30.4969 -13.6488,-7.68874 -28.4844,-11.5073 -44.4811,-11.5073zm-65.0188 -517.003l0 447.004 135.017 13.0038 0 -460.008 -135.017 0z"/>
+  </font>
+  <style type="text/css">
+   <![CDATA[
+    @font-face { font-family:"Dubai";font-variant:normal;font-weight:bold;src:url("#FontID0") format(svg)}
+    .fil1 {fill:#2D2D2D}
+    .fil0 {fill:#484849}
+    .fil2 {fill:#484849;fill-rule:nonzero}
+    .fnt0 {font-weight:bold;font-size:108.448px;font-family:'Dubai'}
+   ]]>
+  </style>
+ </defs>
+ <g id="图层_x0020_1">
+  <metadata id="CorelCorpID_0Corel-Layer"/>
+  <g id="_2400379519344">
+   <text x="39" y="90"  class="fil0 fnt0">i</text>
+   <g>
+    <path class="fil1" d="M37 76c0,1 0,0 0,1l0 0 1 0c0,0 0,0 0,-1 0,0 0,0 0,0 0,0 0,1 -1,0 0,0 0,0 0,0 0,0 0,0 1,0l-1 0c0,0 0,0 0,0z"/>
+    <path class="fil1" d="M36 77c1,0 1,-1 1,-1 0,0 -1,0 -1,1z"/>
+    <path class="fil1" d="M32 39c1,0 0,0 1,0 0,0 0,0 0,0 0,0 -1,0 0,0 0,0 0,0 0,0 0,0 -1,0 -1,0z"/>
+    <path class="fil2" d="M53 0c15,0 28,6 38,16 9,9 15,22 15,37 0,15 -6,28 -15,38 -10,9 -23,15 -38,15 -15,0 -28,-6 -37,-15 -10,-10 -16,-23 -16,-38 0,-15 6,-28 16,-37 9,-10 22,-16 37,-16zm31 22c-8,-8 -19,-13 -31,-13 -12,0 -23,5 -31,13 -8,8 -13,19 -13,31 0,12 5,23 13,31 8,8 19,13 31,13 12,0 23,-5 31,-13 8,-8 13,-19 13,-31 0,-12 -5,-23 -13,-31z"/>
+   </g>
+  </g>
+ </g>
+</svg>

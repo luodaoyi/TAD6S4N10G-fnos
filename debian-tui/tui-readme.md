@@ -1,119 +1,61 @@
-# TAD6S4N —— Debian 原生 TUI（tank）
+# TAD6S4N —— Debian 原生 tank（Go 单二进制）
 
-作者原版是给**飞牛 fnOS 的浏览器插件（`.fpk` + Web UI）**。本目录把同一套硬件能力搬到**原生 Debian**，但**不改作者一行 Go 源码**——只是在它的 Go 后台服务外面套一个**终端面板壳子**。
+作者原版是给**飞牛 fnOS 的浏览器插件（.fpk + Web UI）**。本目录把同一套硬件能力搬到**原生 Debian**，但**不改作者一行 Go 源码**——作者后端复用，前端（tank）用 **Go 原生重写**成单静态二进制。
 
+## 为什么用 Go / 单二进制
+- 作者明确要求：**禁止 Python 做 TUI，用 Go/Rust 原生，交付单文件可执行**，不依赖本机 Python/pip/解释器。
+- 所以 `tank` 用 Go 写（stdlib + 终端 raw/ANSI），`CGO_ENABLED=0` 静态链接，**目标机免 Go、免 Python、免 curl、免编译**。
+- 作者后端 `tad-module` 同样预编译成静态单二进制，直接运行。
+
+## 原理
 ```
-浏览器版 (fnOS)                    Debian 版 (本目录)
-─────────────────                 ─────────────────────
-app/ui/static  → 浏览器渲染         debian-tui/tank → curses 终端渲染
-        ↑                                ↑
-        │ /api/status (unix socket)       │ curl --unix-socket /api/status
-作者 Go 服务（完全复用，不修改）  ← 作者 Go 服务（完全复用，不修改）
+作者 Go 后端 tad-module  ──unix socket──→  /api/status
+        （复用，不改源码）                  ↓
+tank（Go 单二进制）读取 /api/status，渲染终端面板
 ```
+- 后端把 CPU/coretemp、RAPL 功耗、风扇、硬盘槽位、GPIO 全部聚合进 `/api/status`。
+- tank 只做"读接口 + 画面板"，不碰底层 CPU/风扇/功耗写入。
 
-## 文件说明
-
-| 文件 | 作用 |
-|---|---|
-| `tank` | 终端面板前端（Python + curses）。只读 `/api/status` 并画面板：窗口检测、仓格、明细表、温度/功耗，`q`/`r`/`F1`/`F2` 按键。`tank --once` 输出纯文本快照。 |
-| `tank.service` | systemd 单元，把作者的 Go 二进制跑起来，提供 `/api/status` 这个 unix-socket 接口。 |
-| `install-tui.sh` | 一键构建 + 安装：编译作者 Go 后端、写监控模式配置、装 `tank`、落地并启动 systemd 服务。 |
-| `tui-readme.md` | 本说明。 |
-
-> 作者 Go 源码、`internal/powerguard`、`cmd/*`、`app/*`、`manifest` 均未改动；本目录只是**新增**。
-
-## 原理（为什么不用改底层）
-
-作者的 Go 服务把全部硬件识别聚合进一个接口：
-
+## 目录结构（debian-tui/）
 ```
-GET /api/status    (server.go)
-├─ cpu_temperature   coretemp 取 Core N 最大值（作者逻辑）
-├─ packages          Intel RAPL 功耗限制（作者逻辑）
-├─ fan_control       it87 风扇 PWM/RPM/模式（作者逻辑）
-├─ storage.slots     front-1..6 / m2-1..4 槽位、温度、SMART、休眠、繁忙度
-├─ gpio              按键 /dev/port（作者逻辑）
-└─ config            当前配置
+debian-tui/
+├── go编译单文件/           ← 交付给用户的 4 个文件（免编译）+ README.txt
+│   ├── tank                Go 静态单二进制（TUI，V260905-2）
+│   ├── tad-module          Go 静态单二进制（作者后端）
+│   ├── tank.service        systemd 配置（启动 tad-module）
+│   ├── install-tui-lanrenbao.sh   一键安装（拷贝+写配置+起服务）
+│   └── README.txt          组成 + 安装 + 使用
+├── tank.go                 tank 的 Go 源码（V260905-2）
+├── lanrenbao/ui/           浏览器版前端静态资源（可选，供 Web UI）
+├── tankfan                 Python 版风扇工具（本次不做；它87驱动另需第三方模块）
+└── tui-readme.md           本说明
 ```
 
-所以 TUI **不需要**做 PCI 拓扑（`00:1d.x`）、ASM1166、`lsblk`、`smartctl`、it87 枚举、RAPL 读取——这些作者都做好了。TUI 只把 JSON 画成方框。写操作（改风扇）也走作者接口：`POST /api/config/fan`（需 `X-Trim-Isadmin: true` 头，`tank` 已带）。
-
-## 安装
-
+## 安装（目标 x86_64 Linux）
 ```bash
-cd TAD6S4N10G-fnos/debian-tui
-sudo ./install-tui.sh
+cd .../debian-tui/go编译单文件
+sudo ./install-tui-lanrenbao.sh
 ```
+脚本自动：复制 `tad-module` 到 `/usr/local/libexec/tank/`、写 `/etc/tank/config.json`（监控模式 enabled=false，不改功耗/风扇/GPIO）、复制 `tank` 到 `/usr/local/bin/tank`、落地并启动 `tank.service`。
 
-依赖：`go`（构建后端）、`curl`、`python3`（Debian 自带）。
-
-`install-tui.sh` 做的事：
-1. `go build ./backend/powerguard`（依赖 `go.mod` 无外部包，可离线）。
-2. 复制 `app/ui/static` 为浏览器版静态资源（可选，TUI 不需要）。
-3. 写 `/etc/tank/config.json`（**监控模式**：`enabled=false`，不改功耗/风扇/GPIO）。
-4. 安装 `tank` 到 `/usr/local/bin/tank`。
-5. 落地 `tank.service` 并 `systemctl enable --now`。
+无需 Go/Python/curl/编译器，root 即可。
 
 ## 使用
-
 ```bash
-tank               # 交互面板（固定尺寸、居中；普通窗口可直接显示）
-tank --once        # 输出一次纯文本快照（无需大窗口）
+tank              # 欢迎屏：回车=实时刷新(3秒)；输入2=打印一次快照(适合手机小窗)
+tank --once       # 打印一次面板（同输入2）
 systemctl status tank
 journalctl -u tank.service -f
 ```
 
-按键：`q` 退出，`r` 立即刷新，`F1` 风扇自动曲线，`F2` 风扇关闭/BIOS 手动。
+## tank 面板内容
+- 数据头：CPU / Fan:PWM / Core-Package 温度
+- 前置 3.5" 硬盘仓（6 格，█有盘 □无盘，定宽温度）
+- 内置 M.2 NVMe（2×2，同格式）
+- 明细表（槽位/设备/状态/温度/容量型号）
+- 硬盘温度：tank 直接调 `smartctl`（不带 `-n standby`）读取，避开作者 smartctl 解析在 7.5 版的 bug；目标机建议装 `smartmontools`。
 
-## 排版与对齐
-
-- **固定尺寸面板**：面板宽度恒定，不随终端变大而拉伸；窗口检测仅用于判断能否完整显示。
-- **显示宽度对齐**：内部按「终端列宽」对齐（中文/宽字符按 2 列），所以中英混排、卡格、表格均不错位。
-- **仓位格子**：只显示「槽位号 + 占位符 + 定宽温度」，状态词放在下方明细表。
-  - `█` = 有机（使用/未用/休眠/告警）；`□` = 空仓；两符号等宽。
-  - 空仓温度统一 `00.0°C`（定宽），占位符与温度恒对齐。
-- **明细表**：保留 `使用 / 未用 / 空置`（作者逻辑：未用=有盘未挂载，使用=在用/挂载/RAID 成员，空置=无盘）。
-- **状态警告**：面板右下角提示异常；`上/下方向键` 未来可做滚动（当前固定显示）。
-
-## 数据说明
-
-- **SATA 温度**：作者用 `smartctl -n standby` 读普通硬盘，**休眠盘读不到** → `--`。TUI 额外读内核 `drivetemp` hwmon 补上（实测 44/45/48°C，连休眠盘也有）。这部分只读、不改作者源码。
-- **M.2 温度**：作者 SMART 直接读到，正常显示。
-- **功耗**：RAPL `PL1/PL2`，来自作者 `packages[]`。
-- **风扇**：见下文。
-
-## 风扇（重要）
-
-作者 README 明确要求风扇需安装**外部驱动** `fnos-it87-kmod`：
-
-> https://github.com/IamAyang233/fnos-it87-kmod（作者 README 链接）
-
-- 它是**第三方**项目（针对飞牛 fnOS 内核的 DKMS 现场编译模块，不是作者写的，也不在作者仓库里）。
-- 本仓库**不含**任何风扇驱动源码或 `.ko`。
-- 在这台 `i3-N305`/Debian 上实测：内核自带 `it87.ko` 与 `nct6775.ko` 均 `modprobe` 报 **`No such device`** → 识别不到这块白牌主板的 ITE 风扇芯片。
-- 因此未装该驱动前，TUI 正常显示 `Fan: N/A（it87 未加载）`，这是**预期行为**，不是 bug。
-- 若要让风扇可控：需要为**当前 Debian/PVE 内核**编译 `fnos-it87-kmod`（其源码在第三方仓库，GPL-2.0），要求 gcc/dkms/make + 内核头文件。这是**驱动层**工作，与 TUI 无关。
-
-## 环境变量
-
-| 变量 | 默认 | 说明 |
-|---|---|---|
-| `TANK_SOCKET` | `/run/tank/tad-module.sock` | Go 服务的 unix socket |
-| `TANK_MIN_W` | `85` | 开启检测时的最小终端宽度 |
-| `TANK_MIN_H` | `24` | 开启检测时的最小终端高度 |
-| `TANK_REFRESH` | `2` | 自动刷新秒数 |
-| `TANK_CHECK_SIZE` | （关） | 设为 `1` 恢复「窗口太小」警告框。默认关闭，避免普通窗口被拦 |
-
-## 关键入口（`/api/status` 主要字段）
-
-- `cpu_model` / `profile.display`
-- `cpu_temperature.{core_max_c, package_max_c}`
-- `packages[].{pl1_w, pl2_w}`
-- `fan_control.{driver_detected, available, active, fans[].{rpm,pwm_percent,mode}}`
-- `storage.slots[].{id, kind, slot, state, activity, device, model, size_bytes, temperature_c}`
-- `gpio.buttons[]`
-- `config` / `last_error`
-
-## 与 PVE/Debian 的关系
-
-已在这台 `i3-N305`/Debian 13 机上验证：`coretemp`、`intel-rapl`、ASM1166 前置仓、`00:1d.0` 下的 NVMe、`/dev/port`、`lsblk`、`smartctl`、`drivetemp` 均可用；`it87` 需安装第三方模块后风扇才会显示。
+## 注意
+- **风扇**：作者 README 要求第三方 `fnos-it87-kmod`（内核自带 it87 不识别本板）。当前交付**不含**风扇控制；未装驱动前 tank 显示 `Fan: N/A` 属正常。
+- **监控模式**：后端 `enabled=false` 启动，只读展示，不修改功耗/风扇/GPIO。
+- **架构**：目前是 x86_64（amd64）静态二进制；arm/arm64 需另编对应架构。

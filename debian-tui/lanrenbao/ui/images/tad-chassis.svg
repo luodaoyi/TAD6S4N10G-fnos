@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 360" role="img" aria-label="Six-bay storage chassis">
+  <defs>
+    <linearGradient id="case" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#f3f5f7"/>
+    </linearGradient>
+    <linearGradient id="bay" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#eef1f4"/>
+      <stop offset="0.5" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#e8ebef"/>
+    </linearGradient>
+  </defs>
+  <rect x="18" y="16" width="564" height="322" rx="14" fill="url(#case)" stroke="#c8cfd7" stroke-width="4"/>
+  <path d="M30 42h540M30 312h540" stroke="#e1e5e9" stroke-width="2"/>
+  <rect x="40" y="74" width="94" height="198" rx="9" fill="#e7ebef" stroke="#c4ccd4" stroke-width="3"/>
+  <path d="M54 91h66v164H54z" fill="#d1d7dd"/>
+  <path d="M59 98h56M59 248h56" stroke="#aeb8c2" stroke-width="3"/>
+  <rect x="150" y="52" width="410" height="222" rx="12" fill="#dfe4e9" stroke="#bac3cc" stroke-width="3"/>
+  <g fill="url(#bay)" stroke="#c1c9d1" stroke-width="2">
+    <rect x="160" y="62" width="62" height="202" rx="4"/>
+    <rect x="228" y="62" width="62" height="202" rx="4"/>
+    <rect x="296" y="62" width="62" height="202" rx="4"/>
+    <rect x="364" y="62" width="62" height="202" rx="4"/>
+    <rect x="432" y="62" width="62" height="202" rx="4"/>
+    <rect x="500" y="62" width="50" height="202" rx="4"/>
+  </g>
+  <g fill="#d2d8de">
+    <rect x="165" y="70" width="52" height="8" rx="3"/><rect x="233" y="70" width="52" height="8" rx="3"/>
+    <rect x="301" y="70" width="52" height="8" rx="3"/><rect x="369" y="70" width="52" height="8" rx="3"/>
+    <rect x="437" y="70" width="52" height="8" rx="3"/><rect x="505" y="70" width="40" height="8" rx="3"/>
+  </g>
+  <rect x="40" y="286" width="520" height="30" rx="8" fill="#e3e7eb" stroke="#c4ccd4" stroke-width="2"/>
+  <g fill="#aab4be"><circle cx="65" cy="301" r="5"/><circle cx="84" cy="301" r="5"/><rect x="472" y="296" width="22" height="10" rx="3"/><rect x="504" y="296" width="22" height="10" rx="3"/></g>
+  <path d="M58 338v8h78v-8M464 338v8h78v-8" stroke="#aab3bc" stroke-width="8"/>
+</svg>
