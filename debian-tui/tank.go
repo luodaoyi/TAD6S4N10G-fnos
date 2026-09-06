@@ -1,9 +1,10 @@
 // tank - TAD6S4N hardware monitor TUI (native Go, single static binary).
 //
 // Reads the module's /api/status over its Unix socket and renders a terminal
-// panel. HDD temperature is queried directly from smartctl WITHOUT the "-n
-// standby" flag (the author's SMART parser is currently broken for smartctl
-// 7.5's object-form "power_mode"), so sleeping drives get a real reading.
+// panel. HDD temperature is queried directly from smartctl WITH the "-n
+// standby" flag, so sleeping/standby drives are NOT woken (they simply show no
+// reading). The author's SMART parser is currently broken for smartctl 7.5's
+// object-form "power_mode", so we read smartctl ourselves.
 //
 // Go native (stdlib only), no python/curses. Build:
 //   CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o tank .
@@ -33,6 +34,13 @@ var (
 	refreshSec = atoi(getenv("TANK_REFRESH", "3"), 3)
 	hddCache   sync.Map
 )
+
+// hddTemp is a cached SMART temperature with the time it was read, so the
+// live panel does not keep showing a stale value forever.
+type hddTemp struct {
+	temp float64
+	at   time.Time
+}
 
 // ---- /api/status subset ----------------------------------------------------
 
@@ -126,13 +134,13 @@ func fetchStatus() (*status, error) {
 
 func readHDDTemp(dev string) (float64, bool) {
 	if v, ok := hddCache.Load("hdd:" + dev); ok {
-		if t, ok := v.(float64); ok && t > 0 {
-			return t, true
+		if e, ok := v.(hddTemp); ok && e.temp > 0 && time.Since(e.at) < time.Duration(refreshSec)*time.Second {
+			return e.temp, true
 		}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "smartctl", "-j", "-A", dev).Output()
+	out, err := exec.CommandContext(ctx, "smartctl", "-j", "-n", "standby", "-A", dev).Output()
 	if err != nil {
 		return 0, false
 	}
@@ -144,7 +152,7 @@ func readHDDTemp(dev string) (float64, bool) {
 	if json.Unmarshal(out, &doc) != nil || doc.Temperature.Current <= 0 {
 		return 0, false
 	}
-	hddCache.Store("hdd:"+dev, doc.Temperature.Current)
+	hddCache.Store("hdd:"+dev, hddTemp{temp: doc.Temperature.Current, at: time.Now()})
 	return doc.Temperature.Current, true
 }
 
