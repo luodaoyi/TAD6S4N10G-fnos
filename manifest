@@ -1,5 +1,5 @@
 appname=tad-module
-version=0.10.15
+version=0.10.16
 display_name=TAD6S4N模块
 desc=面向 TAD6S4N10G 的温度、功耗、三曲线风扇、硬盘面板、GPIO 按键与脱敏调试报告模块。
 source=thirdparty
@@ -13,4 +13,4 @@ desktop_uidir=ui
 desktop_applaunchname=tad-module.Application
 checkport=false
 disable_authorization_path=false
-changelog=安装时内置 IT87 DKMS 驱动，新装不必再单独装 it87 FPK；与独立驱动共存并跳过双开；内核升级自愈；停止/卸载不 rmmod。
+changelog=兼容 smartctl 7.5 的 object 型 power_mode，修复醒盘温度读不到。
