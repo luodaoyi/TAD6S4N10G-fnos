@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<!-- Creator: CorelDRAW X8 -->
+<svg xmlns="http://www.w3.org/2000/svg" xml:space="preserve" width="8.4727mm" height="3.2867mm" version="1.1" style="shape-rendering:geometricPrecision; text-rendering:geometricPrecision; image-rendering:optimizeQuality; fill-rule:evenodd; clip-rule:evenodd"
+viewBox="0 0 1144 444"
+ xmlns:xlink="http://www.w3.org/1999/xlink">
+ <defs>
+  <font id="FontID0" horiz-adv-x="751" font-variant="normal" style="fill-rule:nonzero" font-weight="700">
+	<font-face
+		font-family="@微软雅黑">
+		<font-face-src>
+			<font-face-name name="Microsoft YaHei Bold"/>
+		</font-face-src>
+	</font-face>
+   <missing-glyph><path d="M0 0z"/></missing-glyph>
+   <glyph unicode="R" horiz-adv-x="698" d="M711.505 0l-185.675 0 -118.642 196.856c-24.3574,40.6289 -44.3723,66.833 -60.0449,78.4627 -15.6227,11.8293 -32.1437,17.6691 -49.8128,17.6691l-48.8146 0 0 -292.987 -161.168 0 0 756.326 265.136 0c180.035,0 270.027,-68.3304 270.027,-204.991 0,-51.5099 -15.0237,-95.6826 -45.171,-132.318 -29.9975,-36.8355 -71.5248,-62.6903 -124.183,-77.6641l0 -1.99651c34.839,-11.6796 73.3217,-50.2121 115.698,-115.198l142.65 -224.158zm-462.99 633.841l0 -217.819 79.1615 0c37.6341,0 68.1807,10.9808 90.9908,32.9923 23.0097,21.9616 34.4896,49.3137 34.4896,82.306 0,68.3304 -40.8286,102.521 -122.635,102.521l-82.0065 0z"/>
+   <glyph unicode="T" horiz-adv-x="625" d="M609.334 624.507l-215.822 0 0 -624.507 -161.517 0 0 624.507 -215.323 0 0 131.819 592.663 0 0 -131.819z"/>
+   <glyph unicode="E" horiz-adv-x="571" d="M535.163 0l-447.816 0 0 756.326 430.147 0 0 -131.819 -268.979 0 0 -178.188 249.963 0 0 -131.32 -249.963 0 0 -183.179 286.648 0 0 -131.819z"/>
+   <glyph unicode="S" horiz-adv-x="601" d="M52.6578 190.517c60.9933,-50.5116 130.172,-75.6676 207.687,-75.6676 43.8233,0 76.8156,7.4869 98.9768,22.6603 22.1612,15.1734 33.1919,34.4896 33.1919,58.3479 0,20.4642 -8.6848,39.8303 -26.3539,57.9985 -17.4694,18.3179 -63.988,42.9748 -139.156,74.3199 -118.193,50.1622 -177.19,122.985 -177.19,218.667 0,70.3269 26.853,124.981 80.3594,163.813 53.5064,39.0317 124.332,58.3479 212.678,58.3479 73.8208,0 135.812,-9.4834 185.975,-28.8495l0 -151.335c-50.8111,34.4896 -110.157,51.8592 -178.138,51.8592 -39.8303,0 -71.5248,-7.33716 -95.3332,-21.8617 -23.7085,-14.4747 -35.6875,-33.8408 -35.6875,-58.298 0,-19.5158 8.18568,-37.5343 24.5071,-53.8558 16.3214,-16.5211 56.5011,-38.6823 120.639,-66.6833 75.1685,-32.2935 126.878,-66.3339 155.029,-102.171 28.1507,-35.6376 42.1762,-78.313 42.1762,-127.826 0,-72.6728 -25.705,-127.976 -77.165,-165.96 -51.3601,-38.1832 -124.532,-57.1999 -219.166,-57.1999 -86.6983,0 -157.674,14.0255 -213.027,42.0265l0 161.667z"/>
+  </font>
+  <style type="text/css">
+   <![CDATA[
+    @font-face { font-family:"@微软雅黑";font-variant:normal;font-weight:bold;src:url("#FontID0") format(svg)}
+    .str0 {stroke:#332C2B;stroke-width:47.2271}
+    .fil1 {fill:#333333}
+    .fil0 {fill:white}
+    .fnt0 {font-weight:bold;font-size:270.419px;font-family:'@微软雅黑'}
+   ]]>
+  </style>
+ </defs>
+ <g id="图层_x0020_1">
+  <metadata id="CorelCorpID_0Corel-Layer"/>
+  <g id="_2400086750848">
+   <rect class="fil0 str0" x="24" y="24" width="1096" height="396" rx="61" ry="52"/>
+   <text x="123" y="326"  class="fil1 fnt0">R</text>
+   <text x="328" y="326"  class="fil1 fnt0">E</text>
+   <text x="499" y="326"  class="fil1 fnt0">S</text>
+   <text x="677" y="326"  class="fil1 fnt0">E</text>
+   <text x="850" y="326"  class="fil1 fnt0">T</text>
+  </g>
+ </g>
+</svg>

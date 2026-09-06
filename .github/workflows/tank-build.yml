@@ -1,0 +1,45 @@
+name: Build tank (Debian TUI)
+
+on:
+  push:
+    branches: [main]
+    paths: ["debian-tui/**"]
+  pull_request:
+    paths: ["debian-tui/**"]
+  # Release builds must NOT be gated by paths (tag refs often mismatch the
+  # paths filter and the attach-to-release step silently never runs).
+  release:
+    types: [created]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  tank:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache: true
+
+      - name: Build tank (linux/amd64, static)
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+            go build -trimpath -ldflags "-s -w" -o tank-linux-amd64 ./debian-tui/tank.go
+          file tank-linux-amd64
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tank-linux-amd64
+          path: tank-linux-amd64
+
+      - name: Attach binary to Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: tank-linux-amd64
