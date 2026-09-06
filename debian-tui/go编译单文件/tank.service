@@ -5,8 +5,13 @@ RequiresMountsFor=/run/tank
 
 [Service]
 Type=simple
-User=root
-Group=root
+User=tank
+Group=tank
+SupplementaryGroups=disk www-data
+# Read-only monitoring: the backend runs unprivileged (not root) and only
+# reads hardware feedback (coretemp / powercap via sysfs, SATA SMART via the
+# disk group). Power/fan/GPIO writes are NOT enabled by default and would need
+# explicit elevated privileges.
 ExecStart=/usr/local/libexec/tank/tad-module serve \
     --config /etc/tank/config.json \
     --state /var/lib/tank/original-state.json \
@@ -14,9 +19,16 @@ ExecStart=/usr/local/libexec/tank/tad-module serve \
     --web-root /usr/local/libexec/tank/ui \
     --log /var/log/tank/tad-module.log
 RuntimeDirectory=tank
-RuntimeDirectoryMode=0755
+RuntimeDirectoryMode=0750
 StateDirectory=tank
+StateDirectoryMode=0750
 LogsDirectory=tank
+LogsDirectoryMode=0750
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+RestrictAddressFamilies=AF_UNIX
 Restart=on-failure
 RestartSec=2
 
