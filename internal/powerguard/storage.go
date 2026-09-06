@@ -1,6 +1,7 @@
 package powerguard
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -756,6 +757,40 @@ func (m *Manager) mdWarning(purposes []string) string {
 	return ""
 }
 
+// smartPowerMode accepts smartctl power_mode as a string ("STANDBY")
+// or as an object ({"ata_value":255,"name":"ACTIVE or IDLE"}) from smartctl 7.5+.
+type smartPowerMode struct {
+	raw string
+}
+
+func (m *smartPowerMode) UnmarshalJSON(b []byte) error {
+	b = bytes.TrimSpace(b)
+	if len(b) == 0 || string(b) == "null" {
+		m.raw = ""
+		return nil
+	}
+	switch b[0] {
+	case '"':
+		var s string
+		if err := json.Unmarshal(b, &s); err != nil {
+			return err
+		}
+		m.raw = s
+		return nil
+	case '{':
+		var o struct {
+			Name string `json:"name"`
+		}
+		if err := json.Unmarshal(b, &o); err != nil {
+			return err
+		}
+		m.raw = o.Name
+		return nil
+	default:
+		return fmt.Errorf("unsupported power_mode JSON: %s", string(b))
+	}
+}
+
 func findSmartctl() (string, error) {
 	for _, candidate := range []string{"/usr/sbin/smartctl", "/usr/bin/smartctl"} {
 		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
@@ -801,7 +836,7 @@ func parseSMART(data []byte) (smartResult, error) {
 			Temperature     float64 `json:"temperature"`
 			PercentageUsed  int64   `json:"percentage_used"`
 		} `json:"nvme_smart_health_information_log"`
-		PowerMode string `json:"power_mode"`
+		PowerMode smartPowerMode `json:"power_mode"`
 		Smartctl  struct {
 			ExitStatus int64 `json:"exit_status"`
 			Messages   []struct {
@@ -818,7 +853,7 @@ func parseSMART(data []byte) (smartResult, error) {
 	}
 	// smartctl -n standby reports sleeping drives via smartctl.messages
 	// ("Device is in STANDBY mode, exit(2)") rather than a power_mode field.
-	powerMode := strings.TrimSpace(document.PowerMode)
+	powerMode := strings.TrimSpace(document.PowerMode.raw)
 	if powerMode == "" {
 		for _, msg := range document.Smartctl.Messages {
 			lower := strings.ToLower(msg.String)
