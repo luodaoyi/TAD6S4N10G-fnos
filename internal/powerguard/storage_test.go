@@ -192,6 +192,37 @@ func TestParseSMARTReportsStandbyPowerMode(t *testing.T) {
 	}
 }
 
+func TestParseSMARTAcceptsObjectPowerMode(t *testing.T) {
+	data := []byte(`{
+  "smart_status":{"passed":true},
+  "temperature":{"current":43},
+  "power_mode":{"ata_value":255,"name":"ACTIVE or IDLE"}
+}`)
+	result, err := parseSMART(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.TemperatureC != 43 {
+		t.Fatalf("expected temperature 43, got %+v", result)
+	}
+	if result.PowerMode != "ACTIVE or IDLE" {
+		t.Fatalf("expected ACTIVE or IDLE power mode, got %+v", result)
+	}
+	if powerModeIsSleeping(result.PowerMode) {
+		t.Fatalf("ACTIVE or IDLE should not be sleeping, got %+v", result)
+	}
+}
+
+func TestParseSMARTObjectStandbyPowerMode(t *testing.T) {
+	result, err := parseSMART([]byte(`{"power_mode":{"ata_value":0,"name":"STANDBY"}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.PowerMode != "STANDBY" || !powerModeIsSleeping(result.PowerMode) {
+		t.Fatalf("expected standby object power mode, got %+v", result)
+	}
+}
+
 func TestParseSMARTDetectsStandbyFromMessages(t *testing.T) {
 	data := []byte(`{
   "json_format_version": [1, 0],
