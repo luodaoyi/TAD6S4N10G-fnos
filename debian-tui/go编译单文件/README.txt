@@ -10,11 +10,13 @@ TAD6S4N —— Debian 原生 tank 面板
   README.txt                本说明
 
 【二进制从哪来】
-  tad-module  作者官方后端：从官方 Release/.fpk 提取（脚本会自动下载
+  tad-module  作者官方后端：从官方 Release/.fpk 提取（脚本自动下载
               https://github.com/luodaoyi/TAD6S4N10G-fnos/releases/download/v0.10.15/tad-module.fpk）
-  tank        本仓库 CI 编译（.github/workflows/tank-build.yml），发布到 Release
-  二者都可用环境变量 TANK_RELEASE_TANK / TANK_RELEASE_BACKEND 指定下载地址，
-  或手动从 Release 下载后与脚本放在同目录（./tank、./tad-module）。
+  tank        本仓库 CI 编译（.github/workflows/tank-build.yml），首次 Release 挂出前，
+              默认 TANK_RELEASE_TANK 为空——请先手动从 CI artifact 或本地编译得到 tank，
+              放到本目录 ./tank；或设置 TANK_RELEASE_TANK=<tank 二进制 URL>。
+  二者均可用环境变量 TANK_RELEASE_TANK / TANK_RELEASE_BACKEND 指定下载地址，
+  或手动从 Release/本地得到后与脚本放在同目录（./tank、./tad-module）。
 
 【安装】
   sudo ./install-tui-lanrenbao.sh

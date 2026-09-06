@@ -69,6 +69,13 @@ if ! id "$SRV_USER" >/dev/null 2>&1; then
   useradd --system --no-create-home --shell /usr/sbin/nologin "$SRV_USER" 2>/dev/null || true
 fi
 
+# Let the invoking (SSH) user read the module socket (owned root:www-data), so
+# `tank` runs without sudo.
+if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
+  log "把启动用户 $SUDO_USER 加入 www-data（读取 /run/tank/tad-module.sock）"
+  usermod -a -G www-data "$SUDO_USER" 2>/dev/null || warn "无法把 $SUDO_USER 加入 www-data，请手动 usermod -a -G www-data $SUDO_USER"
+fi
+
 log "创建目录"
 mkdir -p "$LIB" "$ETC" "$VAR" "$RUN" "$LOG"
 
@@ -122,8 +129,8 @@ else
 fi
 
 log "安装 tank TUI 前端"
-[ -f "$HERE/tank" ] && install -m 0755 "$HERE/tank" /usr/local/bin/tank \
-  || warn "未找到 tank，跳过"
+[ -f "$HERE/tank" ] || die "缺少 $HERE/tank：请设置 TANK_RELEASE_TANK 或手动放入 tank 二进制"
+install -m 0755 "$HERE/tank" /usr/local/bin/tank
 
 log "安装 systemd 服务（专用只读用户，非 root）"
 [ -f "$HERE/tank.service" ] && install -m 0644 "$HERE/tank.service" /etc/systemd/system/tank.service \

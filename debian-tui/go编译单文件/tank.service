@@ -18,8 +18,11 @@ ExecStart=/usr/local/libexec/tank/tad-module serve \
     --socket /run/tank/tad-module.sock \
     --web-root /usr/local/libexec/tank/ui \
     --log /var/log/tank/tad-module.log
+# 0775 lets any user traverse /run/tank to reach the socket; the socket itself
+# is 0660 root:www-data, so interactive users are added to www-data by the
+# installer so plain `tank` works without sudo.
 RuntimeDirectory=tank
-RuntimeDirectoryMode=0750
+RuntimeDirectoryMode=0775
 StateDirectory=tank
 StateDirectoryMode=0750
 LogsDirectory=tank
