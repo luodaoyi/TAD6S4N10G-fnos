@@ -227,6 +227,9 @@ func reapplyLoop(ctx context.Context, manager *powerguard.Manager, logger *log.L
 			timer.Stop()
 			return
 		case <-timer.C:
+			if err == nil && cfg.MonitoringOnly() {
+				continue
+			}
 			if err := manager.ApplyCurrent(); err != nil {
 				logger.Printf("reapply failed: %v", err)
 			}

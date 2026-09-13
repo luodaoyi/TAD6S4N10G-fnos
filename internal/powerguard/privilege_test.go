@@ -43,3 +43,23 @@ func TestRequireElevatedForWritesRejectsNonRootWrites(t *testing.T) {
 		t.Fatalf("got %v, want ErrRootRequired", err)
 	}
 }
+
+func TestApplyLockedSkipsNonRootMonitoringOnly(t *testing.T) {
+	if elevated() {
+		t.Skip("running as root; cannot assert non-root monitor-only skip")
+	}
+	dir := t.TempDir()
+	m := &Manager{
+		Root:       dir,
+		ConfigPath: dir + "/config.json",
+		StatePath:  dir + "/state.json",
+	}
+	// Leftover state that would fail if restore attempted (invalid packages).
+	if err := writeJSONAtomic(m.StatePath, OriginalState{Version: stateVersion, Packages: []OriginalPackage{{Name: "missing-pkg", LongUW: 1}}}, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := Config{Enabled: false, Fan: DefaultFanConfig(), GPIO: DefaultGPIOConfig(), PL1W: 15, PL2W: 25, ReapplySeconds: 30}
+	if err := m.applyLocked(cfg); err != nil {
+		t.Fatalf("monitor-only non-root applyLocked must be no-op, got %v", err)
+	}
+}
