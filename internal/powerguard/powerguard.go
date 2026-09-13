@@ -593,6 +593,11 @@ func (m *Manager) DiscoverPackages() ([]Package, error) {
 }
 
 func (m *Manager) applyLocked(cfg Config) error {
+	// Non-root monitor-only never applied writes in this process; skip restore/apply
+	// so a leftover state file cannot break status-only serve.
+	if cfg.MonitoringOnly() && !elevated() {
+		return nil
+	}
 	var errs []error
 	if cfg.Enabled {
 		errs = append(errs, m.applyPowerLocked(cfg))
