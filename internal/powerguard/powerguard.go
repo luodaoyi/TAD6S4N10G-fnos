@@ -65,6 +65,22 @@ type Config struct {
 	GPIO           GPIOConfig `json:"gpio"`
 }
 
+// MonitoringOnly reports whether all write capabilities are off (read-only status serve).
+func (cfg Config) MonitoringOnly() bool {
+	return !cfg.Enabled && !cfg.Fan.Enabled && !cfg.GPIO.Enabled
+}
+
+// ErrRootRequired is returned when a non-root process tries to enable write capabilities.
+var ErrRootRequired = errors.New("root privileges are required to enable power, fan, or gpio control")
+
+func requireElevatedForWrites(cfg Config) error {
+	if cfg.MonitoringOnly() || elevated() {
+		return nil
+	}
+	return ErrRootRequired
+}
+
+
 type GlobalConfig struct {
 	Enabled        bool  `json:"enabled"`
 	PL1W           int64 `json:"pl1_w"`

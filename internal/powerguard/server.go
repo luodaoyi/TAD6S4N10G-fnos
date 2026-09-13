@@ -128,6 +128,10 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "配置格式错误: "+err.Error())
 		return
 	}
+	normalizeConfig(&cfg)
+	if s.rejectNonRootWrites(w, cfg) {
+		return
+	}
 	if err := s.Manager.SaveAndApply(cfg); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -142,6 +146,19 @@ func (s *Server) handleGlobalConfig(w http.ResponseWriter, r *http.Request) {
 	var cfg GlobalConfig
 	if err := decodeConfigRequest(r, &cfg); err != nil {
 		writeError(w, http.StatusBadRequest, "配置格式错误: "+err.Error())
+		return
+	}
+	current, err := s.Manager.LoadOrCreateConfig()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	current.Enabled = cfg.Enabled
+	current.PL1W = cfg.PL1W
+	current.PL2W = cfg.PL2W
+	current.ReapplySeconds = cfg.ReapplySeconds
+	normalizeConfig(&current)
+	if s.rejectNonRootWrites(w, current) {
 		return
 	}
 	if err := s.Manager.SaveGlobalConfig(cfg); err != nil {
@@ -160,6 +177,16 @@ func (s *Server) handleFanConfig(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "配置格式错误: "+err.Error())
 		return
 	}
+	current, err := s.Manager.LoadOrCreateConfig()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	current.Fan = cfg
+	normalizeConfig(&current)
+	if s.rejectNonRootWrites(w, current) {
+		return
+	}
 	if err := s.Manager.SaveFanConfig(cfg); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -176,11 +203,38 @@ func (s *Server) handleGPIOConfig(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "配置格式错误: "+err.Error())
 		return
 	}
+	current, err := s.Manager.LoadOrCreateConfig()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	current.GPIO = cfg
+	normalizeConfig(&current)
+	if s.rejectNonRootWrites(w, current) {
+		return
+	}
 	if err := s.Manager.SaveGPIOConfig(cfg); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, s.Manager.Status())
+}
+
+
+func (s *Server) rejectNonRootWrites(w http.ResponseWriter, cfg Config) bool {
+	if cfg.MonitoringOnly() || elevated() {
+		return false
+	}
+	writeError(w, http.StatusForbidden, ErrRootRequired.Error())
+	return true
+}
+
+func (s *Server) rejectNonRootMutation(w http.ResponseWriter) bool {
+	if elevated() {
+		return false
+	}
+	writeError(w, http.StatusForbidden, ErrRootRequired.Error())
+	return true
 }
 
 func (s *Server) authorizeConfigRequest(w http.ResponseWriter, r *http.Request) bool {
@@ -211,6 +265,9 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, "仅管理员可以应用功耗、风扇与按键配置")
 		return
 	}
+	if s.rejectNonRootMutation(w) {
+		return
+	}
 	if err := s.Manager.ApplyCurrent(); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -225,6 +282,9 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) {
 	}
 	if !isAdmin(r) {
 		writeError(w, http.StatusForbidden, "仅管理员可以恢复原始功耗与风扇配置")
+		return
+	}
+	if s.rejectNonRootMutation(w) {
 		return
 	}
 	if err := s.Manager.DisableAndRestore(); err != nil {

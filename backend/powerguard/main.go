@@ -143,9 +143,6 @@ func serve(args []string) error {
 	if *config == "" || *state == "" || *socket == "" || *webRoot == "" {
 		return errors.New("--config, --state, --socket and --web-root are required")
 	}
-	if err := requireRoot(); err != nil {
-		return err
-	}
 	logger := log.Default()
 	if *logPath != "" {
 		if err := os.MkdirAll(filepath.Dir(*logPath), 0o700); err != nil {
@@ -163,10 +160,18 @@ func serve(args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := manager.ApplyCurrent(); err != nil {
-		logger.Printf("initial apply failed; continuing in degraded mode so configuration can be repaired: %v", err)
+	monitorOnly := cfg.MonitoringOnly()
+	if !monitorOnly {
+		if err := requireRoot(); err != nil {
+			return err
+		}
 	}
-	logger.Printf("started version=%s interval=%ds", version, cfg.ReapplySeconds)
+	if !monitorOnly {
+		if err := manager.ApplyCurrent(); err != nil {
+			logger.Printf("initial apply failed; continuing in degraded mode so configuration can be repaired: %v", err)
+		}
+	}
+	logger.Printf("started version=%s interval=%ds monitor_only=%v", version, cfg.ReapplySeconds, monitorOnly)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
@@ -183,6 +188,10 @@ func serve(args []string) error {
 
 	select {
 	case <-ctx.Done():
+		if monitorOnly {
+			logger.Printf("stopping: monitor-only mode, skip restore")
+			return nil
+		}
 		logger.Printf("stopping: restoring captured power and fan settings")
 		err := manager.Restore()
 		if errors.Is(err, powerguard.ErrOriginalStateCPUMismatch) {
@@ -191,6 +200,10 @@ func serve(args []string) error {
 		}
 		return err
 	case err := <-done:
+		if monitorOnly {
+			logger.Printf("server stopped: monitor-only mode, skip restore")
+			return err
+		}
 		logger.Printf("server stopped: restoring captured power and fan settings")
 		restoreErr := manager.Restore()
 		if errors.Is(restoreErr, powerguard.ErrOriginalStateCPUMismatch) {
