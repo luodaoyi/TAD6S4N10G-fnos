@@ -2,6 +2,7 @@ package powerguard
 
 import (
 	"errors"
+	"net/http/httptest"
 	"testing"
 )
 
@@ -27,6 +28,7 @@ func TestMonitoringOnly(t *testing.T) {
 }
 
 func TestRequireElevatedForWritesAllowsMonitoringOnly(t *testing.T) {
+	// serve-time helper: monitoring-only config may start without elevation.
 	cfg := Config{Enabled: false, Fan: DefaultFanConfig(), GPIO: DefaultGPIOConfig()}
 	if err := requireElevatedForWrites(cfg); err != nil {
 		t.Fatalf("monitoring-only must not require elevation: %v", err)
@@ -41,6 +43,20 @@ func TestRequireElevatedForWritesRejectsNonRootWrites(t *testing.T) {
 	err := requireElevatedForWrites(cfg)
 	if !errors.Is(err, ErrRootRequired) {
 		t.Fatalf("got %v, want ErrRootRequired", err)
+	}
+}
+
+func TestRejectNonRootMutationBlocksEvenWhenMonitoringOnly(t *testing.T) {
+	if elevated() {
+		t.Skip("running as root; cannot assert non-root HTTP rejection")
+	}
+	s := &Server{}
+	rec := httptest.NewRecorder()
+	if !s.rejectNonRootMutation(rec) {
+		t.Fatal("non-root HTTP mutation must be rejected even for monitoring-only serve")
+	}
+	if rec.Code != 403 {
+		t.Fatalf("status = %d, want 403", rec.Code)
 	}
 }
 

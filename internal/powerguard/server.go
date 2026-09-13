@@ -129,7 +129,7 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	normalizeConfig(&cfg)
-	if s.rejectNonRootWrites(w, cfg) {
+	if s.rejectNonRootMutation(w) {
 		return
 	}
 	if err := s.Manager.SaveAndApply(cfg); err != nil {
@@ -158,7 +158,7 @@ func (s *Server) handleGlobalConfig(w http.ResponseWriter, r *http.Request) {
 	current.PL2W = cfg.PL2W
 	current.ReapplySeconds = cfg.ReapplySeconds
 	normalizeConfig(&current)
-	if s.rejectNonRootWrites(w, current) {
+	if s.rejectNonRootMutation(w) {
 		return
 	}
 	if err := s.Manager.SaveGlobalConfig(cfg); err != nil {
@@ -184,7 +184,7 @@ func (s *Server) handleFanConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	current.Fan = cfg
 	normalizeConfig(&current)
-	if s.rejectNonRootWrites(w, current) {
+	if s.rejectNonRootMutation(w) {
 		return
 	}
 	if err := s.Manager.SaveFanConfig(cfg); err != nil {
@@ -210,7 +210,7 @@ func (s *Server) handleGPIOConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	current.GPIO = cfg
 	normalizeConfig(&current)
-	if s.rejectNonRootWrites(w, current) {
+	if s.rejectNonRootMutation(w) {
 		return
 	}
 	if err := s.Manager.SaveGPIOConfig(cfg); err != nil {
@@ -221,14 +221,8 @@ func (s *Server) handleGPIOConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 
-func (s *Server) rejectNonRootWrites(w http.ResponseWriter, cfg Config) bool {
-	if cfg.MonitoringOnly() || elevated() {
-		return false
-	}
-	writeError(w, http.StatusForbidden, ErrRootRequired.Error())
-	return true
-}
-
+// rejectNonRootMutation blocks HTTP config/apply/restore for non-root.
+// MonitoringOnly only relaxes serve startup; all HTTP mutations still need root.
 func (s *Server) rejectNonRootMutation(w http.ResponseWriter) bool {
 	if elevated() {
 		return false

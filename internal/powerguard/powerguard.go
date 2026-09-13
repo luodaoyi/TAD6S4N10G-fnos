@@ -70,8 +70,8 @@ func (cfg Config) MonitoringOnly() bool {
 	return !cfg.Enabled && !cfg.Fan.Enabled && !cfg.GPIO.Enabled
 }
 
-// ErrRootRequired is returned when a non-root process tries to enable write capabilities.
-var ErrRootRequired = errors.New("root privileges are required to enable power, fan, or gpio control")
+// ErrRootRequired is returned when a non-root process tries to change write-capable configuration.
+var ErrRootRequired = errors.New("root privileges are required to change power, fan, or gpio configuration")
 
 func requireElevatedForWrites(cfg Config) error {
 	if cfg.MonitoringOnly() || elevated() {
