@@ -1,5 +1,5 @@
 appname=tad-module
-version=0.10.18
+version=0.10.19
 display_name=TAD6S4N模块
 desc=面向 TAD6S4N10G 的温度、功耗、三曲线风扇、硬盘面板、GPIO 按键与脱敏调试报告模块。
 source=thirdparty
@@ -13,4 +13,4 @@ desktop_uidir=ui
 desktop_applaunchname=tad-module.Application
 checkport=false
 disable_authorization_path=false
-changelog=夜间模式图表可读性与 fnOS CSP 适配；手机硬盘面板居中；tag Release 同 job 附带 tank。
+changelog=debian-tui 安装目录改英文 single-binary；顺带 #20/#21 已随 v0.10.18。

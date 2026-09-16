@@ -20,7 +20,7 @@ tank（Go 单二进制）读取 /api/status，渲染终端面板
 ## 目录结构（debian-tui/）
 ```
 debian-tui/
-├── go编译单文件/           ← 交付说明和安装脚本；二进制由 CI/Release 或 .fpk 提供
+├── single-binary/           ← 交付说明和安装脚本；二进制由 CI/Release 或 .fpk 提供
 │   ├── tank.service        systemd 配置（启动 tad-module）
 │   ├── install-tui-lanrenbao.sh   一键安装（本地二进制或 curl 下载）
 │   └── README.txt          组成 + 安装 + 使用
@@ -31,7 +31,7 @@ debian-tui/
 
 ## 安装（目标 x86_64 Linux）
 ```bash
-cd .../debian-tui/go编译单文件
+cd .../debian-tui/single-binary
 sudo ./install-tui-lanrenbao.sh
 ```
 脚本自动：复制 `tad-module` 到 `/usr/local/libexec/tank/`、写 `/etc/tank/config.json`（监控模式 enabled=false，不主动应用功耗/风扇/GPIO）、复制 `tank` 到 `/usr/local/bin/tank`、落地并启动以 root 运行的 `tank.service`。后端必须使用 root，这是官方后端 `serve()` 的启动要求；安装脚本本身也必须由 root 执行。
