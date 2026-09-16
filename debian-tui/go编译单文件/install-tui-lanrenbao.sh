@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # tank - one-shot installer (PREBUILT variant).
 #
-# Ships the backend `tad-module` (author's official v0.10.17 static binary, from
+# Ships the backend `tad-module` (author's official v0.10.18 static binary, from
 # the .fpk) and the Go-native TUI `tank`. Binaries are NOT vendored in git; the
 # official tad-module is fetched from the author's Release / .fpk and tank is a
 # CI build. Place them next to this script (./tank, ./tad-module) or provide
@@ -26,8 +26,8 @@ UI="$LIB/ui"
 # Optional: download the binaries if not present locally.
 #   TANK_RELEASE_TANK    URL to a tank binary (e.g. a CI Release asset)
 #   TANK_RELEASE_BACKEND URL to the author's tad-module binary (or .fpk to extract from)
-TANK_RELEASE_TANK="${TANK_RELEASE_TANK:-https://github.com/luodaoyi/TAD6S4N10G-fnos/releases/download/v0.10.17/tank-linux-amd64}"
-TANK_RELEASE_BACKEND="${TANK_RELEASE_BACKEND:-https://github.com/luodaoyi/TAD6S4N10G-fnos/releases/download/v0.10.17/tad-module.fpk}"
+TANK_RELEASE_TANK="${TANK_RELEASE_TANK:-https://github.com/luodaoyi/TAD6S4N10G-fnos/releases/download/v0.10.18/tank-linux-amd64}"
+TANK_RELEASE_BACKEND="${TANK_RELEASE_BACKEND:-https://github.com/luodaoyi/TAD6S4N10G-fnos/releases/download/v0.10.18/tad-module.fpk}"
 
 log() { printf '\033[1;34m[+] %s\033[0m\n' "$*"; }
 warn() { printf '\033[1;33m[!] %s\033[0m\n' "$*"; }
