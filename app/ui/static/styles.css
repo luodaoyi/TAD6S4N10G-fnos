@@ -1563,13 +1563,13 @@ body.modal-open { overflow: hidden; }
   text-decoration: none;
 }
 
-.about-update-link {
+.about-panel .about-update-link {
   color: #fff;
   border-color: var(--primary);
   background: var(--primary);
 }
 
-.about-update-link:hover {
+.about-panel .about-update-link:hover {
   color: #fff;
   border-color: var(--primary-hover);
   background: var(--primary-hover);
