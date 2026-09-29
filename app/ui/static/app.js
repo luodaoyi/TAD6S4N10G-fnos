@@ -1,4 +1,24 @@
 const $ = (id) => document.getElementById(id);
+// 页面错误采集：白屏等运行期问题在真机无控制台可看，捕获后写入
+// localStorage（跨刷新保留最近 20 条），生成调试报告时带出并清空。
+const PAGE_ERROR_STORE_KEY = 'tad-page-errors';
+try {
+  const recordPageError = (detail) => {
+    try {
+      const entry = `${new Date().toISOString()} ${String(detail).slice(0, 280)}`;
+      const stored = JSON.parse(window.localStorage.getItem(PAGE_ERROR_STORE_KEY) || '[]');
+      stored.push(entry);
+      window.localStorage.setItem(PAGE_ERROR_STORE_KEY, JSON.stringify(stored.slice(-20)));
+    } catch (storageError) { /* localStorage 不可用时丢弃 */ }
+  };
+  window.addEventListener('error', (event) => {
+    recordPageError(`${event.message} @${String(event.filename || '').split('/').pop()}:${event.lineno}`);
+  });
+  window.addEventListener('unhandledrejection', (event) => {
+    const reason = event.reason && event.reason.message ? event.reason.message : event.reason;
+    recordPageError(`rejection: ${reason}`);
+  });
+} catch (collectorError) { /* 采集器自身失败不影响页面 */ }
 const DEFAULT_CPU_CURVE = [
   { temp_c: 40, pwm_percent: 60 },
   { temp_c: 55, pwm_percent: 70 },
@@ -2299,6 +2319,24 @@ function collectHostWindowInfo() {
   return info;
 }
 
+// 页面诊断：报告生成时刻的环境快照 + 采集到的页面错误（localStorage 里
+// 跨刷新保留）。白屏类问题真机无控制台，靠这份快照定位：哪块面板消失、
+// 是否有运行期异常。取走即清空，报告之间不重复累计。
+function collectPageDiagnostics() {
+  const diagnostics = {
+    viewport: `${window.innerWidth}x${window.innerHeight}`,
+    theme: String(document.documentElement.dataset.theme || '') || null,
+    activePanels: [...document.querySelectorAll('.tab-panel')].filter((panel) => !panel.hidden).map((panel) => panel.id),
+    shellAttached: Boolean(document.querySelector('main.shell')),
+    pageErrors: [],
+  };
+  try {
+    diagnostics.pageErrors = JSON.parse(window.localStorage.getItem(PAGE_ERROR_STORE_KEY) || '[]');
+    window.localStorage.setItem(PAGE_ERROR_STORE_KEY, '[]');
+  } catch (error) { /* 无存储时保持空数组 */ }
+  return diagnostics;
+}
+
 function formatDebugReport(payload) {
   const generatedAt = new Date().toISOString();
   let serialized;
@@ -2313,7 +2351,13 @@ function formatDebugReport(payload) {
   } catch (error) {
     host = `{"error": ${JSON.stringify(String(error.message))}}`;
   }
-  return `# TAD6S4N10G 调试报告\n\n生成时间：${generatedAt}\n\n以下内容由 GET api/debug/report 返回，用于协助定位模块问题。请在公开发布前检查是否包含敏感信息。\n\n## 接口报告\n\n\`\`\`json\n${serialized}\n\`\`\`\n\n## 宿主窗口环境（页面采集，仅结构信息）\n\n\`\`\`json\n${host}\n\`\`\``;
+  let page;
+  try {
+    page = JSON.stringify(collectPageDiagnostics(), null, 2);
+  } catch (error) {
+    page = `{"error": ${JSON.stringify(String(error.message))}}`;
+  }
+  return `# TAD6S4N10G 调试报告\n\n生成时间：${generatedAt}\n\n以下内容由 GET api/debug/report 返回，用于协助定位模块问题。请在公开发布前检查是否包含敏感信息。\n\n## 接口报告\n\n\`\`\`json\n${serialized}\n\`\`\`\n\n## 宿主窗口环境（页面采集，仅结构信息）\n\n\`\`\`json\n${host}\n\`\`\`\n\n## 页面诊断（错误采集与环境快照）\n\n\`\`\`json\n${page}\n\`\`\``;
 }
 
 function updateDebugReportActions(enabled) {
