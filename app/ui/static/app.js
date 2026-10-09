@@ -110,6 +110,7 @@ let gpioEditingScriptID = '';
 let storageVisualReady = false;
 let fanSelectorSignature = null;
 let debugReportText = '';
+let serialFormDirty = false; // 串口传感器表单有未保存的修改：轮询渲染不得覆盖
 
 function baseUrl(path) {
   const base = window.location.pathname.endsWith('/') ? window.location.pathname : `${window.location.pathname}/`;
@@ -914,7 +915,9 @@ function deleteGPIOScript(scriptID) {
 }
 
 function activateTab(tabID, focus = false) {
-  const tabs = [...document.querySelectorAll('[role="tab"]')];
+  // 只遍历主导航标签：曲线编辑器等页内 [role=tab] 自成 tablist，
+  // 不归主页面切换管——全局遍历会把它们的 aria-controls 面板误隐藏
+  const tabs = [...document.querySelectorAll('.app-tabs [role="tab"]')];
   tabs.forEach((tab) => {
     const active = tab.id === tabID;
     tab.setAttribute('aria-selected', String(active));
@@ -923,12 +926,15 @@ function activateTab(tabID, focus = false) {
     if (panel) panel.hidden = !active;
     if (active && focus) tab.focus();
   });
-  if (tabID === 'tab-fan') requestAnimationFrame(() => { CURVE_KINDS.forEach(renderFanChart); fetchHistory(); renderHistoryChart(); });
+  if (tabID === 'tab-fan') requestAnimationFrame(() => { CURVE_KINDS.forEach(renderFanChart); fetchHistory(); renderHistoryChart(); if (fanDebugVisiblePref()) startFanDebugPoll(); });
+  else stopFanDebugPoll(); // 离开风扇控制页即停轮询(调试卡片不在当前页)
+  // 调试页的传感器显示名列表靠历史数据发现传感器键，进页时刷新一次再渲染
   if (tabID === 'tab-debug') requestAnimationFrame(() => { fetchHistory().then(renderSensorNamesList); });
 }
 
 function setupTabs() {
-  const tabs = [...document.querySelectorAll('[role="tab"]')];
+  // 同 activateTab：只接管主导航标签的点击与方向键导航
+  const tabs = [...document.querySelectorAll('.app-tabs [role="tab"]')];
   tabs.forEach((tab, index) => {
     tab.addEventListener('click', () => activateTab(tab.id));
     tab.addEventListener('keydown', (event) => {
@@ -1283,7 +1289,7 @@ function renderFanChart(kind = 'cpu') {
   updateCurveControls(kind);
 }
 
-/* ---- 历史图表：后台每分钟采样（GET api/history?range=小时数），服务端按峰值聚合 ---- */
+/* ---- 历史温度：后台每分钟采样（GET api/history?range=小时数），服务端按峰值聚合 ---- */
 
 // 父类分组：勾选父类 = 整组曲线显隐；▾ 弹窗勾选组内子类（CPU/SATA/NVMe 弹窗
 // 内含“取最高”聚合项）。
@@ -1294,10 +1300,11 @@ const HISTORY_GROUPS = [
   { key: 'gpu', label: 'GPU', color: '#e05252' },
   { key: 'nic', label: '网卡', color: '#e6a53c' },
   { key: 'other', label: '其它', color: '#2aa8a8' },
-  { key: 'fan', label: '风扇', color: '#d8922a' },
+  { key: 'fan', label: '风扇', color: '#6e7780' }, // 中性灰：与温度传感器色系（蓝/绿/紫/红/琥珀/青）明显区分
 ];
-const HISTORY_DEFAULT_HOURS = 24;
+const HISTORY_DEFAULT_HOURS = 0.5; // 默认 30 分钟档；用户选过则优先用记住的档位
 const HISTORY_FETCH_TTL = 45000;
+const HISTORY_RANGE_STORAGE_KEY = 'tad-history-range';
 // 子类色从父类色派生：同色相、明度阶梯 ±8%、小幅交替色相偏移，
 // 保证同组曲线同色系且可区分。
 function historyHexToHsl(hex) {
@@ -1326,10 +1333,18 @@ function historyChildShade(baseHex, index) {
   const hue = (h + (lighten ? 1 : -1) * Math.min(Math.ceil((index + 1) / 2), 3) * 5 + 360) % 360;
   return `hsl(${Math.round(hue)}, ${Math.round(Math.max(0.25, s) * 100)}%, ${Math.round(lightness * 100)}%)`;
 }
+
+// 风扇组子类不走 HSL 派生：灰色基色会被饱和度下限（0.25）强行染色，
+// 改用独立灰色阶梯按子类序号取色。前四档（TAD6S4N 四风扇）保证深浅主题
+// 都清晰：深色背景 rgb(20,21,25) 下过暗的灰（如 #4a5058）会与网格线混在一起。
+const HISTORY_FAN_SHADES = ['#6e7780', '#97a0ab', '#b6bec8', '#8a919c', '#aab2bc', '#5b626b', '#cfd4da', '#454c54'];
 const HISTORY_FAN_MAX_PERCENT = 100;
 
 let historyCache = null;
 let historyFetchedAt = 0;
+// 先给默认值，真实档位在下方 HISTORY_ALL_STOPS 等常量声明完之后再加载：
+// loadHistoryRangeHours 依赖的 normalize 会读那些 const（无提升），在声明前
+// 调用会抛 ReferenceError 被 try/catch 吞掉——localStorage 记住的档位就失效了
 let historyRangeHours = HISTORY_DEFAULT_HOURS;
 let historyRangedSamples = [];   // 当前范围采样（与图上折线一致）
 let historyYBoundsState = { lo: 20, hi: 90 }; // 渲染时缓存，供十字线取点
@@ -1339,8 +1354,29 @@ let historyLastCursorEvent = null; // 最后悬停位置，自动刷新重绘后
 let historyOpenPopoverKey = null; // 当前展开的父类弹窗
 let historyLegendIdentity = '';   // 图例内容标识，未变化时不重建（保护展开弹窗）
 
-let historySeriesEnabled = loadHistorySeriesEnabled(); // 父类开关，缺省全开
-let historyChildSelection = loadHistoryChildSelection(); // 组内勾选，null=全部显示
+let historySeriesEnabled = loadHistorySeriesEnabled(); // 父类开关；未记录的组走默认（见 defaultHistoryGroupEnabled）
+// 历史曲线显隐默认（用户确认）：CPU/SATA/NVMe 只画"取最高"聚合线、风扇组
+// 全画；GPU/网卡/其它默认不画，进图例弹窗按需开——一张图不再默认铺满
+// 全部核心与单盘明细曲线。
+function defaultHistoryGroupEnabled(groupKey) {
+  return groupKey === 'cpu' || groupKey === 'sata' || groupKey === 'nvme' || groupKey === 'fan';
+}
+// 只读访问器（渲染与测试用）：直接写 historySeriesEnabled 的路径集中在 setHistoryGroupEnabled。
+function historySeriesEnabledFor(groupKey) {
+  const value = historySeriesEnabled[groupKey];
+  return value === undefined ? defaultHistoryGroupEnabled(groupKey) : value;
+}
+let historyChildSelection = loadHistoryChildSelection(); // 组内勾选；未记录的组走默认（见 defaultHistoryChildSelection）
+
+// ---- 30 分钟档回看（监控录像机式拖动窗口）----
+// 拉取 7.5 小时分钟级原始数据：451 点落在服务端 480 点聚合上限内，保持
+// 1 分钟粒度不聚合；图表固定显示 30 点窗口，在这段数据上左右拖动回看。
+const HISTORY_SCRUB_FETCH_HOURS = 7.5;
+const HISTORY_SCRUB_POINTS = 30;
+let historyScrubEndTs = null;      // 回看窗口末端采样 ts；null=贴最新（实时跟随）
+let historyIntervalSeconds = 60;   // 渲染时缓存的服务端采样间隔，拖动吸附换算用
+let historyXDomain = { start: 0, end: 0 }; // 渲染时缓存的横轴时间域，供十字线换算
+let historyScrubDragging = false;  // 拖动中：抑制十字线与提示框
 
 function loadHistorySeriesEnabled() {
   try {
@@ -1380,15 +1416,154 @@ function saveHistoryChildSelection() {
   } catch (error) { /* 忽略写入失败 */ }
 }
 
+// ---- 时间范围：拖动条（30分–2时无极 + 固定挡位，7天/30天并入挡位）----
+
+// 滑杆双段设计（用户确认）：前 30% 是 30 分钟–2 小时的无极区（按 1 分钟
+// 粒度吸附，0.3 分钟/位），后 70% 每 140 位一个固定挡位（6时/12时/24时 +
+// 按保存天数显隐的 7天/30天），拇指落入挡位段即吸附到段中心的停靠位，
+// 刻度画在停靠位上。挡位总数由 updateHistoryRangeAvailability 维护。
+const HISTORY_CONT_POSITIONS = 400; // 无极区占用的滑杆位置数（总行程的 40%）
+const HISTORY_STOP_SPAN = 120;      // 每个固定挡位占用的位置数
+const HISTORY_CONT_MIN_HOURS = 0.5;
+const HISTORY_CONT_MAX_HOURS = 2;
+const HISTORY_BASE_STOPS = [6, 12, 24];
+const HISTORY_ALL_STOPS = [6, 12, 24, 168, 720];
+
+// 档位记忆的加载点：依赖上面的常量都已声明（见顶部 historyRangeHours 的说明）
+historyRangeHours = loadHistoryRangeHours();
+
+// 当前滑杆上的固定挡位数量（3=仅基础挡；保存天数 ≥7 加 7 天，≥30 加 30 天）
+let historySliderStopCount = HISTORY_ALL_STOPS.length;
+
+function historyStopsFor(stopCount) {
+  return HISTORY_ALL_STOPS.slice(0, clamp(Math.round(stopCount) || HISTORY_ALL_STOPS.length, 3, HISTORY_ALL_STOPS.length));
+}
+
+// 挡位序号 → 拇指停靠位（挡位段中心）
+function historyStopCenterPos(stopIndex) {
+  return HISTORY_CONT_POSITIONS + stopIndex * HISTORY_STOP_SPAN + HISTORY_STOP_SPAN / 2;
+}
+
+// 滑杆位置 → 小时。无极区按 1 分钟粒度吸附；挡位区整段吸附到对应挡位。
+function historyPosToHours(pos) {
+  const max = historySliderStopCount > 0 ? historyStopCenterPos(historySliderStopCount - 1) : HISTORY_CONT_POSITIONS;
+  const position = Math.round(clamp(Number(pos) || 0, 0, max));
+  if (position <= HISTORY_CONT_POSITIONS) {
+    const minutes = Math.round(HISTORY_CONT_MIN_HOURS * 60 + (position / HISTORY_CONT_POSITIONS) * (HISTORY_CONT_MAX_HOURS - HISTORY_CONT_MIN_HOURS) * 60);
+    return minutes / 60;
+  }
+  const stops = historyStopsFor(historySliderStopCount);
+  const index = Math.min(stops.length - 1, Math.floor((position - HISTORY_CONT_POSITIONS - 1) / HISTORY_STOP_SPAN));
+  return stops[index];
+}
+
+// 小时 → 滑杆位置。无极区反解到吸附位（1 分钟粒度往返一致）；挡位取停靠位。
+function historyHoursToPos(hours) {
+  const value = Number(hours);
+  if (!Number.isFinite(value)) return 0;
+  if (value <= HISTORY_CONT_MAX_HOURS) {
+    const minutes = clamp(value, HISTORY_CONT_MIN_HOURS, HISTORY_CONT_MAX_HOURS) * 60;
+    return Math.round((minutes - HISTORY_CONT_MIN_HOURS * 60) / ((HISTORY_CONT_MAX_HOURS - HISTORY_CONT_MIN_HOURS) * 60 / HISTORY_CONT_POSITIONS));
+  }
+  const stops = historyStopsFor(historySliderStopCount);
+  let best = 0;
+  let bestDelta = Infinity;
+  stops.forEach((stop, index) => {
+    const delta = Math.abs(stop - value);
+    if (delta < bestDelta) { best = index; bestDelta = delta; }
+  });
+  return historyStopCenterPos(best);
+}
+
+// 范围值钳制到合法值：7 天/30 天原样保留；≤2 小时按 1 分钟粒度钳进无极区；
+// 2 小时以上的旧值（含旧版半小时值）吸附到最近固定挡位。这里用全套挡位，
+// 与保存天数显隐无关——超出保留期的值由 updateHistoryRangeAvailability 回落。
+function normalizeHistoryRangeHours(hours) {
+  const value = Number(hours);
+  if (Number.isFinite(value) && (value === 168 || value === 720)) return value;
+  if (!Number.isFinite(value)) return HISTORY_DEFAULT_HOURS;
+  if (value <= HISTORY_CONT_MAX_HOURS) {
+    const minutes = clamp(value, HISTORY_CONT_MIN_HOURS, HISTORY_CONT_MAX_HOURS) * 60;
+    return Math.round(minutes) / 60;
+  }
+  let best = HISTORY_BASE_STOPS[0];
+  let bestDelta = Infinity;
+  HISTORY_ALL_STOPS.forEach((stop) => {
+    const delta = Math.abs(stop - value);
+    if (delta < bestDelta) { best = stop; bestDelta = delta; }
+  });
+  return best;
+}
+
+function loadHistoryRangeHours() {
+  try {
+    const raw = window.localStorage.getItem(HISTORY_RANGE_STORAGE_KEY);
+    if (raw === null || raw === '') return HISTORY_DEFAULT_HOURS;
+    return normalizeHistoryRangeHours(parseFloat(raw));
+  } catch (error) { return HISTORY_DEFAULT_HOURS; }
+}
+
+function saveHistoryRangeHours(hours) {
+  try { window.localStorage.setItem(HISTORY_RANGE_STORAGE_KEY, String(hours)); }
+  catch (error) { /* 隐私模式等场景下仅本次生效 */ }
+  // 档位同时记到后端配置（随 /api/status 的 config.ui_prefs 下发，跨设备一致）
+  saveUIPrefsQuietly();
+}
+
+// ui_prefs 是整段替换：任何保存点都必须带上全部四个字段（档位/调试卡显隐/
+// 历史曲线父类开关/组内勾选），漏带会把其它偏好抹回默认。overrides 用于
+// 保存点自身的新值尚未落到全局变量时（如风扇卡开关的先改后存）。
+function uiPrefsBody(overrides = {}) {
+  const children = {};
+  for (const [groupKey, selection] of Object.entries(historyChildSelection)) {
+    children[groupKey] = selection === null ? null : [...selection]; // null=全部；空数组=组开但一条不画
+  }
+  return {
+    history_range_hours: historyRangeHours,
+    fan_debug_visible: uiFanDebugVisible,
+    history_series: { ...historySeriesEnabled },
+    history_children: children,
+    ...overrides,
+  };
+}
+
+// 勾选/档位类偏好保存：失败静默——localStorage 镜像兜底，不打扰用户。
+function saveUIPrefsQuietly(overrides = {}) {
+  try {
+    return request('api/config/ui-prefs', { method: 'POST', body: JSON.stringify(uiPrefsBody(overrides)) }).catch(() => {});
+  } catch (error) { return Promise.resolve(); }
+}
+
+// 范围标签：不足 1 小时显示分钟；无极区非整小时显示"N 小时 M 分"；
+// 固定挡位显示 N 小时 / N 天。
+function historyRangeLabel(hours) {
+  if (hours === 168) return '7 天';
+  if (hours === 720) return '30 天';
+  if (hours < 1) return `${Math.round(hours * 60)} 分钟`;
+  if (Number.isInteger(hours)) return `${hours} 小时`;
+  const whole = Math.floor(hours);
+  const minutes = Math.round((hours - whole) * 60);
+  return minutes > 0 ? `${whole} 小时 ${minutes} 分` : `${whole} 小时`;
+}
+
+// 组内默认（用户确认）：CPU/SATA/NVMe 只勾"取最高"聚合项（__agg__），
+// 其余组（风扇/GPU/网卡/其它）null=全部显示。未记录（新设备/清缓存）时生效；
+// 显式记录（含关组清空的空集合）优先于默认。
+function defaultHistoryChildSelection(groupKey) {
+  return groupKey === 'cpu' || groupKey === 'sata' || groupKey === 'nvme' ? new Set(['__agg__']) : null;
+}
+
 function historyChildSelectionFor(groupKey) {
-  const selection = historyChildSelection[groupKey];
-  if (selection === null || selection === undefined) return null; // null = 全部显示（跟随数据）
-  return selection instanceof Set ? selection : new Set(selection); // 统一为 Set，调用方用 has()
+  const stored = historyChildSelection[groupKey];
+  if (stored === undefined) return defaultHistoryChildSelection(groupKey);
+  if (stored === null) return null; // 显式"全部显示"
+  return stored instanceof Set ? stored : new Set(stored); // 统一为 Set，调用方用 has()
 }
 
 function setHistoryChildSelection(groupKey, selection) {
   historyChildSelection[groupKey] = selection;
   saveHistoryChildSelection();
+  saveUIPrefsQuietly();
 }
 
 // 风扇 ID 缩写：it8613:it87.2608:fan3 → fan3
@@ -1402,6 +1577,26 @@ function historyFilterRange(samples, rangeHours, nowTs) {
   return samples.filter((sample) => sample.ts >= cutoff);
 }
 
+// 30 分钟档的拉取范围：回看模式取 7.5 小时原始数据，其余档位原样。
+function historyFetchHoursFor(rangeHours) {
+  return rangeHours === 0.5 ? HISTORY_SCRUB_FETCH_HOURS : rangeHours;
+}
+
+// 回看窗口：固定 points 个采样槽位，末端吸附采样网格（以最旧样本为基准）
+// 并夹在 [最旧+span, 最新] 内。数据不足 points 个点时窗口覆盖全部数据。
+// 纯函数，node --test 直接断言。
+function historyScrubWindow(samples, intervalSeconds, endTs, points = HISTORY_SCRUB_POINTS) {
+  const interval = Math.max(1, intervalSeconds);
+  if (!samples.length) return { start: 0, end: 0, atLive: true };
+  const oldest = samples[0].ts;
+  const latest = samples[samples.length - 1].ts;
+  const span = (points - 1) * interval;
+  if (latest - oldest < span) return { start: oldest, end: latest, atLive: true };
+  const snapped = oldest + Math.round((endTs - oldest) / interval) * interval;
+  const end = Math.min(latest, Math.max(oldest + span, snapped));
+  return { start: end - span, end, atLive: end >= latest };
+}
+
 // 兜底抽稀（正常情况下服务端已聚合到 ≤480 点）：超出上限按固定步长取样
 // 并始终保留最后一个点。
 function historyThinOut(samples, maxPoints = 480) {
@@ -1410,7 +1605,27 @@ function historyThinOut(samples, maxPoints = 480) {
   const out = [];
   for (let i = 0; i < samples.length; i += stride) out.push(samples[i]);
   const last = samples[samples.length - 1];
-  if (out[out.length - 1].ts !== last.ts) out.push(last);
+  if (out[out.length - 1] !== last) out.push(last);
+  return out;
+}
+
+// 渲染抽稀：2 小时以上的范围按 5 抽 1、6 小时以上按 15 抽 1 收敛折线点数
+// （每条曲线少一个数量级的 DOM 节点）；2 小时以内（无极区）保持全精度。
+// 必须在断口切分之后、按段执行——先抽稀会把点距拉大过断口阈值，停机断口
+// 会被误并回连续线。
+function historyDecimationStride(rangeHours) {
+  if (rangeHours > 6) return 15;
+  if (rangeHours > 2) return 5;
+  return 1;
+}
+
+// 按步长抽稀一段折线：保留第 0/stride/2×stride… 个点，且始终保留最后一个
+// 点（曲线末端反映最新状态）。
+function historyThinByStride(samples, stride) {
+  if (stride <= 1 || samples.length <= stride) return samples;
+  const out = samples.filter((_, index) => index % stride === 0);
+  const last = samples[samples.length - 1];
+  if (out[out.length - 1] !== last) out.push(last);
   return out;
 }
 
@@ -1459,9 +1674,10 @@ function historyYBounds(values, fallbackLo, fallbackHi) {
   return { lo, hi };
 }
 
-// 时间轴刻度：各档位固定步长（30 分钟→1 分钟、1 小时→10 分钟、6 小时→1 小时、
-// 24 小时→2 小时、7 天→6 小时、30 天→1 天），未知范围退回自动算法。
-const HISTORY_TICK_STEP_SECONDS = { 0.5: 60, 1: 600, 6: 3600, 24: 7200, 168: 21600, 720: 86400 };
+// 时间轴刻度：各档位固定步长（30 分钟→1 分钟、1 小时→10 分钟、2 小时→30 分钟、
+// 6 小时→1 小时、12 小时→3 小时、24 小时→2 小时、7 天→6 小时、30 天→1 天），
+// 未知范围退回自动算法。2/12 小时步长按 4–5 条网格线取，与其它档位密度一致。
+const HISTORY_TICK_STEP_SECONDS = { 0.5: 60, 1: 600, 2: 1800, 6: 3600, 12: 10800, 24: 7200, 168: 21600, 720: 86400 };
 function historyTimeTicks(startSec, endSec, rangeHours) {
   if (!(endSec > startSec)) return [];
   let step = HISTORY_TICK_STEP_SECONDS[rangeHours];
@@ -1598,7 +1814,10 @@ function historyChildColor(groupKey, childID, allIDs) {
   const group = HISTORY_GROUPS.find((item) => item.key === groupKey);
   const base = group ? group.color : '#3f6ff5';
   if (childID === '__agg__') return base;
-  return historyChildShade(base, allIDs.indexOf(childID));
+  const index = allIDs.indexOf(childID);
+  // 风扇组走独立灰色阶梯（中性灰不参与 HSL 派生）
+  if (groupKey === 'fan') return HISTORY_FAN_SHADES[Math.max(0, index) % HISTORY_FAN_SHADES.length];
+  return historyChildShade(base, index);
 }
 
 // 组曲线：父类开关 + 子类勾选共同决定可见性；聚合项视为一个普通子类。
@@ -1613,7 +1832,9 @@ function historyGroupSeries(groupKey, samples, intervalSeconds) {
       return {
         id: `${groupKey}:${childID}`,
         color: historyChildColor(groupKey, childID, childIDs),
-        segments: historySplitSegments(points, intervalSeconds).map((segment) => historyThinOut(segment)),
+        segments: historySplitSegments(points, intervalSeconds)
+          .map((segment) => historyThinByStride(segment, historyDecimationStride(historyRangeHours)))
+          .map((segment) => historyThinOut(segment)),
       };
     });
 }
@@ -1628,20 +1849,32 @@ function renderHistoryChart() {
   if (!samples.length) {
     svg.replaceChildren();
     renderHistoryLegend();
+    renderHistoryScrubBar(false, null);
     if (status) status.textContent = '正在采样，曲线会随时间慢慢生成。';
     return;
   }
   const intervalSeconds = Math.max(1, Number(data.interval_seconds) || 60);
   const nowTs = Math.floor(Date.now() / 1000);
-  const startSec = nowTs - historyRangeHours * 3600;
-  const ranged = historyFilterRange(samples, historyRangeHours, nowTs);
+  const ranged = historyFilterRange(samples, historyFetchHoursFor(historyRangeHours), nowTs);
   historyRangedSamples = ranged;
+  historyIntervalSeconds = intervalSeconds;
+  // 回看模式（30 分钟档）：横轴域是 30 点滑动窗口；末端贴最新时解除钉住，
+  // 让自动刷新继续跟随实时
+  const scrub = historyRangeHours === 0.5 && ranged.length > 0;
+  if (scrub && historyScrubEndTs !== null && historyScrubEndTs >= ranged[ranged.length - 1].ts) {
+    historyScrubEndTs = null;
+  }
+  const win = scrub
+    ? historyScrubWindow(ranged, intervalSeconds, historyScrubEndTs ?? ranged[ranged.length - 1].ts)
+    : null;
+  const domain = win ? { start: win.start, end: win.end } : { start: nowTs - historyRangeHours * 3600, end: nowTs };
+  historyXDomain = domain;
 
   // 逐父类构建曲线；温度类（CPU/SATA/NVMe/网卡/其它）走左轴，风扇走右轴
   const tempLines = [];
   const fanLines = [];
   HISTORY_GROUPS.forEach((group) => {
-    if (historySeriesEnabled[group.key] === false) return;
+    if (!historySeriesEnabledFor(group.key)) return;
     const lines = historyGroupSeries(group.key, ranged, intervalSeconds);
     lines.forEach((line) => {
       line.yScale = group.key === 'fan' ? 'fan' : 'temp';
@@ -1667,7 +1900,8 @@ function renderHistoryChart() {
     bottom: CHART.bottom,
   };
   historyPlotBox = plot;
-  const x = (ts) => plot.left + ((clamp(ts, startSec, nowTs) - startSec) / (historyRangeHours * 3600)) * (plot.right - plot.left);
+  svg.classList.toggle('scrub', Boolean(win)); // 仅回看模式显示拖动光标与手势
+  const x = (ts) => plot.left + ((clamp(ts, domain.start, domain.end) - domain.start) / Math.max(1, domain.end - domain.start)) * (plot.right - plot.left);
   const yTemp = (value) => plot.bottom - ((clamp(value, bounds.lo, bounds.hi) - bounds.lo) / (bounds.hi - bounds.lo)) * (plot.bottom - plot.top);
   const yFan = (percent) => plot.bottom - (clamp(percent, 0, HISTORY_FAN_MAX_PERCENT) / HISTORY_FAN_MAX_PERCENT) * (plot.bottom - plot.top);
   svg.replaceChildren();
@@ -1679,7 +1913,7 @@ function renderHistoryChart() {
   [0, 25, 50, 75, 100].forEach((tick) => {
     svg.append(svgElement('text', { x: plot.right + axisPad, y: yFan(tick) + textSize * 0.35, class: 'chart-axis-text', 'font-size': textSize, 'text-anchor': 'start' }, `${tick}%`));
   });
-  const timeTicks = historyTimeTicks(startSec, nowTs, historyRangeHours);
+  const timeTicks = historyTimeTicks(domain.start, domain.end, win ? 0.5 : historyRangeHours);
   const tickStep = timeTicks.length > 1 ? timeTicks[1] - timeTicks[0] : 0;
   // 网格线按档位步长全画；刻度文字过密时抽稀，可容纳的标签数随缩放比例减少
   const maxLabels = Math.min(10, Math.max(5, Math.round(10 * chartScale)));
@@ -1702,9 +1936,11 @@ function renderHistoryChart() {
 
   const drawSeries = (line, yScale) => {
     line.segments.forEach((segment) => {
-      if (segment.length < 2) return;
+      // 回看模式只画窗口内的点：窗口外的点若靠 clamp 会堆在绘图区两缘
+      const visible = win ? segment.filter((point) => point.ts >= win.start && point.ts <= win.end) : segment;
+      if (visible.length < 2) return;
       svg.append(svgElement('polyline', {
-        points: segment.map((point) => `${x(point.ts)},${yScale(point.value)}`).join(' '),
+        points: visible.map((point) => `${x(point.ts)},${yScale(point.value)}`).join(' '),
         fill: 'none', stroke: line.color, 'stroke-width': 2 / chartScale, 'stroke-linecap': 'round', 'stroke-linejoin': 'round',
       }));
     });
@@ -1713,6 +1949,7 @@ function renderHistoryChart() {
   fanLines.forEach((line) => drawSeries(line, yFan));
 
   renderHistoryLegend();
+  renderHistoryScrubBar(scrub, win);
 
   if (status) {
     status.textContent = `已记录 ${samples.length} 个采样点 · 更新于 ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}`;
@@ -1722,6 +1959,21 @@ function renderHistoryChart() {
 }
 
 // 图例：六个父类行 = 复选框（整组显隐）+ 色点 + ▾（展开子类勾选弹窗）。
+// 父类勾选开关：取消时连带清空组内全部子类勾选（存为空 Set）——可见性是
+// "父类开 && 子类勾"两层与运算，父类关时子类残留会违背直觉；重新勾上父类
+// 后子类仍是空的，要恢复数据再手动勾或点聚合项。偏好同时落服务端 ui_prefs
+// 与 localStorage（镜像兜底），跨浏览器/设备一致。
+function setHistoryGroupEnabled(groupKey, enabled) {
+  historySeriesEnabled[groupKey] = enabled;
+  // 直接写组内选择（不走 setHistoryChildSelection）：清空与组开关是同一次
+  // 用户操作，合并成一次 ui_prefs 保存
+  if (!enabled) historyChildSelection[groupKey] = new Set();
+  saveHistorySeriesEnabled();
+  saveHistoryChildSelection();
+  saveUIPrefsQuietly();
+  renderHistoryChart();
+}
+
 function renderHistoryLegend() {
   const legend = $('history-legend');
   if (!legend) return;
@@ -1739,11 +1991,9 @@ function renderHistoryLegend() {
       item.dataset.seriesKey = group.key;
       const box = document.createElement('input');
       box.type = 'checkbox';
-      box.checked = historySeriesEnabled[group.key] !== false;
+      box.checked = historySeriesEnabledFor(group.key);
       box.addEventListener('change', () => {
-        historySeriesEnabled[group.key] = box.checked;
-        saveHistorySeriesEnabled();
-        renderHistoryChart();
+        setHistoryGroupEnabled(group.key, box.checked);
       });
       const dot = document.createElement('i');
       dot.className = 'history-dot';
@@ -1850,10 +2100,10 @@ async function fetchHistory(force = false) {
     return historyCache;
   }
   try {
-    const requestedRange = historyRangeHours;
+    const requestedRange = historyFetchHoursFor(historyRangeHours);
     const data = await request(`api/history?range=${requestedRange}`);
     // 快速切换范围时丢弃过期响应：慢的旧请求不能覆盖当前范围的缓存
-    if (requestedRange !== historyRangeHours) return historyCache;
+    if (requestedRange !== historyFetchHoursFor(historyRangeHours)) return historyCache;
     if (data && Array.isArray(data.samples)) {
       historyCache = data;
       historyFetchedAt = Date.now();
@@ -1866,17 +2116,118 @@ async function fetchHistory(force = false) {
   return historyCache;
 }
 
+// 把当前 historyRangeHours 同步到滑杆与按钮：固定挡位停在吸附位中心，
+// 动一下滑杆（input/change）就回到滑杆值。
+// 值标签跟随拇指：把滑杆位置百分比写入 CSS 变量（夹在 6%–94%，标签居中
+// 对准拇指且不出容器）。
+function syncRunLogThumbPct(slider) {
+  const max = Number(slider.max) || 1;
+  const pct = clamp((Number(slider.value) / max) * 100, 6, 94);
+  slider.parentElement.style.setProperty('--thumb-pct', `${pct}%`);
+}
+
+function syncHistoryRangeUI() {
+  const slider = $('history-range-slider');
+  if (slider) {
+    slider.value = String(historyHoursToPos(historyRangeHours));
+    slider.setAttribute('aria-valuetext', historyRangeLabel(historyRangeHours));
+    syncRunLogThumbPct(slider);
+  }
+  const label = $('history-range-value');
+  if (label) label.textContent = historyRangeLabel(historyRangeHours);
+}
+
+function setHistoryRange(hours) {
+  historyRangeTouched = true; // 本会话用户已手动选择，此后不被后端档位覆盖
+  historyRangeHours = hours;
+  historyScrubEndTs = null; // 换档退出回看，窗口回到实时
+  saveHistoryRangeHours(hours);
+  syncHistoryRangeUI();
+  fetchHistory(true);
+}
+
+// 后端配置的档位只在首次状态到达时采纳一次：localStorage 只是首屏快速起效
+// 的缓存，跨设备的最终一致性以后端为准（换浏览器/换设备也生效）；用户本会话
+// 已操作过档位则不打扰。
+let historyRangeTouched = false;
+let historyRangeAdopted = false;
+
+// 历史曲线显隐偏好（父类开关+组内勾选）从服务端 ui_prefs 采纳：与档位同款，
+// 首次 render 后不再覆盖（用户进页后立刻点勾选不被轮询回来的旧值冲掉）。
+// 采纳后写 localStorage 镜像并重置图例标识，下次图例渲染用新勾选状态。
+let historySeriesAdopted = false;
+function applyBackendHistorySeries(prefs) {
+  if (historySeriesAdopted) return;
+  historySeriesAdopted = true;
+  const series = prefs?.history_series;
+  const children = prefs?.history_children;
+  if (!series && !children) return;
+  if (series && typeof series === 'object') historySeriesEnabled = { ...series };
+  if (children && typeof children === 'object') {
+    const merged = { ...historyChildSelection };
+    for (const [groupKey, list] of Object.entries(children)) {
+      merged[groupKey] = list === null ? null : new Set(list);
+    }
+    historyChildSelection = merged;
+  }
+  saveHistorySeriesEnabled();
+  saveHistoryChildSelection();
+  historyLegendIdentity = '';
+}
+
+function applyBackendHistoryRange(prefs) {
+  if (historyRangeAdopted || historyRangeTouched) return;
+  historyRangeAdopted = true;
+  const hours = Number(prefs?.history_range_hours);
+  if (!Number.isFinite(hours) || hours <= 0) return;
+  const normalized = normalizeHistoryRangeHours(hours);
+  if (normalized === historyRangeHours) return;
+  historyRangeHours = normalized;
+  historyScrubEndTs = null;
+  try { window.localStorage.setItem(HISTORY_RANGE_STORAGE_KEY, String(normalized)); }
+  catch (error) { /* 缓存镜像失败可忽略 */ }
+  syncHistoryRangeUI();
+  fetchHistory(true);
+}
+
+// 保留天数收窄可查窗口：7 天/30 天挡位按保存天数显隐（小于 7 天两个都不
+// 显示，7–29 天只显示 7 天），滑杆 max 随挡位数变化；当前记忆的范围超出
+// 保留期则回落到默认档（30 分钟）。
+function updateHistoryRangeAvailability(retentionDays) {
+  const days = Math.round(Number(retentionDays) || 30);
+  historySliderStopCount = 3 + (days >= 7 ? 1 : 0) + (days >= 30 ? 1 : 0);
+  const slider = $('history-range-slider');
+  // 滑杆 max = 末挡停靠位：拖到最右恰好填满整条轨道（进度条 100%），
+  // 吸附回拉不会让尾巴留一段灰色。
+  if (slider) slider.max = String(historyStopCenterPos(historySliderStopCount - 1));
+  const ticks = document.querySelector('.history-range-ticks');
+  if (ticks) {
+    ticks.classList.remove('layout-5', 'layout-6', 'layout-7');
+    ticks.classList.add(`layout-${historySliderStopCount + 2}`); // 30分/2时 两个恒显刻度 + 挡位数
+    const weekTick = ticks.querySelector('[data-tick="7d"]');
+    const monthTick = ticks.querySelector('[data-tick="30d"]');
+    if (weekTick) weekTick.hidden = days < 7;
+    if (monthTick) monthTick.hidden = days < 30;
+  }
+  if (historyRangeHours > days * 24) setHistoryRange(HISTORY_DEFAULT_HOURS);
+}
+
 function setupHistoryPanel() {
-  document.querySelectorAll('.history-range-btn').forEach((button) => {
-    button.addEventListener('click', () => {
-      const hours = Number(button.dataset.range);
-      if (!hours) return;
-      historyRangeHours = hours;
-      document.querySelectorAll('.history-range-btn').forEach((other) => other.classList.toggle('active', other === button));
-      fetchHistory(true);
+  const slider = $('history-range-slider');
+  if (slider) {
+    // 拖动中只实时刷新标签，松手（change）才取数，避免半路连续请求；
+    // 滑杆位置经双段映射换成小时（无极区 1 分钟粒度 / 挡位区整段吸附）。
+    slider.addEventListener('input', () => {
+      const hours = historyPosToHours(parseFloat(slider.value));
+      const label = $('history-range-value');
+      if (label) label.textContent = historyRangeLabel(hours);
+      syncRunLogThumbPct(slider);
     });
-  });
+    slider.addEventListener('change', () => setHistoryRange(historyPosToHours(parseFloat(slider.value))));
+  }
+  syncHistoryRangeUI(); // 应用 localStorage 记忆的范围
   setupHistoryCursor();
+  setupHistoryScrub();
 }
 
 // ---- 悬浮十字线：竖虚线 + 各曲线在该时刻的数值提示框 ----
@@ -1890,10 +2241,9 @@ function historyCursorTimeAt(event) {
   point.x = event.clientX;
   point.y = event.clientY;
   const local = point.matrixTransform(matrix.inverse());
-  const nowTs = Math.floor(Date.now() / 1000);
-  const startSec = nowTs - historyRangeHours * 3600;
-  const raw = startSec + ((local.x - historyPlotBox.left) / (historyPlotBox.right - historyPlotBox.left)) * historyRangeHours * 3600;
-  return Math.round(Math.min(nowTs, Math.max(startSec, raw)));
+  const raw = historyXDomain.start
+    + ((local.x - historyPlotBox.left) / (historyPlotBox.right - historyPlotBox.left)) * (historyXDomain.end - historyXDomain.start);
+  return Math.round(Math.min(historyXDomain.end, Math.max(historyXDomain.start, raw)));
 }
 
 function historyNearestSample(ts) {
@@ -1910,7 +2260,7 @@ function historyNearestSample(ts) {
 function historyCursorRows(sample) {
   const rows = [];
   HISTORY_GROUPS.forEach((group) => {
-    if (historySeriesEnabled[group.key] === false) return;
+    if (!historySeriesEnabledFor(group.key)) return;
     const selection = historyChildSelectionFor(group.key);
     const childIDs = historyGroupChildIDs(group.key, historyRangedSamples);
     childIDs.forEach((childID) => {
@@ -1935,21 +2285,25 @@ function drawHistoryCrosshair(sample) {
   if (!svg) return;
   svg.querySelectorAll('.history-crosshair').forEach((node) => node.remove());
   if (!sample) return;
-  const nowTs = Math.floor(Date.now() / 1000);
-  const startSec = nowTs - historyRangeHours * 3600;
   const plot = historyPlotBox;
-  const cx = plot.left + ((clamp(sample.ts, startSec, nowTs) - startSec) / (historyRangeHours * 3600)) * (plot.right - plot.left);
-  svg.append(svgElement('line', { x1: cx, y1: plot.top, x2: cx, y2: plot.bottom, class: 'history-crosshair history-crosshair-line' }));
+  const span = Math.max(1, historyXDomain.end - historyXDomain.start);
+  const cx = plot.left + ((clamp(sample.ts, historyXDomain.start, historyXDomain.end) - historyXDomain.start) / span) * (plot.right - plot.left);
+  // 竖虚线用 non-scaling-stroke（SVG 属性，CSP 安全）：viewBox 拉伸时线宽保持
+  // styles.css 里设定的 1.5 屏幕像素，不会随窗口放大变粗
+  svg.append(svgElement('line', { x1: cx, y1: plot.top, x2: cx, y2: plot.bottom, class: 'history-crosshair history-crosshair-line', 'vector-effect': 'non-scaling-stroke' }));
   const { lo, hi } = historyYBoundsState;
   const yTemp = (value) => plot.bottom - ((clamp(value, lo, hi) - lo) / (hi - lo)) * (plot.bottom - plot.top);
   const yFan = (percent) => plot.bottom - (clamp(percent, 0, HISTORY_FAN_MAX_PERCENT) / HISTORY_FAN_MAX_PERCENT) * (plot.bottom - plot.top);
+  // 圆点半径除以缩放（同折线 stroke-width 的处理）：viewBox 随容器宽度拉伸，
+  // 固定 viewBox 单位会让悬停圆点等比变大；curveChartScale 自带 0.25 下限防 0
+  const scale = curveChartScale(svg);
   historyCursorRows(sample).forEach((row) => {
-    svg.append(svgElement('circle', { cx, cy: row.isFan ? yFan(row.value) : yTemp(row.value), r: 4, class: 'history-crosshair', fill: row.color }));
+    svg.append(svgElement('circle', { cx, cy: row.isFan ? yFan(row.value) : yTemp(row.value), r: 4 / scale, class: 'history-crosshair', fill: row.color }));
   });
 }
 
 function showHistoryCursor(event) {
-  if (!historyRangedSamples.length) return;
+  if (historyScrubDragging || !historyRangedSamples.length) return;
   historyLastCursorEvent = { clientX: event.clientX, clientY: event.clientY };
   const ts = historyCursorTimeAt(event);
   if (ts == null) return;
@@ -1999,6 +2353,74 @@ function setupHistoryCursor() {
   if (!svg) return;
   svg.addEventListener('mousemove', showHistoryCursor);
   svg.addEventListener('mouseleave', hideHistoryCursor);
+}
+
+// ---- 30 分钟档回看：状态条 + 图表拖动 ----
+// 图表固定显示 30 点窗口；在图上左右拖动（鼠标/触摸）移动窗口，拖回最右
+// 跟随实时。回看状态条显示窗口时段，离开实时边缘时提供“回到最新”。
+
+function renderHistoryScrubBar(active, win) {
+  const bar = $('history-scrub-bar');
+  if (!bar) return;
+  if (!active || !win) {
+    bar.hidden = true;
+    return;
+  }
+  bar.hidden = false;
+  const label = $('history-scrub-range');
+  if (label) {
+    const span = `${historyFormatClock(win.start)}–${historyFormatClock(win.end)}`;
+    label.textContent = win.atLive
+      ? `实时 ${span} · 在图上左右拖动回看历史`
+      : `回看 ${span}`;
+  }
+  const live = $('history-scrub-live');
+  if (live) live.hidden = win.atLive;
+}
+
+function setupHistoryScrub() {
+  const svg = $('history-chart');
+  if (!svg) return;
+  let drag = null; // { pointerId, startX, baseEndTs }
+  const pxPerSlot = () => Math.max(1, (historyPlotBox.right - historyPlotBox.left) / (HISTORY_SCRUB_POINTS - 1));
+  svg.addEventListener('pointerdown', (event) => {
+    if (historyRangeHours !== 0.5 || event.button > 0) return;
+    if (!historyRangedSamples.length) return;
+    drag = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      baseEndTs: historyScrubEndTs ?? historyRangedSamples[historyRangedSamples.length - 1].ts,
+    };
+    historyScrubDragging = true;
+    hideHistoryCursor();
+    try { svg.setPointerCapture(event.pointerId); } catch (error) { /* 已释放的指针 */ }
+    svg.classList.add('scrubbing');
+  });
+  svg.addEventListener('pointermove', (event) => {
+    if (!drag || event.pointerId !== drag.pointerId) return;
+    const oldest = historyRangedSamples[0].ts;
+    // 内容跟手：向右拖 = 看更早的数据，窗口末端随位移左移并吸附采样网格
+    const deltaSlots = (event.clientX - drag.startX) / pxPerSlot();
+    const rawEnd = drag.baseEndTs - deltaSlots * historyIntervalSeconds;
+    historyScrubEndTs = oldest + Math.round((rawEnd - oldest) / historyIntervalSeconds) * historyIntervalSeconds;
+    renderHistoryChart();
+  });
+  const endDrag = (event) => {
+    if (!drag || event.pointerId !== drag.pointerId) return;
+    drag = null;
+    historyScrubDragging = false;
+    svg.classList.remove('scrubbing');
+  };
+  svg.addEventListener('pointerup', endDrag);
+  svg.addEventListener('pointercancel', endDrag);
+  const live = $('history-scrub-live');
+  if (live) {
+    live.addEventListener('click', () => {
+      historyScrubEndTs = null;
+      fetchHistory();
+      renderHistoryChart();
+    });
+  }
 }
 
 
@@ -2106,7 +2528,18 @@ function fillHistoryInputs(history = {}) {
   $('history-enabled').checked = enabled;
   const maxSize = Number(history.max_size_mb) || 64;
   $('history-max-size').value = maxSize;
+  // 旧后端配置无 retention_days 字段时按 30 天兜底
+  const retentionDays = Number(history.retention_days) || 30;
+  $('history-retention-days').value = retentionDays;
+  $('history-archive-enabled').checked = Boolean(history.archive_enabled);
+  $('history-archive-dir').value = history.archive_dir || '';
+  updateHistoryRangeAvailability(retentionDays);
   updateHistoryDisabledNotice(enabled);
+  // 运行日志大小在 render() 的 status 上下文里单独回填（见 syncRunLogInputs）
+}
+
+function syncRunLogInputs(status = {}) {
+  $('runlog-max-size').value = Number(status.config?.log?.max_size_mb) || 16;
 }
 
 function updateHistoryDisabledNotice(enabled) {
@@ -2117,17 +2550,33 @@ $('history-enabled').addEventListener('change', () => {
   updateHistoryDisabledNotice($('history-enabled').checked);
 });
 
+// 历史设置保存前的取值校验：返回错误提示文案，通过时返回 null
+function historySettingsError(maxSize, retentionDays) {
+  if (!Number.isFinite(maxSize) || maxSize < 8 || maxSize > 1024) return '数据库大小上限需在 8–1024 MB 之间。';
+  if (!Number.isFinite(retentionDays) || retentionDays < 1) return '保存天数需至少为 1 天。';
+  return null;
+}
+
 $('save-history').addEventListener('click', async () => {
   const maxSizeInput = $('history-max-size');
-  if (!maxSizeInput.reportValidity()) return;
+  const retentionInput = $('history-retention-days');
+  if (!maxSizeInput.reportValidity() || !retentionInput.reportValidity()) return;
   const maxSize = Number(maxSizeInput.value);
-  if (!Number.isFinite(maxSize) || maxSize < 8 || maxSize > 1024) {
-    showMessage('数据库大小上限需在 8–1024 MB 之间。', true, 'message-history');
+  const retentionDays = Number(retentionInput.value);
+  const archiveEnabled = $('history-archive-enabled').checked;
+  const archiveDir = $('history-archive-dir').value.trim();
+  if (archiveEnabled && !archiveDir) {
+    showMessage('开启长期记录需先填写保存位置。', true, 'message-history');
+    return;
+  }
+  const error = historySettingsError(maxSize, retentionDays);
+  if (error) {
+    showMessage(error, true, 'message-history');
     return;
   }
   setBusy(true);
   try {
-    render(await request('api/config/history', { method: 'POST', body: JSON.stringify({ enabled: $('history-enabled').checked, max_size_mb: maxSize }) }), true);
+    render(await request('api/config/history', { method: 'POST', body: JSON.stringify({ enabled: $('history-enabled').checked, max_size_mb: maxSize, retention_days: retentionDays, archive_enabled: archiveEnabled, archive_dir: archiveEnabled ? archiveDir : '' }) }), true);
     showMessage($('history-enabled').checked ? '历史设置已保存；后台每分钟继续写入采样。' : '历史设置已保存；后台已停止写入新采样。', false, 'message-history');
   } catch (error) {
     showMessage(`保存失败：${error.message}`, true, 'message-history');
@@ -2135,6 +2584,521 @@ $('save-history').addEventListener('click', async () => {
     setBusy(false);
   }
 });
+
+// 清空数据库属危险操作：按钮在调试页"历史温度设定"卡片的操作行（导出之后）。
+// 点击瞬间先补一次长期记录冲刷（不论二次确认结果如何，缓冲里的旧数据先落到
+// 归档盘），然后经 window.confirm 二次确认；确认后才真正清空。冲刷失败时在
+// 弹窗里明示后果，由用户决定是否仍要清空。
+$('history-clear').addEventListener('click', async () => {
+  setBusy(true);
+  let flushError = '';
+  let flushed = false;
+  try {
+    const result = await request('api/history/archive', { method: 'POST', body: '{}' });
+    flushed = Boolean(result.flushed);
+  } catch (error) {
+    flushError = error.message;
+  }
+  const message = flushError
+    ? `长期记录冲刷失败（${flushError}），未冲刷的数据将随清空丢失。仍要清空？`
+    : flushed
+      ? '长期记录的缓冲已补归档。清空数据库将删除全部在线历史采样，且无法恢复。确定清空？'
+      : '清空数据库将删除全部历史采样，且无法恢复。确定清空？';
+  const confirmed = window.confirm(message);
+  if (!confirmed) {
+    setBusy(false);
+    return; // 取消：补冲刷已生效（或已尝试），在线数据原样保留
+  }
+  try {
+    await request('api/history/clear', { method: 'POST', body: '{}' });
+    // 强制绕过 TTL 缓存重新拉取，曲线立即清空（与保存传感器名后的刷新一致）
+    await fetchHistory(true);
+    renderHistoryChart();
+    showMessage('历史数据库已清空。', false, 'message-history');
+  } catch (error) {
+    showMessage(`清空失败：${error.message}`, true, 'message-history');
+  } finally {
+    setBusy(false);
+  }
+});
+
+// ---- 运行日志：独立大小设置、导出与清空 ----
+
+function runlogMessage(message, error = false) {
+  showMessage(message, error, 'runlog-status');
+}
+
+$('save-runlog').addEventListener('click', async () => {
+  const input = $('runlog-max-size');
+  if (!input.reportValidity()) return;
+  const maxSize = Number(input.value);
+  if (!Number.isFinite(maxSize) || maxSize < 1 || maxSize > 256) {
+    runlogMessage('日志大小上限需在 1–256 MB 之间。', true);
+    return;
+  }
+  setBusy(true);
+  try {
+    render(await request('api/config/log', { method: 'POST', body: JSON.stringify({ max_size_mb: maxSize }) }), true);
+    runlogMessage(`日志大小上限已保存为 ${maxSize} MB；超过后自动截断并保留一代备份。`);
+  } catch (error) {
+    runlogMessage(`保存失败：${error.message}`, true);
+  } finally {
+    setBusy(false);
+  }
+});
+
+$('runlog-export').addEventListener('click', () => {
+  const stamp = new Date().toISOString().slice(0, 10);
+  const link = document.createElement('a');
+  link.href = baseUrl('api/log/export');
+  link.download = `tad-module-log-${stamp}.txt`;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  runlogMessage('日志下载已开始。');
+});
+
+$('runlog-clear').addEventListener('click', async () => {
+  if (!window.confirm('清空运行日志将删除当前日志与上一代备份，且无法恢复。确定清空？')) return;
+  setBusy(true);
+  try {
+    await request('api/log/clear', { method: 'POST', body: '{}' });
+    runlogMessage('运行日志已清空。');
+  } catch (error) {
+    runlogMessage(`清空失败：${error.message}`, true);
+  } finally {
+    setBusy(false);
+  }
+});
+
+// ---- 风扇调试控制（调试页勾选显示;调试期间暂停温控曲线） ----
+
+const FAN_DEBUG_VISIBLE_KEY = 'tad-fan-debug-visible'; // 旧版 localStorage 键,仅一次性迁移用
+let fanDebugPollTimer = 0;
+// 调试卡显隐偏好(服务端 ui_prefs 持久,跨浏览器一致);status 未到时按 false
+let uiFanDebugVisible = false;
+
+function fanDebugVisiblePref() {
+  return uiFanDebugVisible;
+}
+
+function setFanDebugVisible(visible) {
+  const previous = uiFanDebugVisible;
+  uiFanDebugVisible = visible;
+  applyFanDebugVisible();
+  // 与档位同款:偏好落服务端(随 config.ui_prefs 下发,跨浏览器一致);
+  // 失败静默恢复——开关状态以保存成功为准
+  request('api/config/ui-prefs', {
+    method: 'POST',
+    body: JSON.stringify(uiPrefsBody({ fan_debug_visible: visible })),
+  }).catch(() => {
+    uiFanDebugVisible = previous;
+    applyFanDebugVisible();
+  });
+}
+
+function applyFanDebugVisible() {
+  const visible = fanDebugVisiblePref();
+  $('fan-debug-visible').checked = visible;
+  $('fan-debug-card').hidden = !visible;
+  if (visible) startFanDebugPoll(); else stopFanDebugPoll();
+}
+
+// status 到达:采纳后端偏好;首次升级做一次 localStorage 迁移——旧版只存
+// 本地,后端从未有值,迁移"开着"的用户;迁移后清键,此后关开都走服务端
+function syncFanDebugVisibleFromStatus() {
+  const serverVisible = currentStatus?.config?.ui_prefs?.fan_debug_visible === true;
+  if (serverVisible === uiFanDebugVisible) {
+    if (serverVisible) { try { window.localStorage.removeItem(FAN_DEBUG_VISIBLE_KEY); } catch (error) { /* 忽略 */ } }
+    return;
+  }
+  let legacy = false;
+  try { legacy = window.localStorage.getItem(FAN_DEBUG_VISIBLE_KEY) === '1'; } catch (error) { /* 忽略 */ }
+  if (!serverVisible && legacy) {
+    // 旧版开着 → 迁移为服务端开启(带档位,同一次保存),成功后清旧键
+    try { window.localStorage.removeItem(FAN_DEBUG_VISIBLE_KEY); } catch (error) { /* 忽略 */ }
+    saveUIPrefsQuietly({ fan_debug_visible: true }).then(() => { uiFanDebugVisible = true; applyFanDebugVisible(); });
+    return;
+  }
+  uiFanDebugVisible = serverVisible;
+  applyFanDebugVisible();
+}
+
+// 页面加载即按记忆的偏好恢复显隐(勾选过则卡片直接可见);status 到达后
+// syncFanDebugVisibleFromStatus 以服务端值为准
+applyFanDebugVisible();
+
+function startFanDebugPoll() {
+  if (fanDebugPollTimer) return;
+  const poll = async () => {
+    try {
+      renderFanDebug(await request('api/fans/debug'));
+    } catch (error) {
+      $('fan-debug-status').textContent = `调试状态读取失败：${error.message}`;
+    }
+  };
+  poll();
+  fanDebugPollTimer = window.setInterval(poll, 2000);
+}
+
+function stopFanDebugPoll() {
+  if (fanDebugPollTimer) { window.clearInterval(fanDebugPollTimer); fanDebugPollTimer = 0; }
+}
+
+function fanDebugStatus(message, error = false) {
+  showMessage(message, error, 'fan-debug-status');
+}
+
+// 汇总状态行文案:紧急覆盖优先,其次列出正在递增/已完成的风扇;无事可说返回 null
+function fanDebugStatusInfo(state) {
+  if (state.emergency) {
+    return { error: true, text: '⚠ CPU 超过紧急温度，已强制全部风扇 100%（覆盖调试转速）' };
+  }
+  const fans = state.fans || [];
+  const label = (fan) => fan.name || fan.id;
+  const running = fans.filter((fan) => fan.auto_running).map(label);
+  if (running.length) {
+    return { text: `自动递增进行中：${running.join('、')} 按各自的递增值与间隔独立推进，到上限自动完成并保持。` };
+  }
+  const done = fans.filter((fan) => fan.auto_done).map(label);
+  if (done.length) {
+    return { text: `已完成自动递增：${done.join('、')} 已停在上限；重新打开行内开关可从 0 重跑。` };
+  }
+  return null;
+}
+
+function applyFanDebugStatus(state) {
+  const info = fanDebugStatusInfo(state);
+  if (info) fanDebugStatus(info.text, Boolean(info.error));
+  else fanDebugStatus('');
+}
+
+// 风扇调试单位表:转速 RPM 按 2000 RPM=100% 线性换算;PWM 原始值不带符号
+const FAN_DEBUG_UNITS = [
+  { value: 'rpm', label: '转速 RPM', max: 2000, suffix: 'RPM' },
+  { value: 'percent', label: '百分比 %', max: 100, suffix: '%' },
+  { value: 'pwm', label: 'PWM', max: 255, suffix: '' },
+];
+
+function fanDebugUnit(value) {
+  return FAN_DEBUG_UNITS.find((unit) => unit.value === value) || FAN_DEBUG_UNITS[1];
+}
+
+// 单位间线性换算(按各自上限等比):50% ↔ 128 PWM ↔ 1000 RPM。
+// rpmMax 是该风扇的满转基准(后端全速实测自动标定,0/缺省用名义值 2000)。
+function convertDebugValue(value, fromUnit, toUnit, rpmMax = 0) {
+  const toMax = toUnit === 'rpm' && rpmMax ? rpmMax : fanDebugUnit(toUnit).max;
+  const fromMax = fromUnit === 'rpm' && rpmMax ? rpmMax : fanDebugUnit(fromUnit).max;
+  return Math.round((value * toMax) / fromMax);
+}
+
+// 调试值输入框 + 单位后缀;unitDef 形如 FAN_DEBUG_UNITS 项({max, suffix})。
+// 外层包 inline-flex 容器:td 不能直接设 flex(会脱离 table-cell 布局,列错位)。
+function buildFanDebugInput(unitDef, className, kind, fanId, ariaLabel) {
+  const input = document.createElement('input');
+  input.type = 'number';
+  input.min = kind === 'interval' ? '1' : '0';
+  if (Number.isFinite(unitDef.max)) input.max = String(unitDef.max);
+  input.step = '1';
+  input.inputMode = 'numeric';
+  input.className = className;
+  input.dataset.fanId = fanId;
+  input.dataset.kind = kind;
+  input.setAttribute('aria-label', ariaLabel);
+  const wrap = document.createElement('span');
+  wrap.className = 'fan-debug-inline';
+  wrap.append(input);
+  if (unitDef.suffix) {
+    const mark = document.createElement('span');
+    mark.className = 'fan-debug-suffix';
+    mark.textContent = unitDef.suffix;
+    wrap.append(mark);
+  }
+  return { input, wrap };
+}
+
+// 渲染调试状态;每行一个自动测试滑动开关,各风扇独立启停互不影响
+function renderFanDebug(state) {
+  const body = $('fan-debug-body');
+  // 正在行内编辑数字/单位时不重绘表格,避免 2 秒轮询打断输入(状态行照常更新)
+  const active = document.activeElement;
+  if (active && body.contains(active) && (active.type === 'number' || active.tagName === 'SELECT')) {
+    applyFanDebugStatus(state);
+    return;
+  }
+  const pending = {};
+  body.querySelectorAll('input[data-fan-id][data-kind], select[data-fan-id][data-kind]').forEach((field) => {
+    pending[field.dataset.fanId + ':' + field.dataset.kind] = field.value;
+  });
+  body.replaceChildren();
+  (state.fans || []).forEach((fan) => {
+    const row = document.createElement('tr');
+    const takeCell = document.createElement('td');
+    const takeBox = document.createElement('input');
+    takeBox.type = 'checkbox';
+    takeBox.dataset.fanId = fan.id;
+    takeBox.checked = fan.taken_over;
+    takeBox.setAttribute('aria-label', `接管 ${fan.id}`);
+    takeBox.addEventListener('change', () => applyFanTakeover(fan.id, takeBox.checked));
+    takeCell.append(takeBox);
+    const name = document.createElement('td');
+    name.textContent = fan.name;
+    const channel = document.createElement('td');
+    channel.textContent = fan.channel;
+    const rpm = document.createElement('td');
+    rpm.textContent = `${fan.rpm} RPM`;
+    const pwm = document.createElement('td');
+    pwm.textContent = `${fan.pwm_percent}%`;
+    const mode = document.createElement('td');
+    mode.textContent = fan.mode === 1 ? '手动' : fan.mode === 0 ? '全速' : `自动(${fan.mode})`;
+    const debugCell = document.createElement('td');
+    debugCell.className = 'fan-debug-pwm-cell';
+    const stepCell = document.createElement('td');
+    stepCell.className = 'fan-debug-step-cell';
+    const intervalCell = document.createElement('td');
+    intervalCell.className = 'fan-debug-step-cell';
+    const autoCell = document.createElement('td');
+    autoCell.className = 'fan-debug-auto-cell';
+    if (fan.taken_over) {
+      const unit = document.createElement('select');
+      unit.className = 'fan-debug-unit';
+      unit.dataset.fanId = fan.id;
+      unit.dataset.kind = 'unit';
+      for (const def of FAN_DEBUG_UNITS) {
+        const option = document.createElement('option');
+        option.value = def.value;
+        option.textContent = def.label;
+        unit.append(option);
+      }
+      unit.value = pending[fan.id + ':unit'] ?? fan.debug_unit ?? 'percent';
+      // 自动递增进行中/已完成时输入框跟随后端实际值,避免停留在旧的手动值
+      const followsAuto = fan.auto_running || fan.auto_done;
+      const debugUnit = fanDebugUnit(unit.value);
+      // 该风扇的满转基准:RPM 单位的输入上限与换算分母(后端全速实测标定)
+      const rpmMax = fan.rpm_max || 2000;
+      const unitMax = (def) => (def.value === 'rpm' ? rpmMax : def.max);
+      const debugWrap = buildFanDebugInput({ ...debugUnit, max: unitMax(debugUnit) }, 'fan-debug-pwm-input', 'pwm', fan.id, `调试转速 ${fan.id}`);
+      const input = debugWrap.input;
+      input.value = (followsAuto ? String(fan.debug_percent ?? 0) : pending[fan.id + ':pwm']) ?? String(fan.debug_percent ?? 0);
+      const apply = document.createElement('button');
+      apply.type = 'button';
+      apply.textContent = '应用';
+      apply.className = 'fan-debug-apply';
+      apply.addEventListener('click', () => applyFanDebugPWM(fan.id, Number(input.value), unit.value, undefined, rpmMax));
+      // 标定满转:全速运转至读数稳态(最多约 9 秒),学特性表最高档与满转基准
+      const calibrate = document.createElement('button');
+      calibrate.type = 'button';
+      calibrate.textContent = '标定';
+      calibrate.className = 'fan-debug-apply fan-debug-calibrate';
+      calibrate.title = '全速运转数秒,实测满转转速并更新该风扇的 RPM 换算基准';
+      calibrate.addEventListener('click', async () => {
+        calibrate.disabled = true;
+        apply.disabled = true;
+        fanDebugStatus(`正在标定 ${fan.id} 的满转转速，风扇将全速运转数秒…`);
+        try {
+          const result = await request('api/fans/debug/calibrate', { method: 'POST', body: JSON.stringify({ id: fan.id }) });
+          fanDebugStatus(`标定完成：${fan.id} 满转基准 ${result.base} RPM（RPM 单位上限已同步）。`);
+        } catch (error) {
+          fanDebugStatus(`标定失败：${error.message}`, true);
+        } finally {
+          calibrate.disabled = false;
+          apply.disabled = false;
+        }
+      });
+      let prevUnit = unit.value;
+      unit.addEventListener('change', () => {
+        const to = fanDebugUnit(unit.value);
+        const from = fanDebugUnit(prevUnit);
+        // 输入框与递增值按比例换算到新单位(RPM/%/PWM 上限等比)
+        const v = Number(input.value);
+        if (Number.isFinite(v)) {
+          input.value = String(convertDebugValue(v, from.value, to.value, rpmMax));
+        }
+        const s = Number(stepInput.value);
+        if (Number.isFinite(s) && s > 0) {
+          stepInput.value = String(convertDebugValue(s, from.value, to.value, rpmMax));
+        }
+        input.max = String(unitMax(to));
+        stepInput.max = String(unitMax(to));
+        setCellSuffix(debugCell, to.suffix);
+        setCellSuffix(stepCell, to.suffix);
+        prevUnit = unit.value;
+        // 同步后端:基准值按新单位存储(同物理输出,只是换算存储),递增/完成判定跟随新单位
+        if (Number.isFinite(v)) {
+          applyFanDebugPWM(fan.id, Number(input.value), unit.value, `单位已切换为${to.label}，已按新单位同步调试值。`, rpmMax);
+        }
+      });
+      const stepWrap = buildFanDebugInput({ ...debugUnit, max: unitMax(debugUnit) }, 'fan-debug-auto-input', 'step', fan.id, `递增转速 ${fan.id}`);
+      const stepInput = stepWrap.input;
+      stepInput.value = pending[fan.id + ':step'] ?? String(fan.auto_step || 5);
+      const intervalWrap = buildFanDebugInput({ suffix: '秒' }, 'fan-debug-auto-input', 'interval', fan.id, `递增间隔 ${fan.id}`);
+      const intervalInput = intervalWrap.input;
+      intervalInput.value = pending[fan.id + ':interval'] ?? String(fan.auto_interval || 10);
+      // 自动测试运行中锁定整行参数(单位/调试值/应用/标定/递增/间隔):中途
+      // 改动会破坏递增进程;开关本身保持可操作(随时可停)。完成后(auto_done)
+      // 解锁。锁定随 2 秒轮询的重绘持续生效,绕过 UI 的改动还有后端拒绝兜底。
+      const autoLocked = Boolean(fan.auto_running);
+      unit.disabled = autoLocked;
+      input.disabled = autoLocked;
+      apply.disabled = autoLocked;
+      calibrate.disabled = autoLocked;
+      stepInput.disabled = autoLocked;
+      intervalInput.disabled = autoLocked;
+      debugCell.append(unit, debugWrap.wrap, apply, calibrate);
+      stepCell.append(stepWrap.wrap);
+      intervalCell.append(intervalWrap.wrap);
+      // 自动测试滑动开关:开=按该行步进/间隔/单位从当前调试值递增;到上限自动弹回并标记完成
+      const autoToggle = document.createElement('label');
+      autoToggle.className = 'toggle fan-debug-auto-toggle';
+      const autoBox = document.createElement('input');
+      autoBox.type = 'checkbox';
+      autoBox.dataset.fanId = fan.id;
+      autoBox.checked = fan.auto_running;
+      autoBox.setAttribute('aria-label', `${fan.id} 自动递增测试${fan.auto_done ? '（已完成，重新打开可从 0 重跑）' : ''}`);
+      autoBox.addEventListener('change', () => applyFanDebugAuto(fan.id, autoBox.checked, Number(stepInput.value) || 5, Number(intervalInput.value) || 10, unit.value));
+      autoToggle.append(autoBox, document.createElement('span'));
+      autoCell.append(autoToggle);
+      if (fan.auto_done) {
+        const done = document.createElement('span');
+        done.className = 'fan-debug-done';
+        done.textContent = '✓ 已完成';
+        autoCell.append(done);
+      }
+    }
+    row.append(takeCell, name, channel, rpm, pwm, mode, debugCell, stepCell, intervalCell, autoCell);
+    body.append(row);
+  });
+  applyFanDebugStatus(state);
+}
+
+// 替换单元格里输入框后面的单位后缀(RPM/%/秒;空串=移除)
+function setCellSuffix(cell, text) {
+  let mark = cell.querySelector('.fan-debug-suffix');
+  if (!text) {
+    if (mark) mark.remove();
+    return;
+  }
+  if (!mark) {
+    mark = document.createElement('span');
+    mark.className = 'fan-debug-suffix';
+    cell.append(mark);
+  }
+  mark.textContent = text;
+}
+
+$('fan-debug-visible').addEventListener('change', () => setFanDebugVisible($('fan-debug-visible').checked));
+
+// ---- 长期记录保存位置：官方系统目录选择器（fnOS 应用 SDK pickSharedFile）----
+
+// SDK 单例：动态 import vendor 的 @trimjs/web-app ESM 构建，ready() 握手
+// 超时 8 秒防卡死；失败后下次点击重新初始化。
+let fsSdkPromise = null;
+
+function getFsSdk() {
+  if (!fsSdkPromise) {
+    fsSdkPromise = (async () => {
+      const mod = await import('./fnos-web-app.js');
+      const sdk = new mod.TrimApp();
+      await Promise.race([
+        sdk.ready(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('初始化超时')), 8000)),
+      ]);
+      return sdk;
+    })().catch((error) => {
+      fsSdkPromise = null;
+      throw error;
+    });
+  }
+  return fsSdkPromise;
+}
+
+async function browseArchiveDir() {
+  const button = $('history-archive-browse');
+  button.disabled = true;
+  try {
+    const sdk = await getFsSdk();
+    if (sdk.isStandaloneWeb) {
+      showMessage('请在 fnOS 桌面内打开本插件后再选择目录，独立浏览器无法调起系统选择器。', true, 'message-history');
+      return;
+    }
+    const result = await sdk.pickSharedFile({
+      title: '选择长期记录保存位置',
+      okText: '选择此目录',
+      sidebarGroup: ['myFiles', 'otherShare', 'favorites', 'external'],
+    });
+    if (result && result.code !== 0) {
+      showMessage(`目录选择失败：${result.msg || '未知错误'}`, true, 'message-history');
+      return;
+    }
+    if (Array.isArray(result?.data) && result.data.length) {
+      // 共享授权目录仅单选，取第一个路径回填
+      $('history-archive-dir').value = result.data[0];
+    }
+  } catch (error) {
+    showMessage(`系统目录选择器不可用：${error.message}。可直接手动输入路径；该功能需要 fnOS 1.2.0401 及以上版本。`, true, 'message-history');
+  } finally {
+    button.disabled = false;
+  }
+}
+
+$('history-archive-browse').addEventListener('click', browseArchiveDir);
+
+async function applyFanTakeover(id, taken) {
+  setBusy(true);
+  try {
+    renderFanDebug(await request('api/fans/debug/takeover', { method: 'POST', body: JSON.stringify({ id, taken }) }));
+    fanDebugStatus(taken ? `已接管 ${id}，该风扇脱离温控曲线。` : `已释放 ${id}，恢复曲线控制。`);
+  } catch (error) {
+    fanDebugStatus(`接管切换失败：${error.message}`, true);
+    startFanDebugPoll(); // 立即轮询校正界面状态
+  } finally {
+    setBusy(false);
+  }
+}
+
+// 单风扇自动递增的开/关:开=以当前调试值为基准,按该行步进/间隔/单位递增;
+// 关=停在当前转速(参数保留,重新打开原样继续)。各风扇互不影响。
+async function applyFanDebugAuto(id, running, step, interval, unit) {
+  // 输入框 step=1 只约束步进点击,手输 1.5 这类小数会原样到这——后端字段
+  // 是整数,不取整会 JSON decode 失败报 400
+  step = Math.round(step);
+  interval = Math.round(interval);
+  const label = id.split(':').pop();
+  setBusy(true);
+  try {
+    const state = running
+      ? await request('api/fans/debug/auto', { method: 'POST', body: JSON.stringify({ fans: [{ id, step, interval, unit }] }) })
+      : await request('api/fans/debug/auto/stop', { method: 'POST', body: JSON.stringify({ id }) });
+    renderFanDebug(state);
+    fanDebugStatus(running ? `${label} 自动递增已开始。` : `${label} 自动递增已停止，保持当前转速。`);
+  } catch (error) {
+    fanDebugStatus(`自动递增切换失败：${error.message}`, true);
+    startFanDebugPoll(); // 立即轮询校正开关状态
+  } finally {
+    setBusy(false);
+  }
+}
+
+// rpmMax 为该风扇实测满转基准(标定后 >2000):rpm 单位的上限按它校验,
+// 否则标定过的高速风扇会被 2000 默认值误拒(单位切换的换算值同理)
+async function applyFanDebugPWM(id, value, unit, successMessage, rpmMax) {
+  value = Math.round(value); // 同 applyFanDebugAuto:手输小数不得原样发给整数后端
+  const def = fanDebugUnit(unit);
+  const max = unit === 'rpm' ? (rpmMax || def.max) : def.max;
+  if (!Number.isFinite(value) || value < 0 || value > max) {
+    fanDebugStatus(`调试值需在 0–${max} 之间。`, true);
+    return;
+  }
+  setBusy(true);
+  try {
+    renderFanDebug(await request('api/fans/debug/pwm', { method: 'POST', body: JSON.stringify({ id, value, unit }) }));
+    fanDebugStatus(successMessage || `已应用 ${id} ${def.label} ${value}。`);
+  } catch (error) {
+    fanDebugStatus(`应用失败：${error.message}`, true);
+  } finally {
+    setBusy(false);
+  }
+}
 
 function renderFanRPMs(fanStatus = {}) {
   const target = $('fan-rpm-list');
@@ -2194,6 +3158,7 @@ function updatePowerMode(mode, applyPreset = true) {
 
 function render(status, keepInputs = false) {
   currentStatus = status;
+  syncFanDebugVisibleFromStatus();
   const pkg = status.packages?.[0] || {};
   const cpuTemperature = status.cpu_temperature || {};
   const fanStatus = status.fan_control || {};
@@ -2255,8 +3220,12 @@ function render(status, keepInputs = false) {
     updatePowerMode(detectedPowerMode(status, status.config || {}), false);
     fillFanInputs(status.config?.fan);
     fillGPIOInputs(status.config?.gpio);
+    applyBackendHistoryRange(status.config?.ui_prefs); // 后端档位先采纳，保留天数钳制随后生效
+    applyBackendHistorySeries(status.config?.ui_prefs); // 曲线显隐偏好同批采纳（跨浏览器一致）
     fillHistoryInputs(status.config?.history);
+    syncRunLogInputs(status);
   }
+  renderSerialSensor(status.serial);
   CURVE_KINDS.forEach(renderFanChart);
 }
 
@@ -2443,7 +3412,7 @@ function renderSensorNamesList() {
   if (!keys.length) {
     const empty = document.createElement('p');
     empty.className = 'debug-report-meta';
-    empty.textContent = '暂未发现传感器，请先打开历史图表页等待数据加载。';
+    empty.textContent = '暂未发现传感器，请先打开历史温度页等待数据加载。';
     wrap.append(empty);
     return;
   }
@@ -2512,7 +3481,185 @@ async function saveSensorNames() {
   }
 }
 
-// ---- 调试页：历史图表数据导出（sql 快照 / csv 宽表） ----
+// ---- 调试页：USB 串口温度传感器（usb:tty:* 读数走「其它」分组，多设备） ----
+
+const SERIAL_BAUD_RATES = [2400, 4800, 9600, 19200, 38400, 57600, 115200];
+
+function setupSerialSensor() {
+  const rows = $('serial-sensor-rows');
+  if (!rows) return;
+  $('serial-sensor-add').addEventListener('click', () => {
+    addSerialRow(null);
+    serialFormDirty = true;
+  });
+  $('serial-sensor-save').addEventListener('click', saveSerialSensor);
+}
+
+// renderSerialSensor 同步串口传感器卡：设备下拉选项每轮刷新（插拔自动出
+// 现），配置行集合只在用户没有未保存修改时跟随服务端，各行状态文本常刷。
+function renderSerialSensor(serial) {
+  const rows = $('serial-sensor-rows');
+  if (!rows) return;
+  const configs = serial?.configs || [];
+  const devices = serial?.devices || [];
+  if (!serialFormDirty) {
+    rows.replaceChildren();
+    configs.forEach((config) => appendSerialRow(config, devices));
+    if (!configs.length) {
+      const empty = document.createElement('p');
+      empty.className = 'serial-sensor-empty';
+      empty.textContent = '尚未配置串口传感器。点击「添加传感器」后选择设备与波特率。';
+      rows.append(empty);
+    }
+  } else {
+    // 已有行只刷新设备选项与状态文本，保留用户未保存的选择
+    [...rows.querySelectorAll('.serial-sensor-config')].forEach((row) => {
+      const path = row.dataset.path;
+      fillSerialDeviceOptions(row.querySelector('.serial-row-device'), devices, path);
+      const status = serialSensorStatusText(configs.find((c) => c.path === path), Date.now());
+      const line = row.querySelector('.serial-row-status');
+      line.textContent = status;
+    });
+  }
+}
+
+// appendSerialRow 追加一行配置（config 为空表示新添加的空行）。
+function appendSerialRow(config, devices) {
+  const row = document.createElement('div');
+  row.className = 'serial-sensor-config';
+  row.dataset.path = config?.path || '';
+
+  const toggle = document.createElement('label');
+  toggle.className = 'toggle serial-row-enabled';
+  const checkbox = document.createElement('input');
+  checkbox.type = 'checkbox';
+  checkbox.checked = Boolean(config?.enabled);
+  checkbox.addEventListener('change', () => { serialFormDirty = true; });
+  const span = document.createElement('span');
+  toggle.append(checkbox, span);
+
+  const device = document.createElement('select');
+  device.className = 'serial-row-device';
+  device.addEventListener('change', () => {
+    row.dataset.path = device.value;
+    serialFormDirty = true;
+  });
+  fillSerialDeviceOptions(device, devices, config?.path || '');
+
+  const baud = document.createElement('select');
+  baud.className = 'serial-row-baud';
+  SERIAL_BAUD_RATES.forEach((rate) => {
+    const option = document.createElement('option');
+    option.value = String(rate);
+    option.textContent = `${rate} bps`;
+    if (rate === (config?.baud || 9600)) option.selected = true;
+    baud.append(option);
+  });
+  baud.addEventListener('change', () => { serialFormDirty = true; });
+
+  const remove = document.createElement('button');
+  remove.type = 'button';
+  remove.className = 'serial-row-remove';
+  remove.textContent = '删除';
+  remove.addEventListener('click', () => {
+    row.remove();
+    serialFormDirty = true;
+  });
+
+  const status = document.createElement('p');
+  status.className = 'serial-row-status message';
+  status.textContent = serialSensorStatusText(config, Date.now());
+
+  row.append(toggle, device, baud, remove, status);
+  $('serial-sensor-rows').append(row);
+}
+
+function addSerialRow() {
+  appendSerialRow({ enabled: true, baud: 9600 }, currentStatus?.serial?.devices || []);
+}
+
+// fillSerialDeviceOptions 填充一行的设备下拉：候选设备 + 已配置但当前未检
+// 测到的路径（保留选项避免误改配置）；selected 为当前应选中的路径。
+function fillSerialDeviceOptions(select, devices, selected) {
+  const options = [...devices.map((d) => ({ path: d.path, label: `${d.label}（${d.path}）` }))];
+  if (selected && !devices.some((d) => d.path === selected)) {
+    options.push({ path: selected, label: `${selected}（未检测到）` });
+  }
+  if (!options.length) {
+    options.push({ path: '', label: '未发现串口设备（插入 USB 转串口后自动出现）' });
+  }
+  select.replaceChildren();
+  options.forEach((option) => {
+    const el = document.createElement('option');
+    el.value = option.path;
+    el.textContent = option.label;
+    if (option.path === selected) el.selected = true;
+    select.append(el);
+  });
+}
+
+// serialSensorStatusText 把一行配置的运行态拼成一句话；now 参数便于离线
+// 单测注入时钟。有错误但读数还新鲜（<60 秒）时按"瞬断重连中"表述——USB
+// 串口偶发 EOF 会自动快速重连，不该吓唬用户；重连失败持续无读数才升级为
+// "连接失败"。
+function serialSensorStatusText(config, now = Date.now()) {
+  if (!config) return '尚未保存。';
+  if (!config.enabled) return '未启用（保留配置，不再读取）。';
+  // 零值时间戳（旧后端下发的 0001-01-01）解析出负数毫秒，一并当无读数，
+  // 避免渲染出“63927157204 秒前”这类纪元差值
+  const lastAtMs = config.last_at ? new Date(config.last_at).getTime() : NaN;
+  const age = Number.isFinite(lastAtMs) && lastAtMs > 0
+    ? Math.max(0, Math.round((now - lastAtMs) / 1000))
+    : null;
+  const parts = [];
+  if (config.open) parts.push('已连接');
+  else if (config.last_error) {
+    parts.push(age !== null && age <= 60
+      ? `读数中断，正在自动重连（${config.last_error}）`
+      : `连接失败：${config.last_error}`);
+  } else parts.push('等待连接…');
+  if (age !== null) {
+    parts.push(`最近读数 ${formatTemperature(config.last_celsius, true)}（${age} 秒前）`);
+  }
+  if (config.key) parts.push(`曲线键 ${config.key}`);
+  return `${parts.join('；')}。`;
+}
+
+async function saveSerialSensor() {
+  const line = $('serial-sensor-status');
+  const configs = [...document.querySelectorAll('.serial-sensor-config')].map((row) => ({
+    enabled: row.querySelector('.serial-row-enabled input').checked,
+    path: row.querySelector('.serial-row-device').value,
+    baud: Number(row.querySelector('.serial-row-baud').value) || 9600,
+  }));
+  const enabledWithoutPath = configs.filter((c) => c.enabled && !c.path).length;
+  if (enabledWithoutPath) {
+    line.textContent = `有 ${enabledWithoutPath} 个启用的传感器未选择设备路径。`;
+    line.className = 'message error';
+    return;
+  }
+  const button = $('serial-sensor-save');
+  button.disabled = true;
+  try {
+    const updated = await request('api/config/serial-sensor', {
+      method: 'POST',
+      body: JSON.stringify({ configs }),
+    });
+    serialFormDirty = false;
+    render(updated, true);
+    const enabled = configs.filter((c) => c.enabled).length;
+    line.textContent = enabled
+      ? `已保存 ${configs.length} 个配置（启用 ${enabled} 个）。读数出现在历史温度「其它」分组，键以 usb:tty: 开头。`
+      : `已保存 ${configs.length} 个配置（全部停用）。`;
+  } catch (error) {
+    line.textContent = `保存失败：${error.message}`;
+    line.className = 'message error';
+  } finally {
+    button.disabled = false;
+  }
+}
+
+// ---- 调试页：历史温度数据导出（sql 快照 / csv 宽表） ----
 
 function setupHistoryExport() {
   const toggle = $('history-export-toggle');
@@ -2786,6 +3933,43 @@ function setupCurveEditor(kind) {
   $(editor.removeID).addEventListener('click', () => removeSelectedCurvePoint(kind));
 }
 CURVE_KINDS.forEach(setupCurveEditor);
+
+// ---- 曲线编辑器标签页：三张卡一次只显示一张，收纵向空间 ----
+// 切换后必须重绘：curveChartScale 按 clientWidth 测量，隐藏期间为 0，
+// 缩放与图内文字会失真；显示后按真实尺寸重算。上次停留的标签记 localStorage
+// （页面内布局记忆，无需进服务端 ui_prefs）。
+let activeCurveKind = loadActiveCurveKind();
+
+function loadActiveCurveKind() {
+  try {
+    const saved = window.localStorage.getItem('tad-curve-tab');
+    return CURVE_KINDS.includes(saved) ? saved : 'cpu';
+  } catch (error) { return 'cpu'; }
+}
+
+function applyCurveTab(kind) {
+  activeCurveKind = CURVE_KINDS.includes(kind) ? kind : 'cpu';
+  CURVE_KINDS.forEach((candidate) => {
+    const panel = document.querySelector(`.curve-editor[data-curve-kind="${candidate}"]`);
+    if (panel) panel.hidden = candidate !== activeCurveKind;
+    const tab = $(`curve-tab-${candidate}`);
+    if (tab) {
+      tab.classList.toggle('active', candidate === activeCurveKind);
+      tab.setAttribute('aria-selected', String(candidate === activeCurveKind));
+    }
+  });
+  try { window.localStorage.setItem('tad-curve-tab', activeCurveKind); } catch (error) { /* 隐私模式等场景仅本次生效 */ }
+  renderFanChart(activeCurveKind);
+}
+
+function setupCurveTabs() {
+  CURVE_KINDS.forEach((kind) => {
+    const tab = $(`curve-tab-${kind}`);
+    if (tab) tab.addEventListener('click', () => applyCurveTab(kind));
+  });
+  applyCurveTab(activeCurveKind);
+}
+setupCurveTabs();
 function setupCurveChartScaling() {
   const charts = [
     ...CURVE_KINDS.map((kind) => $(curveEditors[kind].chartID)),
@@ -2831,6 +4015,7 @@ $('debug-download-report').addEventListener('click', downloadDebugReport);
 $('debug-open-issue').addEventListener('click', openDebugIssue);
 setupHistoryExport();
 setupSensorNames();
+setupSerialSensor();
 $('gpio-enabled').addEventListener('change', updateGPIOEnabledState);
 $('gpio-script-add').addEventListener('click', () => openGPIOScriptEditor());
 $('gpio-script-cancel').addEventListener('click', closeGPIOScriptEditor);

@@ -33,7 +33,7 @@
       } catch (error) { /* localStorage 不可用时跟随系统 */ }
     })();
   </script>
-  <link rel="stylesheet" href="styles.css?v=0.10.19">
+  <link rel="stylesheet" href="styles.css?v=0.10.19-t5-t5">
   <script>
     // 样式自愈：升级包后浏览器可能仍持有带长缓存的远古样式表（无 CSS 变量，
     // 表现为图表坐标线消失、文字变黑、主题切换无反应）。绕过缓存拉取服务端
@@ -172,8 +172,14 @@
               </label>
             </div>
 
+            <div class="curve-tabs" role="tablist" aria-label="温控曲线编辑器切换">
+              <button id="curve-tab-cpu" type="button" class="curve-tab" role="tab" aria-selected="true" aria-controls="cpu-curve-editor">CPU</button>
+              <button id="curve-tab-hdd" type="button" class="curve-tab" role="tab" aria-selected="false" aria-controls="disk-curve-editor">HDD/SATA</button>
+              <button id="curve-tab-nvme" type="button" class="curve-tab" role="tab" aria-selected="false" aria-controls="nvme-curve-editor">NVMe</button>
+            </div>
+
             <div class="curve-editors">
-              <section class="curve-editor" aria-labelledby="cpu-curve-heading">
+              <section id="cpu-curve-editor" class="curve-editor" role="tabpanel" aria-labelledby="cpu-curve-heading" data-curve-kind="cpu">
                 <div class="curve-editor-heading">
                   <h3 id="cpu-curve-heading">CPU 温度曲线</h3>
                   <span>读取 coretemp 最高值</span>
@@ -189,7 +195,7 @@
                 <fieldset class="curve-fan-selector"><legend>CPU 曲线控制的风扇</legend><div id="cpu-fan-options" class="curve-fan-options"></div></fieldset>
                 <p id="curve-help">拖动圆点调整 CPU 温度和转速；支持 2–8 个节点，也可使用方向键微调。</p>
               </section>
-              <section class="curve-editor" aria-labelledby="disk-curve-heading">
+              <section id="disk-curve-editor" class="curve-editor" role="tabpanel" aria-labelledby="disk-curve-heading" data-curve-kind="hdd" hidden>
                 <div class="curve-editor-heading">
                   <h3 id="disk-curve-heading">HDD/SATA 温度曲线</h3>
                   <span>取已勾选前置仓的最高温度</span>
@@ -210,7 +216,7 @@
                 </fieldset>
                 <p id="disk-curve-help">默认 25°C 使用最低转速、35°C 使用 85%、50°C 使用 100%；温度来自前置 SATA 仓。</p>
               </section>
-              <section class="curve-editor" aria-labelledby="nvme-curve-heading">
+              <section id="nvme-curve-editor" class="curve-editor" role="tabpanel" aria-labelledby="nvme-curve-heading" data-curve-kind="nvme" hidden>
                 <div class="curve-editor-heading">
                   <h3 id="nvme-curve-heading">NVMe 温度曲线</h3>
                   <span>取已勾选 M.2 槽的最高温度</span>
@@ -242,35 +248,52 @@
           <section class="card history-card" aria-labelledby="history-heading">
             <div class="panel-heading">
               <div>
-                <h2 id="history-heading">历史图表</h2>
-                <p>温度（左轴，°C）与风扇转速（右轴，占满量程百分比）随时间的变化。</p>
+                <h2 id="history-heading">历史温度</h2>
+                <p>温度（左轴，°C）与风扇转速（右轴，占满量程百分比）随时间的变化；采样开关、保存天数等更多设置在“&lt;/&gt; 调试”页的“历史温度与风扇控制”。</p>
               </div>
               <div class="history-range" role="group" aria-label="时间范围">
-                <button type="button" class="history-range-btn" data-range="0.5">30 分钟</button>
-                <button type="button" class="history-range-btn" data-range="1">1 小时</button>
-                <button type="button" class="history-range-btn" data-range="6">6 小时</button>
-                <button type="button" class="history-range-btn active" data-range="24">24 小时</button>
-                <button type="button" class="history-range-btn" data-range="168">7 天</button>
-                <button type="button" class="history-range-btn" data-range="720">30 天</button>
+                <div class="history-range-slider">
+                  <output id="history-range-value" class="history-range-value" for="history-range-slider">30 分钟</output>
+                  <input id="history-range-slider" class="history-range-input" type="range" min="0" max="1000" step="1" value="0" aria-label="历史时间范围：30 分钟到 2 小时无极调节（1 分钟粒度），之后为 6 小时、12 小时、24 小时、7 天、30 天固定挡位，7 天与 30 天按保存天数显隐">
+                  <div class="history-range-ticks layout-7" aria-hidden="true">
+                    <span class="history-range-tick" data-tick="cont-min">30分</span>
+                    <span class="history-range-tick" data-tick="cont-max">2时</span>
+                    <span class="history-range-tick" data-tick="6h">6时</span>
+                    <span class="history-range-tick" data-tick="12h">12时</span>
+                    <span class="history-range-tick" data-tick="24h">24时</span>
+                    <span class="history-range-tick" data-tick="7d">7天</span>
+                    <span class="history-range-tick" data-tick="30d">30天</span>
+                  </div>
+                </div>
               </div>
             </div>
-            <label class="toggle history-toggle"><input id="history-enabled" type="checkbox"><span></span>启用历史记录</label>
-            <div class="history-size-limit">
-              <label class="field history-size-field">
-                <span>数据库大小上限（MB）</span>
-                <input id="history-max-size" class="text-input" type="number" min="8" max="1024" step="8" value="64" inputmode="numeric">
-              </label>
-              <button id="save-history" type="button">保存历史设置</button>
-            </div>
-            <p id="message-history" class="message" role="status" aria-live="polite"></p>
-            <p class="notice history-limit-notice">满配设备（4 风扇 + 6 盘位 + 12 传感器）每分钟采样约 0.7 KB，30 天约 30–45 MB；数据库同时受 30 天保留期与大小上限约束，超限后从最旧的一天开始删除。</p>
-            <div id="history-disabled-notice" class="inline-status history-disabled-notice" hidden>历史记录已停用：后台不再写入新采样，已保存的数据仍会按保留期与大小上限继续清理。</div>
             <div id="history-legend" class="history-legend"></div>
             <svg id="history-chart" class="curve-chart history-chart" viewBox="0 0 640 260" role="img" aria-label="温度与风扇转速历史曲线"></svg>
+            <div id="history-scrub-bar" class="history-scrub-bar" hidden>
+              <span id="history-scrub-range" class="history-scrub-range"></span>
+              <button id="history-scrub-live" class="history-scrub-live" type="button" hidden>回到最新</button>
+            </div>
             <div id="history-tooltip" class="history-tooltip" role="status" hidden></div>
             <p id="history-status" class="inline-status"></p>
-            <p class="notice">数据由插件后台每分钟采样一次并写入本地数据库，保留最近 30 天；插件停止运行期间不采集，重启后曲线会出现断口。长时间范围下服务端会自动按峰值聚合，温度曲线展示区间内的最高温。</p>
+            <p class="notice">数据由插件后台每分钟采样一次并写入本地数据库，按设置的保存天数保留；采样开关、大小上限与保存天数在“&lt;/&gt; 调试”页的“历史温度与风扇控制”中。插件停止运行期间不采集，重启后曲线会出现断口；长时间范围下服务端会自动按峰值聚合，温度曲线展示区间内的最高温；30 分钟档支持在图上左右拖动，回看最近 7.5 小时的数据。</p>
           </section>
+          <section class="card debug-panel" id="fan-debug-card" aria-labelledby="fan-debug-heading" hidden>
+            <div class="panel-heading">
+              <div>
+                <h2 id="fan-debug-heading">风扇调试</h2>
+                <p>逐风扇手动设定转速与独立的自动递增测试。勾选接管的风扇脱离温控曲线、仅受行内调试值控制（CPU 超过紧急温度时仍强制全速兜底）；未接管的风扇照常受曲线控制，可与调试中的风扇并存。</p>
+              </div>
+            </div>
+            <div class="table-scroll">
+              <table class="status-table fan-debug-table">
+                <thead><tr><th>接管</th><th>风扇</th><th>通道</th><th>当前转速</th><th>当前 PWM</th><th>模式</th><th>调试转速</th><th>每次递增</th><th>递增间隔</th><th>自动测试</th></tr></thead>
+                <tbody id="fan-debug-body"></tbody>
+              </table>
+            </div>
+            <p class="notice">勾选“接管”后该风扇脱离温控曲线，仅受行内调试转速控制；取消勾选立即恢复曲线并结束该风扇的自动测试。调试值支持三种单位：转速 RPM（闭环控制——设定目标转速后按反馈实测自动微调 PWM，实测与目标差 ≤3% 即保持；目标初值来自自动学习的 PWM→转速特性表，全速运转时满转基准也会自动标定并随特性表在重启后保留，表随风扇被驱动过的工况自动充实；等不及自然学习可点行内“标定”主动全速数秒一次学到位；实际转速仍以“当前转速”读数为准）、百分比 %（0–100）、PWM（0–255 原始占空比，不带符号），切换单位时数值自动换算并同步。行内“自动测试”滑动开关按风扇独立启停：开启后从当前调试转速起，按该行的递增值与间隔推进，到所选单位上限自动完成并保持；再次开启会从 0 重跑。一个风扇递增期间，其他风扇可照常手动调试。</p>
+            <p id="fan-debug-status" class="message" role="status" aria-live="polite"></p>
+          </section>
+
         </section>
 
         <section id="panel-gpio" class="tab-panel" role="tabpanel" aria-labelledby="tab-gpio" hidden>
@@ -376,31 +399,109 @@
               <button id="debug-copy-report" type="button" disabled>复制报告</button>
               <button id="debug-download-report" type="button" disabled>下载报告</button>
               <button id="debug-open-issue" type="button" disabled>打开 GitHub Issue</button>
-              <div class="history-export-wrap" title="导出后台采样的温度、风扇与传感器历史（SQLite 数据库，保留最近 30 天）；sql 为数据库快照，csv 为可用 Excel 打开的宽表">
-                <button id="history-export-toggle" type="button" aria-haspopup="true" aria-expanded="false">导出历史图表数据 ▾</button>
-                <div id="history-export-menu" class="history-export-menu" hidden>
-                  <button id="history-export-sql" type="button">下载sql</button>
-                  <button id="history-export-csv" type="button">下载为csv</button>
-                </div>
-              </div>
             </div>
             <p id="debug-report-meta" class="debug-report-meta">尚未生成报告</p>
             <textarea id="debug-report" class="debug-report" readonly spellcheck="false" aria-label="调试报告内容" placeholder="点击“生成调试报告”获取报告"></textarea>
             <p id="debug-status" class="message" role="status" aria-live="polite">可以生成一份新的调试报告。</p>
           </section>
 
+          <section class="card debug-panel" aria-labelledby="history-settings-heading">
+            <div class="panel-heading">
+              <div>
+                <h2 id="history-settings-heading">历史温度与风扇控制</h2>
+                <p>采样开关、数据库大小上限与保存天数，以及历史数据的导出与清空；曲线与时间范围在“风扇控制”页的历史温度卡片。风扇调试控制在“风扇控制”页，用下方开关启用。</p>
+              </div>
+              <label class="toggle"><input id="fan-debug-visible" type="checkbox"><span></span>启用风扇调试</label>
+            </div>
+            <label class="toggle history-toggle"><input id="history-enabled" type="checkbox"><span></span>启用历史记录</label>
+            <div id="history-disabled-notice" class="inline-status history-disabled-notice" hidden>历史记录已停用：后台不再写入新采样，已保存的数据仍会按保留期与大小上限继续清理。</div>
+            <div class="field-grid history-settings">
+              <label class="field">
+                <span>数据库大小上限</span>
+                <div class="input-wrap"><input id="history-max-size" type="number" min="8" max="1024" step="8" value="64" inputmode="numeric"><b>MB</b></div>
+                <small>超限后同步清理运行日志</small>
+              </label>
+              <label class="field">
+                <span>保存天数</span>
+                <div class="input-wrap"><input id="history-retention-days" type="number" min="1" step="1" value="30" inputmode="numeric"><b>天</b></div>
+                <small>默认 30 天；可设大实现接近不限期，磁盘由大小上限兜底</small>
+              </label>
+            </div>
+            <div class="history-archive">
+              <label class="toggle history-archive-toggle"><input id="history-archive-enabled" type="checkbox"><span></span>启用长期记录</label>
+              <div class="field history-archive-dir">
+                <span>长期记录保存位置</span>
+                <div class="history-archive-row">
+                  <input id="history-archive-dir" class="text-input" type="text" placeholder="/vol1/1000/长期记录" autocomplete="off" spellcheck="false">
+                  <button id="history-archive-browse" type="button">浏览</button>
+                </div>
+                <small>开启后数据先在系统盘缓存，按月归档写入到保存位置，HDD 仅在归档时单次写入，文件数量不限制</small>
+              </div>
+            </div>
+            <div class="actions history-actions">
+              <button id="save-history" type="button" class="primary">保存历史设置</button>
+              <div class="history-export-wrap" title="导出后台采样的温度、风扇与传感器历史（SQLite 数据库，按保存天数保留）；sql 为数据库快照，csv 为可用 Excel 打开的宽表">
+                <button id="history-export-toggle" type="button" aria-haspopup="true" aria-expanded="false">导出历史温度数据 ▾</button>
+                <div id="history-export-menu" class="history-export-menu" hidden>
+                  <button id="history-export-sql" type="button">下载sql</button>
+                  <button id="history-export-csv" type="button">下载为csv</button>
+                </div>
+              </div>
+              <button id="history-clear" type="button" class="danger">清空数据库</button>
+            </div>
+            <p id="message-history" class="message" role="status" aria-live="polite"></p>
+            <p class="notice history-limit-notice">满配设备（4 风扇 + 6 盘位 + 12 传感器）每分钟采样约 0.7 KB，30 天约 30–45 MB；数据库同时受 保留天数与大小上限约束，超限后从最旧的一天开始删除。</p>
+          </section>
+
+          <section class="card debug-panel" aria-labelledby="runlog-heading">
+            <div class="panel-heading">
+              <div>
+                <h2 id="runlog-heading">运行日志</h2>
+                <p>守护进程的文本诊断日志（/var/log/tank/tad-module.log），正常情况下近乎空白；超过大小上限会自动截断并保留一代备份。</p>
+              </div>
+            </div>
+            <div class="field-grid history-settings">
+              <label class="field">
+                <span>日志大小上限</span>
+                <div class="input-wrap"><input id="runlog-max-size" type="number" min="1" max="256" step="1" value="16" inputmode="numeric"><b>MB</b></div>
+                <small>范围 1–256 MB，默认 16 MB；与历史数据库大小上限相互独立</small>
+              </label>
+            </div>
+            <div class="actions history-actions">
+              <button id="save-runlog" type="button" class="primary">保存日志设置</button>
+              <button id="runlog-export" type="button">导出日志</button>
+              <button id="runlog-clear" type="button" class="danger">清空日志</button>
+            </div>
+            <p id="runlog-status" class="message" role="status" aria-live="polite"></p>
+          </section>
+
           <section class="card debug-panel" aria-labelledby="sensor-names-heading">
             <div class="panel-heading">
               <div>
                 <h2 id="sensor-names-heading">传感器显示名</h2>
-                <p>为温度传感器设置便于辨认的显示名（如多个 temp1），并可选择其归属父类（默认按驱动自动归类）；历史图表与悬浮提示会使用该名称，配置保存在本机，所有设备生效。</p>
+                <p>为温度传感器设置便于辨认的显示名（如多个 temp1），并可选择其归属父类（默认按驱动自动归类）；历史温度与悬浮提示会使用该名称，配置保存在本机，所有设备生效。</p>
               </div>
             </div>
             <div id="sensor-names-list" class="sensor-names-list"></div>
             <div class="actions debug-actions">
               <button id="sensor-names-save" type="button" class="primary">保存显示名</button>
             </div>
-            <p id="sensor-names-status" class="message" role="status" aria-live="polite">切换到历史图表页一次即可列出全部传感器。</p>
+            <p id="sensor-names-status" class="message" role="status" aria-live="polite">切换到历史温度页一次即可列出全部传感器。</p>
+          </section>
+
+          <section class="card debug-panel" aria-labelledby="serial-sensor-heading">
+            <div class="panel-heading">
+              <div>
+                <h2 id="serial-sensor-heading">USB 串口温度传感器</h2>
+                <p>经 USB 转串口模块（CH340、CP210x、FTDI 等）接入的温度计：固件逐行输出含温度数字的文本（如 25.6、+25.6、temp:25.6），行内第一个合理温度按摄氏度入库，可同时接多个。读取为间歇轮询（每 5 秒开口读一次），其余时间串口空闲、可被其他程序读取。读数出现在历史温度「其它」分组（键 usb:tty: 开头），可在上方「传感器显示名」改名。设备优先选 by-id 路径（插拔编号不漂移）；两个一模一样的适配器 by-id 会撞名，用 by-path 按物理插口区分。</p>
+              </div>
+            </div>
+            <div id="serial-sensor-rows" class="serial-sensor-rows"></div>
+            <div class="actions debug-actions">
+              <button id="serial-sensor-add" type="button">添加传感器</button>
+              <button id="serial-sensor-save" type="button" class="primary">保存串口传感器</button>
+            </div>
+            <p id="serial-sensor-status" class="message" role="status" aria-live="polite">插入 USB 转串口设备后，下拉框会自动列出候选串口。</p>
           </section>
         </section>
 
@@ -451,6 +552,6 @@
       <button id="app-modal-close" type="button" class="primary" data-modal-close>关闭</button>
     </div>
   </div>
-  <script src="app.js?v=0.10.19" defer></script>
+  <script src="app.js?v=0.10.19-t5-t5" defer></script>
 </body>
 </html>

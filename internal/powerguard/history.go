@@ -1,6 +1,9 @@
 package powerguard
 
 import (
+	"bufio"
+	"bytes"
+	"compress/gzip"
 	"context"
 	"database/sql"
 	"encoding/csv"
@@ -10,6 +13,7 @@ import (
 	"log"
 	"math"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,31 +24,42 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// 历史采样参数：60 秒一个点、实际存储 32 天（约 4.6 万行），单文件 history.db。
-// 满配设备每分钟约 0.7KB（主表 45B + 风扇 165B + 盘位 180B + 传感器 315B），
-// 32 天约 32–48MB，默认大小上限 64MB 是两倍余量；超限后按天删最旧数据。
-// 存储比展示窗口（historyMaxRangeHours = 30 天）多 2 天缓冲：日期/大小清理
-// 以天粒度从最旧侧删除时，用户可见的 30 天窗口前缘永远不会缺数据。
+// 历史采样参数：60 秒一个点，单文件 history.db。满配设备每分钟约 0.7KB
+// （主表 45B + 风扇 165B + 盘位 180B + 传感器 315B），按默认保留 30 天约
+// 30–45MB，默认大小上限 64MB 是两倍余量；超限后按天删最旧数据。
+// 保留期（retention_days，默认 30、下限 1、不设实际上限）由用户配置；磁盘
+// 体积由大小上限兜底（超限按天删最旧），所以不限期是安全的。仅保留一个
+// 防溢出护栏：time.Duration 按纳秒计，天数超过约 292 年会溢出为负数、把
+// 清理 cutoff 推到未来导致清空全部数据，故荒谬大值钳到 36500（100 年）。
+// 存储层实际多留 2 天缓冲（historyRetentionBufferDays）：日期/大小清理以
+// 天粒度从最旧侧删除时，用户可见的展示窗口（保留天数）前缘永远不会缺数据。
 const (
-	historyInterval        = time.Minute
-	historyRetentionDays   = 32 // 实际保留天数；展示窗口另由 historyMaxRangeHours 钳制在 30 天
-	historyPruneEvery      = time.Hour
-	historyMaxPoints       = 480
-	historyMaxRangeHours   = 30 * 24 // 用户可查询的最大范围：30 天（< 存储的 32 天）
-	historyFileVersion     = 1       // /api/history 响应结构版本
-	historyMinMaxSizeMB    = 8
-	historyMaxMaxSizeMB    = 1024
-	historySizePruneBytes  = 24 * 60 * 60 // 大小超限时每次删除的最旧数据跨度（秒）
-	historySizePruneRounds = 64           // 单次清理最多删除的天数，防止死循环
+	historyInterval             = time.Minute
+	historyDefaultRetentionDays = 30 // 保留期默认值；展示窗口上限 = 保留天数×24
+	historyMinRetentionDays     = 1
+	historyMaxRetentionDays     = 36500 // 防溢出护栏（100 年），不是产品意义上的上限
+	// 存储比展示窗口多留的缓冲天数（历史设计为 32 天存储 = 30 天展示 + 2 天）
+	historyRetentionBufferDays = 2
+	historyPruneEvery          = time.Hour
+	historyMaxPoints           = 480
+	historyFileVersion         = 1 // /api/history 响应结构版本
+	historyMinMaxSizeMB        = 8
+	historyMaxMaxSizeMB        = 1024
+	historySizePruneBytes      = 24 * 60 * 60 // 大小超限时每次删除的最旧数据跨度（秒）
+	historySizePruneRounds     = 64           // 单次清理最多删除的天数，防止死循环
+	archiveFlushMinRows        = 200000       // 归档冲刷体量阈值：满配 ~210B/行 ≈ 42MB，攒够才写 HDD（跨月也会提前冲）
 )
 
 type HistoryConfig struct {
-	Enabled   bool  `json:"enabled"`
-	MaxSizeMB int64 `json:"max_size_mb"`
+	Enabled        bool   `json:"enabled"`
+	MaxSizeMB      int64  `json:"max_size_mb"`
+	RetentionDays  int    `json:"retention_days"`  // 历史保留天数（展示窗口），默认 30
+	ArchiveEnabled bool   `json:"archive_enabled"` // 长期记录：清理前先把旧数据按月归档到用户目录
+	ArchiveDir     string `json:"archive_dir"`     // 长期记录保存位置（绝对路径，保存时验证可写）
 }
 
 func DefaultHistoryConfig() HistoryConfig {
-	return HistoryConfig{Enabled: true, MaxSizeMB: 64}
+	return HistoryConfig{Enabled: true, MaxSizeMB: 64, RetentionDays: historyDefaultRetentionDays}
 }
 
 // ClampHistoryMaxSize 把大小上限限制在合理区间，配置文件里的非法值静默归位。
@@ -56,6 +71,18 @@ func ClampHistoryMaxSize(maxSizeMB int64) int64 {
 		return historyMaxMaxSizeMB
 	}
 	return maxSizeMB
+}
+
+// ClampHistoryRetentionDays 把历史保留天数限制在合理区间，配置文件里的非法值
+// 静默归位（0 由 normalizeConfig 先归为默认值，这里不会遇到 0）。
+func ClampHistoryRetentionDays(days int) int {
+	if days < historyMinRetentionDays {
+		return historyMinRetentionDays
+	}
+	if days > historyMaxRetentionDays {
+		return historyMaxRetentionDays
+	}
+	return days
 }
 
 type HistoryFanSample struct {
@@ -95,10 +122,16 @@ type historyFile struct {
 // HistoryStore 把采样写入 SQLite（WAL 模式），读写并发安全。
 // 查询按需走索引取范围切片，不用常驻整段历史在内存里。
 type HistoryStore struct {
-	mu        sync.Mutex
-	db        *sql.DB
-	path      string
-	lastPrune time.Time
+	mu                sync.Mutex
+	db                *sql.DB
+	path              string
+	retentionDays     int    // 用户配置的保留天数（不含缓冲），0 值由构造函数归为默认
+	archiveEnabled    bool   // 长期记录：清理前先把旧数据归档到用户目录
+	archiveDir        string // 长期记录保存位置（绝对路径，保存配置时已验证可写）
+	archiveFailStreak int    // 长期记录连续失败轮数；失败期间暂停删除保数据（见 archiveForDelete）
+	archiveWatermark  int64  // 归档水位：之前的采样都已归档+删除；水位到当期 cutoff 之间是 SSD 上的缓冲
+	logger            *log.Logger
+	lastPrune         time.Time
 }
 
 func NewHistoryStore(path string) (*HistoryStore, error) {
@@ -110,11 +143,16 @@ func NewHistoryStore(path string) (*HistoryStore, error) {
 		return nil, fmt.Errorf("open history db: %w", err)
 	}
 	// WAL：写只追加日志页，读不阻塞写；synchronous=NORMAL 在 WAL 下够安全。
+	// wal_autocheckpoint 保持默认（1000 页）即可：WAL 平时由读连接自动合并，
+	// 大小超限清理后另有显式 wal_checkpoint(TRUNCATE) 截断，无需更激进。
+	// cache_size 上限 8MB：按天查询顺序扫表，页面缓存命中率足够，同时约束
+	// 守护进程常驻内存（modernc 驱动默认只有 2MB，30 天数据量下偏小）。
 	for _, pragma := range []string{
 		"PRAGMA journal_mode=WAL",
 		"PRAGMA synchronous=NORMAL",
 		"PRAGMA busy_timeout=3000",
 		"PRAGMA foreign_keys=ON",
+		"PRAGMA cache_size=-8192",
 	} {
 		if _, err := db.Exec(pragma); err != nil {
 			db.Close()
@@ -148,16 +186,18 @@ CREATE TABLE IF NOT EXISTS history_sensors (
 	c       REAL NOT NULL DEFAULT 0,
 	PRIMARY KEY (ts, grp, key)
 );`
+	// 索引现状说明：四张表的查询都是 `WHERE ts >= ? ORDER BY ts`——主表 ts 是
+	// INTEGER PRIMARY KEY（rowid 聚簇），三张子表的复合主键均以 ts 开头，
+	// 范围扫描天然走索引，无需额外建索引（额外索引只会拖慢写入）。
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("history schema: %w", err)
 	}
-	store := &HistoryStore{db: db, path: path, lastPrune: time.Time{}}
-	if err := store.Prune(time.Now()); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("history prune: %w", err)
-	}
-	return store, nil
+	// 不在构造时 Prune：此刻 retentionDays 还是默认值（30 天、归档关），
+	// 用户配置的更长保留期/长期记录要等 main 构造后的 SyncSettings 才生效——
+	// 先删会把超期数据按错误窗口清掉。首次清理由 SyncSettings（启动即调）
+	// 或采样循环的 PruneIfNeeded 承担，两者都先应用用户设置再删。
+	return &HistoryStore{db: db, path: path, retentionDays: historyDefaultRetentionDays, lastPrune: time.Time{}}, nil
 }
 
 func (s *HistoryStore) Close() error {
@@ -194,58 +234,72 @@ func (s *HistoryStore) ExportSQLite(ctx context.Context, w io.Writer) error {
 
 // WriteCSV 把全部历史导出为宽表 CSV：时间与聚合温度为固定列，风扇/单盘/
 // 传感器按出现的 ID 动态成列（缺失留空）。首行带 BOM，方便 Excel 识别 UTF-8。
+//
+// 流式实现（内存常量，1GB 库实测堆峰值从 ~2GB 降到 ~10MB）：列头用三个
+// DISTINCT 预扫（走主键索引，JOIN history 排除孤儿子行，与旧行为一致）；
+// 数据行用四张表各自的 ts 有序游标做归并连接——history 主表驱动，每个时刻
+// 只在内存里保留当前 ts 的子行（满配 ~23 行），单次扫表无需整体加载。
 func (s *HistoryStore) WriteCSV(ctx context.Context, w io.Writer) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	samples, err := s.queryRange(ctx, 0)
+	return s.writeCSVLocked(ctx, w, 0, math.MaxInt64)
+}
+
+// writeCSVLocked 是 WriteCSV 的范围版（调用方须已持锁）：只导出 [lo, hi) 的
+// 采样，列头发现限定在同一范围内——归档单个月份时，只有该月出现过的 ID 才
+// 成列。lo=0、hi=math.MaxInt64 即全库，行为与 WriteCSV 一致。
+func (s *HistoryStore) writeCSVLocked(ctx context.Context, w io.Writer, lo, hi int64) error {
+	// 列发现：DISTINCT 走复合主键索引，只读 ID 列不取数据；JOIN history
+	// 保证"出现过在主表里的 ID"才成列（孤儿子行不成列，旧行为同样不可见）。
+	fans, err := s.distinctStrings(ctx, `SELECT DISTINCT f.fan_id FROM history_fans f JOIN history h ON h.ts = f.ts WHERE f.ts >= ? AND f.ts < ? ORDER BY f.fan_id`, lo, hi)
 	if err != nil {
 		return err
 	}
-
-	fanCols := map[string]bool{}
-	diskCols := map[string]bool{}
-	sensorCols := map[string]bool{}
-	for _, sample := range samples {
-		for _, fan := range sample.Fans {
-			fanCols[fan.ID] = true
-		}
-		for _, disk := range sample.Disks {
-			diskCols[disk.ID] = true
-		}
-		for _, sensor := range sample.Sensors {
-			sensorCols[sensor.Group+"\x00"+sensor.Key] = true
-		}
-	}
-	sortedKeys := func(set map[string]bool) []string {
-		keys := make([]string, 0, len(set))
-		for key := range set {
-			keys = append(keys, key)
-		}
-		for i := 1; i < len(keys); i++ {
-			for j := i; j > 0 && keys[j] < keys[j-1]; j-- {
-				keys[j], keys[j-1] = keys[j-1], keys[j]
-			}
-		}
-		return keys
-	}
-	fans := sortedKeys(fanCols)
-	disks := sortedKeys(diskCols)
-	sensors := sortedKeys(sensorCols)
-
-	if _, err := w.Write([]byte("\xef\xbb\xbf")); err != nil {
+	disks, err := s.distinctStrings(ctx, `SELECT DISTINCT d.slot_id FROM history_slots d JOIN history h ON h.ts = d.ts WHERE d.ts >= ? AND d.ts < ? ORDER BY d.slot_id`, lo, hi)
+	if err != nil {
 		return err
 	}
-	csvWriter := csv.NewWriter(w)
-	header := []string{"ts", "time", "cpu_c", "hdd_c", "nvme_c"}
+	type csvSensorPair struct{ group, key string }
+	var sensors []csvSensorPair
+	sensorRows, err := s.db.QueryContext(ctx, `SELECT DISTINCT s.grp, s.key FROM history_sensors s JOIN history h ON h.ts = s.ts WHERE s.ts >= ? AND s.ts < ? ORDER BY s.grp, s.key`, lo, hi)
+	if err != nil {
+		return err
+	}
+	for sensorRows.Next() {
+		var pair csvSensorPair
+		if err := sensorRows.Scan(&pair.group, &pair.key); err != nil {
+			sensorRows.Close()
+			return err
+		}
+		sensors = append(sensors, pair)
+	}
+	if err := sensorRows.Err(); err != nil {
+		sensorRows.Close()
+		return err
+	}
+	sensorRows.Close()
+
+	buf := bufio.NewWriterSize(w, 64<<10)
+	if _, err := buf.WriteString("\xef\xbb\xbf"); err != nil {
+		return err
+	}
+	csvWriter := csv.NewWriter(buf)
+	header := make([]string, 0, 5+len(fans)*2+len(disks)+len(sensors))
+	header = append(header, "ts", "time", "cpu_c", "hdd_c", "nvme_c")
+	fanRPMIndex := make(map[string]int, len(fans))
 	for _, id := range fans {
+		fanRPMIndex[id] = len(header)
 		header = append(header, "fan_"+id+"_rpm", "fan_"+id+"_pwm")
 	}
+	diskIndex := make(map[string]int, len(disks))
 	for _, id := range disks {
+		diskIndex[id] = len(header)
 		header = append(header, "disk_"+id+"_c")
 	}
-	for _, key := range sensors {
-		parts := strings.SplitN(key, "\x00", 2)
-		header = append(header, "sensor_"+parts[0]+"_"+parts[1]+"_c")
+	sensorIndex := make(map[string]int, len(sensors))
+	for _, pair := range sensors {
+		sensorIndex[pair.group+"\x00"+pair.key] = len(header)
+		header = append(header, "sensor_"+pair.group+"_"+pair.key+"_c")
 	}
 	if err := csvWriter.Write(header); err != nil {
 		return err
@@ -256,49 +310,160 @@ func (s *HistoryStore) WriteCSV(ctx context.Context, w io.Writer) error {
 		}
 		return strconv.FormatFloat(value, 'f', 1, 64)
 	}
-	for _, sample := range samples {
-		record := []string{
-			strconv.FormatInt(sample.TS, 10),
-			time.Unix(sample.TS, 0).Format("2006-01-02 15:04:05"),
-			formatC(sample.CPUC), formatC(sample.HDDC), formatC(sample.NVMeC),
+
+	// 四个 ts 有序游标。子表游标落后于主表时（孤儿子行，历史库理论上不该有，
+	// 但老库的 PRAGMA foreign_keys 是连接级的、无法完全排除）直接跳过。
+	mainRows, err := s.db.QueryContext(ctx, `SELECT ts, cpu_c, hdd_c, nvme_c FROM history WHERE ts >= ? AND ts < ? ORDER BY ts`, lo, hi)
+	if err != nil {
+		return err
+	}
+	defer mainRows.Close()
+	fanRows, err := s.db.QueryContext(ctx, `SELECT ts, fan_id, rpm, pwm_percent FROM history_fans WHERE ts >= ? AND ts < ? ORDER BY ts, fan_id`, lo, hi)
+	if err != nil {
+		return err
+	}
+	defer fanRows.Close()
+	slotRows, err := s.db.QueryContext(ctx, `SELECT ts, slot_id, temperature_c FROM history_slots WHERE ts >= ? AND ts < ? ORDER BY ts, slot_id`, lo, hi)
+	if err != nil {
+		return err
+	}
+	defer slotRows.Close()
+	sensorDataRows, err := s.db.QueryContext(ctx, `SELECT ts, grp, key, c FROM history_sensors WHERE ts >= ? AND ts < ? ORDER BY ts, grp, key`, lo, hi)
+	if err != nil {
+		return err
+	}
+	defer sensorDataRows.Close()
+
+	var (
+		mainTS                              int64
+		mainCPU, mainHDD, mainNVMe          float64
+		fanTS, fanRPM                       int64
+		fanID                               string
+		fanPWM                              int
+		slotTS                              int64
+		slotID                              string
+		slotC                               float64
+		sensorTS                            int64
+		sensorGroup, sensorKey              string
+		sensorC                             float64
+		mainOK, fanOK, slotOK, sensorDataOK bool
+	)
+	advance := func(rows *sql.Rows, dest ...any) (bool, error) {
+		if !rows.Next() {
+			return false, rows.Err()
 		}
-		for _, id := range fans {
-			rpm, pwm := "", ""
-			for _, fan := range sample.Fans {
-				if fan.ID == id {
-					rpm = strconv.FormatInt(fan.RPM, 10)
-					pwm = strconv.Itoa(fan.PWMPercent)
-				}
-			}
-			record = append(record, rpm, pwm)
+		if err := rows.Scan(dest...); err != nil {
+			return false, err
 		}
-		for _, id := range disks {
-			value := ""
-			for _, disk := range sample.Disks {
-				if disk.ID == id {
-					value = formatC(disk.TemperatureC)
-				}
+		return true, nil
+	}
+	if mainOK, err = advance(mainRows, &mainTS, &mainCPU, &mainHDD, &mainNVMe); err != nil {
+		return err
+	}
+	if fanOK, err = advance(fanRows, &fanTS, &fanID, &fanRPM, &fanPWM); err != nil {
+		return err
+	}
+	if slotOK, err = advance(slotRows, &slotTS, &slotID, &slotC); err != nil {
+		return err
+	}
+	if sensorDataOK, err = advance(sensorDataRows, &sensorTS, &sensorGroup, &sensorKey, &sensorC); err != nil {
+		return err
+	}
+
+	record := make([]string, len(header))
+	for rowCount := 0; mainOK; rowCount++ {
+		if rowCount%1000 == 0 {
+			if err := ctx.Err(); err != nil {
+				return err
 			}
-			record = append(record, value)
 		}
-		for _, key := range sensors {
-			value := ""
-			for _, sensor := range sample.Sensors {
-				if sensor.Group+"\x00"+sensor.Key == key {
-					value = formatC(sensor.C)
-				}
+		for fanOK && fanTS < mainTS {
+			if fanOK, err = advance(fanRows, &fanTS, &fanID, &fanRPM, &fanPWM); err != nil {
+				return err
 			}
-			record = append(record, value)
+		}
+		for slotOK && slotTS < mainTS {
+			if slotOK, err = advance(slotRows, &slotTS, &slotID, &slotC); err != nil {
+				return err
+			}
+		}
+		for sensorDataOK && sensorTS < mainTS {
+			if sensorDataOK, err = advance(sensorDataRows, &sensorTS, &sensorGroup, &sensorKey, &sensorC); err != nil {
+				return err
+			}
+		}
+		for i := range record {
+			record[i] = ""
+		}
+		record[0] = strconv.FormatInt(mainTS, 10)
+		record[1] = time.Unix(mainTS, 0).Format("2006-01-02 15:04:05")
+		record[2] = formatC(mainCPU)
+		record[3] = formatC(mainHDD)
+		record[4] = formatC(mainNVMe)
+		for fanOK && fanTS == mainTS {
+			if idx, ok := fanRPMIndex[fanID]; ok {
+				record[idx] = strconv.FormatInt(fanRPM, 10)
+				record[idx+1] = strconv.Itoa(fanPWM)
+			}
+			if fanOK, err = advance(fanRows, &fanTS, &fanID, &fanRPM, &fanPWM); err != nil {
+				return err
+			}
+		}
+		for slotOK && slotTS == mainTS {
+			if idx, ok := diskIndex[slotID]; ok {
+				record[idx] = formatC(slotC)
+			}
+			if slotOK, err = advance(slotRows, &slotTS, &slotID, &slotC); err != nil {
+				return err
+			}
+		}
+		for sensorDataOK && sensorTS == mainTS {
+			if idx, ok := sensorIndex[sensorGroup+"\x00"+sensorKey]; ok {
+				record[idx] = formatC(sensorC)
+			}
+			if sensorDataOK, err = advance(sensorDataRows, &sensorTS, &sensorGroup, &sensorKey, &sensorC); err != nil {
+				return err
+			}
 		}
 		if err := csvWriter.Write(record); err != nil {
 			return err
 		}
+		if mainOK, err = advance(mainRows, &mainTS, &mainCPU, &mainHDD, &mainNVMe); err != nil {
+			return err
+		}
+	}
+	if err := mainRows.Err(); err != nil {
+		return err
 	}
 	csvWriter.Flush()
-	return csvWriter.Error()
+	if err := csvWriter.Error(); err != nil {
+		return err
+	}
+	return buf.Flush()
+}
+
+// distinctStrings 跑一列 DISTINCT 查询并按序返回（列头发现与归档月份发现用）。
+func (s *HistoryStore) distinctStrings(ctx context.Context, query string, args ...any) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var value string
+		if err := rows.Scan(&value); err != nil {
+			return nil, err
+		}
+		out = append(out, value)
+	}
+	return out, rows.Err()
 }
 
 // Append 追加一个采样点（ts 为主键，重复写入即覆盖）。
+// 写入路径说明：database/sql 会对 *sql.DB 的每条固定 SQL 缓存预编译语句，
+// 每分钟一个事务、每事务十来条 Exec 的量级下，手动管理 Tx 级预编译语句
+// 只会增加代码复杂度，收益可以忽略——维持现状。
 func (s *HistoryStore) Append(sample HistorySample) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -345,21 +510,55 @@ ON CONFLICT(ts) DO UPDATE SET cpu_c=excluded.cpu_c, hdd_c=excluded.hdd_c, nvme_c
 	return nil
 }
 
-// PruneIfNeeded 挂在采样循环上的低频清理：日期轮转距上次超过 1 小时才真正
-// 执行 DELETE；大小上限每次都检查（仅两次 stat），超限才进入删除与 VACUUM。
-// 历史记录停用后清理照跑，让旧数据按期收敛。
-func (s *HistoryStore) PruneIfNeeded(now time.Time, maxSizeMB int64) error {
+// SetLogger 注入守护进程日志器（长期记录失败/回退需要让用户看到原因）。
+func (s *HistoryStore) SetLogger(logger *log.Logger) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.logger = logger
+}
+
+// logf 在注入了日志器时记一条日志；未注入（单测）静默。
+func (s *HistoryStore) logf(format string, args ...any) {
+	if s.logger != nil {
+		s.logger.Printf(format, args...)
+	}
+}
+
+// SyncSettings 同步用户可调的清理配置（保留天数、长期记录）并立即按新保留
+// 期清理一次：保存配置后马上调用，缩短保留期能当场生效。用户主动保存说明
+// 可能刚修好了长期记录目录，连续失败计数一并归零。
+func (s *HistoryStore) SyncSettings(settings HistoryConfig) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.applySettingsLocked(settings)
+	s.archiveFailStreak = 0
+	s.archiveWatermark = 0 // 用户主动保存（可能刚修好目录）：立即安排一次冲刷
+	return s.pruneLocked(time.Now())
+}
+
+func (s *HistoryStore) applySettingsLocked(settings HistoryConfig) {
+	s.retentionDays = ClampHistoryRetentionDays(settings.RetentionDays)
+	s.archiveEnabled = settings.ArchiveEnabled
+	s.archiveDir = strings.TrimSpace(settings.ArchiveDir)
+}
+
+// PruneIfNeeded 挂在采样循环上的低频清理：日期轮转距上次超过 1 小时才真正
+// 执行 DELETE；大小上限每次都检查（仅两次 stat），超限才进入删除与 VACUUM。
+// 历史记录停用后清理照跑，让旧数据按期收敛。每次调用都同步保留天数与长期
+// 记录设置，保证配置变更最迟在下个采样点生效。
+func (s *HistoryStore) PruneIfNeeded(now time.Time, settings HistoryConfig) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.applySettingsLocked(settings)
 	if s.lastPrune.IsZero() || time.Since(s.lastPrune) >= historyPruneEvery {
 		if err := s.pruneLocked(now); err != nil {
 			return err
 		}
 	}
-	if maxSizeMB <= 0 {
+	if settings.MaxSizeMB <= 0 {
 		return nil
 	}
-	return s.enforceSizeLocked(maxSizeMB << 20)
+	return s.enforceSizeLocked(now, settings.MaxSizeMB<<20)
 }
 
 // Prune 删除保留期之外的采样（history_fans 级联删除）。
@@ -370,12 +569,394 @@ func (s *HistoryStore) Prune(now time.Time) error {
 }
 
 func (s *HistoryStore) pruneLocked(now time.Time) error {
-	cutoff := now.Add(-historyRetentionDays * 24 * time.Hour).Unix()
+	// 长期记录开启时，删除与归档合并为一次"冲刷"：过期数据留在主库（SSD）
+	// 当缓冲，攒到跨自然月或体量达到阈值才一次性写入归档盘（HDD 平时可持续
+	// 休眠，一年只有十几次大块顺序写），写完再删并把水位推进到 cutoff。
+	// 冲刷失败：水位不动、本轮不删（保数据，SSD 继续缓冲），下小时重试。
+	// 不设"连续失败后回退直接删除"——长期记录是用户明确要保的数据，归档
+	// 失败宁可让库增长（大小上限另有约束），由日志暴露等待用户修复目录。
+	if s.archiveEnabled && s.archiveDir != "" {
+		return s.flushArchiveLocked(now)
+	}
+	cutoff := now.Add(-time.Duration(s.retentionDays+historyRetentionBufferDays) * 24 * time.Hour).Unix()
 	if _, err := s.db.Exec(`DELETE FROM history WHERE ts < ?`, cutoff); err != nil {
 		return err
 	}
 	s.lastPrune = now
 	return nil
+}
+
+func (s *HistoryStore) flushArchiveLocked(now time.Time) error {
+	// 无论本轮是"缓冲未满不动归档盘"还是冲刷失败，都算完成了一次轮转检查：
+	// 不更新的话每个采样点（1 分钟）都会重进冲刷判定/重试，错误日志跟着刷屏；
+	// 每小时一次的重试节奏足够，快速恢复靠用户保存配置（SyncSettings 立即冲刷）
+	s.lastPrune = now
+	cutoff := now.Add(-time.Duration(s.retentionDays+historyRetentionBufferDays) * 24 * time.Hour).Unix()
+	if !s.archiveFlushDue(now, cutoff) {
+		// 缓冲未满且没跨月：不动归档盘，过期数据继续留在 SSD
+		return nil
+	}
+	return s.deleteExpiredLocked(s.archiveWatermark, cutoff)
+}
+
+// archiveFlushDue 冲刷条件：水位未建立（首轮/重启后），自上次冲刷后过期的
+// 数据跨了自然月（cutoff 的月份离开水位月份 = 上一个整月已完整过期），或未
+// 冲刷的过期数据体量达到阈值。跨月比较用 cutoff 而非 now：保留期极长时水位
+// 和 cutoff 都在很远的历史里，跟 now 比会每小时误判"该冲刷"。
+func (s *HistoryStore) archiveFlushDue(now time.Time, cutoff int64) bool {
+	if s.archiveWatermark == 0 {
+		return true
+	}
+	if cutoff <= s.archiveWatermark {
+		return false // 保留期极长：还没有任何数据过期
+	}
+	if monthKey(s.archiveWatermark) != monthKey(cutoff) {
+		return true
+	}
+	var pending int64
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM history WHERE ts >= ? AND ts < ?`, s.archiveWatermark, cutoff).Scan(&pending); err != nil {
+		return true // 查询失败按"需要冲刷"处理，让具体错误在归档步骤暴露
+	}
+	return pending >= archiveFlushMinRows
+}
+
+// deleteExpiredLocked 归档并删除 [lo, hi) 的采样（lo=水位）；长期记录开启时
+// 先冲刷归档（失败则中止，调用方不得继续删）。删除严格限定在已归档区间内：
+// 水位之下不该有数据（采样永远写"当前时刻"），万一因时钟回跳等异常出现，
+// 留在原地也绝不无声丢弃。成功后水位推进到 hi。
+func (s *HistoryStore) deleteExpiredLocked(lo, hi int64) error {
+	if s.archiveEnabled && s.archiveDir != "" {
+		if err := s.archiveForDelete(lo, hi); err != nil {
+			return err
+		}
+	}
+	if _, err := s.db.Exec(`DELETE FROM history WHERE ts >= ? AND ts < ?`, lo, hi); err != nil {
+		return err
+	}
+	s.archiveWatermark = hi
+	return nil
+}
+
+// archiveForDelete 长期记录的归档步骤：成功返回 nil，失败返回 error 且调用方
+// 不得删除该批数据。长期记录开启时归档失败**永远保数据不删**——保存位置坏掉
+// 由运行日志暴露、磁盘风险由大小上限约束，不做静默丢弃；用户保存配置
+// （SyncSettings）即视为可能已修复，失败计数归零重试。
+func (s *HistoryStore) archiveForDelete(lo, hi int64) error {
+	if err := s.archiveBetween(lo, hi); err != nil {
+		s.archiveFailStreak++
+		s.logf("long-term archive failed (%d consecutive rounds), pruning paused until the archive dir recovers: %v", s.archiveFailStreak, err)
+		return err
+	}
+	if s.archiveFailStreak > 0 {
+		s.logf("long-term archive recovered")
+	}
+	s.archiveFailStreak = 0
+	return nil
+}
+
+// archiveBetween 把 [lo, hi) 的采样按自然月（本地时区）归档到用户目录：
+// 一个月一个压缩 CSV 文件（tad-history-202609.csv.gz），文件名天然唯一且可按
+// 年月识别；文件数量不限制。CSV 格式与 /api/history/export.csv 的宽表完全
+// 一致（Excel 可直接打开）；gzip 压缩后满配约 1.4MB/月，对比 SQLite 月文件
+// 的 ~50MB 缩减约 35 倍——宽表同一列的值逐行重复、格式一致，gzip 的窗口
+// 跨行匹配效率极高，文本化即拿到列压缩的大部分收益。
+func (s *HistoryStore) archiveBetween(lo, hi int64) error {
+	if err := os.MkdirAll(s.archiveDir, 0o755); err != nil {
+		return fmt.Errorf("create archive dir: %w", err)
+	}
+	months, err := s.distinctStrings(context.Background(),
+		`SELECT DISTINCT strftime('%Y%m', ts, 'unixepoch', 'localtime') FROM history WHERE ts >= ? AND ts < ? ORDER BY 1`, lo, hi)
+	if err != nil {
+		return err
+	}
+	for _, month := range months {
+		mLo, mHi, err := monthBounds(month)
+		if err != nil {
+			return err
+		}
+		if mLo < lo {
+			mLo = lo
+		}
+		if mHi > hi {
+			mHi = hi
+		}
+		if mLo >= mHi {
+			continue
+		}
+		path := filepath.Join(s.archiveDir, fmt.Sprintf("tad-history-%s.csv.gz", month))
+		if err := s.archiveMonthRange(path, mLo, mHi); err != nil {
+			return fmt.Errorf("archive %s: %w", month, err)
+		}
+	}
+	return nil
+}
+
+// monthKey 把 unix 秒转成本地 YYYYMM（冲刷的跨月条件用）。
+func monthKey(ts int64) string {
+	return time.Unix(ts, 0).Format("200601")
+}
+
+// monthBounds 把 YYYYMM 解析成本地日历月的 [起, 止) unix 秒区间。
+func monthBounds(month string) (int64, int64, error) {
+	if len(month) != 6 {
+		return 0, 0, fmt.Errorf("unexpected month %q", month)
+	}
+	year, err := strconv.Atoi(month[:4])
+	if err != nil {
+		return 0, 0, fmt.Errorf("unexpected month %q: %w", month, err)
+	}
+	mon, err := strconv.Atoi(month[4:6])
+	if err != nil || mon < 1 || mon > 12 {
+		return 0, 0, fmt.Errorf("unexpected month %q", month)
+	}
+	lo := time.Date(year, time.Month(mon), 1, 0, 0, 0, 0, time.Local)
+	return lo.Unix(), lo.AddDate(0, 1, 0).Unix(), nil
+}
+
+// archiveMonthRange 把 [lo, hi) 的采样写成月度归档文件（宽表 CSV + gzip，
+// 复用 writeCSVLocked 的流式导出）。先写同目录临时文件再 rename：进程中断
+// 最多留下一个待清理的临时文件，不会出现半截归档。
+func (s *HistoryStore) archiveMonthRange(path string, lo, hi int64) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".tad-archive-*.csv.gz.tmp")
+	if err != nil {
+		return fmt.Errorf("create temp archive: %w", err)
+	}
+	tmpName := tmp.Name()
+	complete := false
+	defer func() {
+		if !complete {
+			tmp.Close()
+			os.Remove(tmpName)
+		}
+	}()
+	// BestCompression：归档一个月才写一次、满配整月也就 1~2 秒（低端 ARM
+	// 实测量级），换约 10% 的体积缩减值得。
+	gz, err := gzip.NewWriterLevel(tmp, gzip.BestCompression)
+	if err != nil {
+		return err
+	}
+	if err := s.writeArchiveMonthCSV(gz, path, lo, hi); err != nil {
+		return fmt.Errorf("write archive csv: %w", err)
+	}
+	if err := gz.Close(); err != nil {
+		return fmt.Errorf("close gzip: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close archive file: %w", err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return fmt.Errorf("rename archive: %w", err)
+	}
+	complete = true
+	return nil
+}
+
+// writeArchiveMonthCSV 往 gz 写 [lo, hi) 的宽表 CSV。同一自然月可能被多次
+// 冲刷（首轮水位建立、跨月、大小清理提前冲刷都会在月内留下接缝），目标文件
+// 已存在时读出旧内容按 ts 归并去重（同 ts 保留新值）后与新数据合并重写：
+// 月文件始终保持"一个自然月一个文件、Excel 直接可开"，重跑幂等语义与旧
+// SQLite 方案的 INSERT OR REPLACE 一致，不会因覆盖写丢掉先前的批次。
+func (s *HistoryStore) writeArchiveMonthCSV(gz *gzip.Writer, path string, lo, hi int64) error {
+	oldHeader, oldRows, err := readArchiveCSVFile(path)
+	if err != nil {
+		return err
+	}
+	if oldHeader == nil {
+		return s.writeCSVLocked(context.Background(), gz, lo, hi)
+	}
+	// 新数据先流式生成到内存缓冲（满配一个月未压缩 ~7MB），再与旧行归并。
+	var newBuf bytes.Buffer
+	if err := s.writeCSVLocked(context.Background(), &newBuf, lo, hi); err != nil {
+		return err
+	}
+	newReader := csv.NewReader(strings.NewReader(strings.TrimPrefix(newBuf.String(), "\ufeff")))
+	newHeader, err := newReader.Read()
+	if err != nil {
+		return err
+	}
+	header := mergeCSVHeaders(oldHeader, newHeader)
+	oldMap := mapCSVColumns(oldHeader, header)
+	newMap := mapCSVColumns(newHeader, header)
+	// 合并重写也要补 UTF-8 BOM（writeCSVLocked 首写会带）：列名/传感器键含
+	// 中文时，无 BOM 的 CSV 会被 Excel 按本地编码误读成乱码
+	if _, err := gz.Write([]byte("\ufeff")); err != nil {
+		return err
+	}
+	w := csv.NewWriter(gz)
+	if err := w.Write(header); err != nil {
+		return err
+	}
+	writeRow := func(row []string, mapping []int) error {
+		out := make([]string, len(header))
+		for j, v := range row {
+			if j < len(mapping) {
+				if k := mapping[j]; k >= 0 {
+					out[k] = v
+				}
+			}
+		}
+		return w.Write(out)
+	}
+	rowTS := func(row []string) (int64, error) {
+		if len(row) == 0 {
+			return 0, fmt.Errorf("archive row without ts column")
+		}
+		return strconv.ParseInt(row[0], 10, 64)
+	}
+	// 双流归并：旧行（内存）与新增行（流式）都按 ts 升序（水位递增保证），
+	// 同 ts 保留新值。
+	pending, pendingOK := make([]string, 0), false
+	advance := func() error {
+		row, err := newReader.Read()
+		if err == io.EOF {
+			pendingOK = false
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		pending, pendingOK = row, true
+		return nil
+	}
+	if err := advance(); err != nil {
+		return err
+	}
+	oldPos := 0
+	for oldPos < len(oldRows) || pendingOK {
+		switch {
+		case oldPos >= len(oldRows):
+			if err := writeRow(pending, newMap); err != nil {
+				return err
+			}
+			if err := advance(); err != nil {
+				return err
+			}
+		case !pendingOK:
+			if err := writeRow(oldRows[oldPos], oldMap); err != nil {
+				return err
+			}
+			oldPos++
+		default:
+			oldTS, err := rowTS(oldRows[oldPos])
+			if err != nil {
+				return err
+			}
+			newTS, err := rowTS(pending)
+			if err != nil {
+				return err
+			}
+			switch {
+			case oldTS < newTS:
+				if err := writeRow(oldRows[oldPos], oldMap); err != nil {
+					return err
+				}
+				oldPos++
+			case oldTS > newTS:
+				if err := writeRow(pending, newMap); err != nil {
+					return err
+				}
+				if err := advance(); err != nil {
+					return err
+				}
+			default: // 同 ts：保留新值，旧行跳过（重跑幂等）
+				if err := writeRow(pending, newMap); err != nil {
+					return err
+				}
+				if err := advance(); err != nil {
+					return err
+				}
+				oldPos++
+			}
+		}
+	}
+	w.Flush()
+	return w.Error()
+}
+
+// readArchiveCSVFile 读已有月归档的表头与数据行；文件不存在返回 (nil, nil, nil)。
+func readArchiveCSVFile(path string) ([]string, [][]string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil, nil
+		}
+		return nil, nil, err
+	}
+	defer f.Close()
+	zr, err := gzip.NewReader(f)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer zr.Close()
+	records, err := csv.NewReader(zr).ReadAll()
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(records) == 0 {
+		return nil, nil, nil
+	}
+	header := records[0]
+	header[0] = strings.TrimPrefix(header[0], "\ufeff")
+	return header, records[1:], nil
+}
+
+// mergeCSVHeaders 合并两份宽表列头（并集）：固定列不会新增，旧列头原序保留，
+// 新增列按所属组（fan/disk/sensor）追加到旧列头对应组区间的末尾。
+func mergeCSVHeaders(oldHeader, newHeader []string) []string {
+	inOld := make(map[string]bool, len(oldHeader))
+	for _, h := range oldHeader {
+		inOld[h] = true
+	}
+	headerGroup := func(h string) int {
+		switch {
+		case strings.HasPrefix(h, "fan_"):
+			return 0
+		case strings.HasPrefix(h, "disk_"):
+			return 1
+		case strings.HasPrefix(h, "sensor_"):
+			return 2
+		default:
+			return -1 // 固定列（ts/time/聚合温度）
+		}
+	}
+	var extra [3][]string
+	for _, h := range newHeader {
+		if !inOld[h] {
+			if g := headerGroup(h); g >= 0 {
+				extra[g] = append(extra[g], h)
+			}
+		}
+	}
+	merged := append([]string(nil), oldHeader...)
+	for g := 0; g < 3; g++ {
+		if len(extra[g]) == 0 {
+			continue
+		}
+		pos := len(merged)
+		for i, h := range merged {
+			if headerGroup(h) == g {
+				pos = i + 1
+			}
+		}
+		merged = append(merged, make([]string, len(extra[g]))...)
+		copy(merged[pos+len(extra[g]):], merged[pos:])
+		copy(merged[pos:pos+len(extra[g])], extra[g])
+	}
+	return merged
+}
+
+// mapCSVColumns 给出 from 每一列在 to 布局中的目标下标（缺失为 -1），
+// 供行数据按列名重排。
+func mapCSVColumns(from, to []string) []int {
+	index := make(map[string]int, len(to))
+	for i, h := range to {
+		index[h] = i
+	}
+	mapping := make([]int, len(from))
+	for j, h := range from {
+		mapping[j] = index[h]
+	}
+	return mapping
 }
 
 // dbSizeBytes 统计主库与 WAL 文件大小；文件不存在按 0 处理。
@@ -392,7 +973,7 @@ func (s *HistoryStore) dbSizeBytes() int64 {
 // enforceSizeLocked 数据库（含 WAL）超过上限时，从最旧的一天开始逐段删除，
 // 至少保留最新一个采样点。删除发生在采样间隙且只在超限时发生，VACUUM 的
 // I/O 开销可以接受。
-func (s *HistoryStore) enforceSizeLocked(limitBytes int64) error {
+func (s *HistoryStore) enforceSizeLocked(now time.Time, limitBytes int64) error {
 	deleted := false
 	for round := 0; round < historySizePruneRounds; round++ {
 		if s.dbSizeBytes() <= limitBytes {
@@ -409,7 +990,10 @@ func (s *HistoryStore) enforceSizeLocked(limitBytes int64) error {
 		if cutoff > newest.Int64 {
 			cutoff = newest.Int64
 		}
-		if _, err := s.db.Exec(`DELETE FROM history WHERE ts < ?`, cutoff); err != nil {
+		// 大小清理走同一个"先冲刷归档再删"的出口，但不做体量/跨月缓冲：
+		// 库超限时必须当场收缩（稳态下超限本身约一天一次，对 HDD 就是
+		// 每天一批；归档先在 SSD 上攒着的缓冲也在这一步一并写走）。
+		if err := s.deleteExpiredLocked(s.archiveWatermark, cutoff); err != nil {
 			return err
 		}
 		deleted = true
@@ -425,15 +1009,18 @@ func (s *HistoryStore) enforceSizeLocked(limitBytes int64) error {
 	return err
 }
 
+// maxRangeHours 展示窗口上限 = 配置保留天数×24（不含 2 天缓冲）：用户可查询
+// 的最大范围就是保留期本身，缓冲数据只用于轮转删除时兜底。
+func (s *HistoryStore) maxRangeHours() float64 {
+	return float64(s.retentionDays) * 24
+}
+
 // Aggregated 返回最近 rangeHours 小时的采样（支持 0.5 这样的半小时范围）；
 // 行数超过 maxPoints 时按桶聚合（数值字段取峰值），第二个返回值是聚合后的
 // 采样间隔秒数，前端据此识别停机断口。
 func (s *HistoryStore) Aggregated(ctx context.Context, rangeHours, maxPoints float64, now time.Time) ([]HistorySample, int, error) {
 	if rangeHours < 0.5 {
 		rangeHours = 0.5
-	}
-	if rangeHours > historyMaxRangeHours {
-		rangeHours = historyMaxRangeHours
 	}
 	if maxPoints < 10 {
 		maxPoints = 10
@@ -444,6 +1031,11 @@ func (s *HistoryStore) Aggregated(ctx context.Context, rangeHours, maxPoints flo
 	cutoff := now.Add(-time.Duration(rangeHours * float64(time.Hour))).Unix()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// 范围钳制放在锁内：retentionDays 由 applySettingsLocked（配置保存/采样
+	// 循环）持锁写入，锁外读会被 -race 报数据竞争
+	if maxRange := s.maxRangeHours(); rangeHours > maxRange {
+		cutoff = now.Add(-time.Duration(maxRange * float64(time.Hour))).Unix()
+	}
 	samples, err := s.queryRange(ctx, cutoff)
 	if err != nil {
 		return nil, 0, err
@@ -678,6 +1270,11 @@ func classifySensorLabel(label string) string {
 		return "nic"
 	case knownGPUDrivers[chip]:
 		return "gpu"
+	case knownUSBTempDrivers[chip]:
+		// USB 温度计的 hwmon 驱动（如 out-of-tree 的 "temper"）：显式归
+		// 「其它」组。结果与 default 相同，写出来是为了让 knownUSBTempDrivers
+		// 表参与归类决策，将来需要单独分组时改这里即可。
+		return "other"
 	default:
 		return "other"
 	}
@@ -747,7 +1344,63 @@ func (s *HistoryStore) appendAndLog(ctx context.Context, manager *Manager, logge
 			logger.Printf("history append failed: %v", err)
 		}
 	}
-	if err := s.PruneIfNeeded(now, settings.MaxSizeMB); err != nil {
+	if err := s.PruneIfNeeded(now, settings); err != nil {
 		logger.Printf("history prune failed: %v", err)
 	}
+}
+
+// FlushArchive 立即补一次归档冲刷（清空数据库前由 HTTP 层调用）：把水位到
+// 当前 cutoff 之间的过期缓冲一次性写入归档盘并从主库删除、推进水位。与定时
+// 冲刷共用归档与失败计数（失败返回 error，缓冲原样保留在主库）。长期记录未
+// 开启、保留期极长、或过期窗口里没有行（刚开启/保存过设置水位归零，数据全
+// 在保留窗口内）时是空操作——返回 false 让前端如实提示"没有缓冲可归档"，
+// 而不是声称已归档。返回是否真的归档并删除了数据。
+func (s *HistoryStore) FlushArchive(now time.Time) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.archiveEnabled || s.archiveDir == "" {
+		return false, nil
+	}
+	cutoff := now.Add(-time.Duration(s.retentionDays+historyRetentionBufferDays) * 24 * time.Hour).Unix()
+	if cutoff <= s.archiveWatermark {
+		return false, nil // 保留期极长：没有任何过期缓冲可冲
+	}
+	var pending int64
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM history WHERE ts >= ? AND ts < ?`, s.archiveWatermark, cutoff).Scan(&pending); err != nil {
+		return false, err
+	}
+	if pending == 0 {
+		s.archiveWatermark = cutoff // 空窗照样消费掉，避免每小时重复扫描
+		return false, nil
+	}
+	if err := s.archiveForDelete(s.archiveWatermark, cutoff); err != nil {
+		return false, err
+	}
+	if _, err := s.db.Exec(`DELETE FROM history WHERE ts >= ? AND ts < ?`, s.archiveWatermark, cutoff); err != nil {
+		return false, err
+	}
+	s.archiveWatermark = cutoff
+	return true, nil
+}
+
+// Clear 清空全部历史数据并回收磁盘空间；schema 与配置（保留期、大小上限）
+// 都不受影响，清空后可立即继续采样。
+func (s *HistoryStore) Clear(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// history 的三张子表都有 ON DELETE CASCADE，直接 DELETE FROM history 即可
+	// 级联；但逐张显式清空对意外缺外键定义的旧库更稳，顺序上先子后父。
+	for _, table := range []string{"history_sensors", "history_slots", "history_fans", "history"} {
+		if _, err := s.db.ExecContext(ctx, `DELETE FROM `+table); err != nil {
+			return fmt.Errorf("clear %s: %w", table, err)
+		}
+	}
+	// VACUUM 只压缩主库；WAL 文件停在高位水位，必须显式截断才真正归还磁盘。
+	if _, err := s.db.ExecContext(ctx, `VACUUM`); err != nil {
+		return fmt.Errorf("vacuum: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		return fmt.Errorf("wal checkpoint: %w", err)
+	}
+	return nil
 }

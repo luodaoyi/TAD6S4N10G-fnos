@@ -13,4 +13,5 @@ desktop_uidir=ui
 desktop_applaunchname=tad-module.Application
 checkport=false
 disable_authorization_path=false
+micro_app=true
 changelog=debian-tui 安装目录改英文 single-binary；顺带 #20/#21 已随 v0.10.18。

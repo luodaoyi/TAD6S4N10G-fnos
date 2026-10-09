@@ -147,6 +147,8 @@ func serve(args []string) error {
 		return err
 	}
 	logger := log.Default()
+	var logFile *os.File
+	var manager *powerguard.Manager
 	if *logPath != "" {
 		if err := os.MkdirAll(filepath.Dir(*logPath), 0o700); err != nil {
 			return err
@@ -155,14 +157,30 @@ func serve(args []string) error {
 		if err != nil {
 			return err
 		}
-		defer file.Close()
-		logger = log.New(file, "", log.LstdFlags|log.LUTC)
+		defer func() { _ = logFile.Close() }()
+		logFile = file
+		// 写入路径的大小兜底：定时轮转（10 分钟）之外，错误刷屏写满超限时
+		// 就地截断。**limit 只读原子快照**——Write 可能在持有 m.mu 的 logf 里
+		// 被触发（saveConfigLocked 等），调 LogSettings() 会重入 m.mu 死锁。
+		// 必须用闭包而非方法值：此刻 manager 变量还是 nil，方法值会在求值时
+		// 绑定 nil 接收者（后续给变量赋值无法挽回），闭包则到调用时才取变量
+		capped := powerguard.NewSizeCappedLogWriter(file, func() int64 {
+			if manager == nil {
+				return 0
+			}
+			return manager.LogLimitBytes()
+		})
+		logger = log.New(capped, "", log.LstdFlags|log.LUTC)
 	}
-	manager := &powerguard.Manager{Root: *root, ConfigPath: *config, StatePath: *state, Version: version}
+	manager = &powerguard.Manager{Root: *root, ConfigPath: *config, StatePath: *state, Version: version}
+	manager.SetLogger(logger)
 	cfg, err := manager.LoadOrCreateConfig()
 	if err != nil {
 		return err
 	}
+	// 日志大小上限的原子快照在此初始化（写入路径兜底与定时轮转共用，
+	// 后续由 SaveLogConfig 在保存时更新）
+	manager.SetLogLimitBytes(int64(cfg.Log.MaxSizeMB) << 20)
 	if err := manager.ApplyCurrent(); err != nil {
 		logger.Printf("initial apply failed; continuing in degraded mode so configuration can be repaired: %v", err)
 	}
@@ -180,17 +198,34 @@ func serve(args []string) error {
 	}
 	if history != nil {
 		defer history.Close()
+		history.SetLogger(logger)
+		// 启动即按配置同步保留期与长期记录并清理一次（构造函数只用了默认值）
+		if err := history.SyncSettings(cfg.History); err != nil {
+			logger.Printf("history settings sync (prune/archive) failed: %v", err)
+		}
 		go powerguard.HistoryLoop(ctx, manager, logger, history)
 	}
 	go func() {
-		server := &powerguard.Server{Manager: manager, Socket: *socket, WebRoot: *webRoot, BasePath: "/app/tad-module", Logger: logger, History: history}
+		server := &powerguard.Server{Manager: manager, Socket: *socket, WebRoot: *webRoot, BasePath: "/app/tad-module", Logger: logger, History: history, LogPath: *logPath}
 		done <- server.ListenAndServe()
 	}()
+	// 日志大小清理：独立于历史数据库大小上限（log.max_size_mb，默认 16MB），
+	// 超限后内容另存 .1 并就地截断。读取走 manager 的实时配置，用户改上限
+	// 后最迟一个检查周期生效。
+	if logFile != nil {
+		go powerguard.LogRotateLoop(ctx, logger, *logPath, logFile, manager.LogLimitBytes)
+	}
 	go reapplyLoop(ctx, manager, logger)
 	go fanLoop(ctx, manager, logger)
 	go storageLoop(ctx, manager, logger)
 	go storageActivityLoop(ctx, manager)
 	go gpioLoop(ctx, manager, logger)
+	// USB 串口温度传感器读取器：未配置时内部低频空转，常驻无副作用
+	go manager.SerialSensorLoop(ctx, logger)
+	// USB HID 温度计（TEMPer 家族）：锁外后台读取 + 缓存（阻塞 IO 不进
+	// /api/status 持锁路径），启动探测随行
+	manager.ProbeUSBTemperatureSensors(logger)
+	go manager.USBTemperatureLoop(ctx, logger)
 
 	select {
 	case <-ctx.Done():
