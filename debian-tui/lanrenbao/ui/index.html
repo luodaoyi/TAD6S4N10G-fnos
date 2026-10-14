@@ -214,8 +214,8 @@
                 </tbody>
               </table>
             </div>
-            <p id="gpio-status" class="inline-status">按键映射默认关闭。</p>
-            <p class="notice">短按不会触发动作；达到长按阈值时会尝试蜂鸣并闪灯确认，松开后执行对应动作。自定义脚本由插件服务以 root 运行，单次最长 30 秒并限制日志输出。请只保存你完全信任的脚本。</p>
+            <p id="gpio-status" class="inline-status">按键映射默认启用。</p>
+            <p class="notice">本页三列只绑长按 3/9/15 秒；短按（按一下，松开即执行）要在主面板（Web 界面的「按钮控制」）里配置，这里改不了。每次按键确认或触发时都会通过 Linux PC Speaker 滴滴滴响 3 声、并让复制键 LED 闪 3 下。自定义脚本由插件服务以 root 运行，单次最长 30 秒并限制日志输出。请只保存你完全信任的脚本。</p>
           </section>
           <section class="card gpio-scripts-panel" aria-labelledby="gpio-scripts-heading">
             <div class="panel-heading">

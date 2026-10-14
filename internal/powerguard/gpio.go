@@ -26,6 +26,7 @@ const (
 	GPIOActionRefreshStorage = "refresh_storage"
 	GPIOActionSMARTCheck     = "smart_check"
 	GPIOActionReapplyPlugin  = "reapply_plugin"
+	GPIOActionRefreshSDCard  = "refresh_sdcard"
 	GPIOActionScriptPrefix   = "script:"
 
 	gpioScriptMaxCount  = 32
@@ -62,11 +63,31 @@ type GPIOScript struct {
 }
 
 type GPIOConfig struct {
-	Version int                `json:"version"`
-	Enabled bool               `json:"enabled"`
-	Scripts []GPIOScript       `json:"scripts,omitempty"`
-	Buttons []GPIOButtonConfig `json:"buttons"`
+	Version int              `json:"version"`
+	Enabled bool             `json:"enabled"`
+	Scripts []GPIOScript     `json:"scripts,omitempty"`
+	Backups []GPIOBackupJob  `json:"backups,omitempty"` // 图形化配置的备份任务，动作 backup:<id> 引用（backup.go）
+	Autos   []GPIOAutoBackup `json:"autos,omitempty"`   // 自动备份规则（打标卷），动作 auto_backup:<id> 引用（backup_auto.go）
+	// AutoVolumes NAS 侧保存的打标卷记录（backup_auto.go）：设备拔掉后列表里仍能
+	// 看到它、并支持离线取消打标。由打标接口维护，保存按键配置时不允许前端覆盖
+	// （见 SaveGPIOConfig）——否则页面一保存就把记录抹掉。
+	AutoVolumes []AutoBackupVolumeRecord `json:"auto_volumes,omitempty"`
+	Buttons     []GPIOButtonConfig       `json:"buttons"`
+	// Migrations 记录已经应用过的一次性默认值补位（gpioDefaultsMigration*）。
+	// 有了它，用户手动把某个档位清成「无动作」之后不会被再次填回。
+	Migrations []string `json:"migrations,omitempty"`
+	// StorageNotify 是否在识别到新插入的存储设备时用蜂鸣器提示（见 storage_notify.go）。
+	// 指针类型是为了区分「用户关掉了」与「老配置里还没有这个字段」——后者必须
+	// 按默认（开启）处理，否则升级上来的机器会静默失去这个功能。
+	StorageNotify *bool `json:"storage_notify,omitempty"`
 }
+
+// StorageNotifyEnabled 报告存储设备插入提示音是否开启：字段缺省视为开启。
+func (config GPIOConfig) StorageNotifyEnabled() bool {
+	return config.StorageNotify == nil || *config.StorageNotify
+}
+
+func gpioBoolPointer(value bool) *bool { return &value }
 
 type GPIOButtonStatus struct {
 	ID         string `json:"id"`
@@ -93,6 +114,8 @@ type GPIOEvent struct {
 	Stage    string
 	Action   string
 	Script   *GPIOScript
+	Backup   *GPIOBackupJob
+	Auto     *GPIOAutoBackup
 	Kind     GPIOEventKind
 	Feedback *GPIOFeedbackPattern
 }
@@ -131,7 +154,7 @@ var gpioButtonSpecs = []gpioButtonSpec{
 var allowedGPIOActions = map[string]bool{
 	GPIOActionNone: true, GPIOActionLog: true,
 	GPIOActionRefreshStorage: true, GPIOActionSMARTCheck: true,
-	GPIOActionReapplyPlugin: true,
+	GPIOActionReapplyPlugin: true, GPIOActionRefreshSDCard: true,
 }
 
 type gpioButtonRuntime struct {
@@ -152,18 +175,161 @@ type gpioRuntime struct {
 	lastError string
 }
 
+// defaultGPIOShortActions 开箱即用的默认绑定：只给网络键的短按绑定「刷新SD卡」
+// ——这是换卡后读卡器认不出卡时最常用的一下；其余按键与档位一律无动作，留给用户
+// 自己决定（避免「按一下不知道会做什么」）。
+var defaultGPIOShortActions = map[string]string{
+	"network": GPIOActionRefreshSDCard,
+}
+
+const (
+	// gpioDefaultsMigrationRefreshSDCard 是「给网络键短按补上刷新SD卡」这一次性
+	// 迁移的标记名。只对确实还空着的档位生效，且只做一次。
+	gpioDefaultsMigrationRefreshSDCard = "network-short-sdcard"
+	// gpioDefaultsMigrationLegacyHold3S 是上一版的迁移标记：那一版把刷新SD卡写在
+	// 网络键长按 3 秒上。现在的推荐位置是短按，升级时要把这条由迁移写进去的
+	// 绑定收回来，免得同一个动作同时挂在两档上让人以为按错了。
+	gpioDefaultsMigrationLegacyHold3S = "network-hold3s-sdcard"
+)
+
 func DefaultGPIOConfig() GPIOConfig {
-	config := GPIOConfig{Version: gpioConfigVersion, Enabled: false}
+	config := GPIOConfig{Version: gpioConfigVersion, Enabled: true}
+	config.Migrations = []string{gpioDefaultsMigrationRefreshSDCard}
+	config.StorageNotify = gpioBoolPointer(true)
 	for _, spec := range gpioButtonSpecs {
+		short := defaultGPIOShortActions[spec.ID]
+		if short == "" {
+			short = GPIOActionNone
+		}
 		config.Buttons = append(config.Buttons, GPIOButtonConfig{
 			ID: spec.ID,
 			Actions: GPIOActions{
-				Short: GPIOActionNone, Hold3S: GPIOActionNone,
+				Short: short, Hold3S: GPIOActionNone,
 				Hold9S: GPIOActionNone, Hold15S: GPIOActionNone,
 			},
 		})
 	}
 	return config
+}
+
+// applyGPIORecommendedDefaults 给升级上来的老配置补上推荐默认值，只动「用户
+// 从来没配过」的档位，并用 Migrations 保证每个迁移只应用一次：用户把动作改回
+// 「无动作」是明确选择，不该被下次启动再填回去。
+func applyGPIORecommendedDefaults(config *GPIOConfig) bool {
+	if !config.Enabled {
+		// 按键映射整体关着，说明用户不打算用它，不要擅自写入动作。
+		return false
+	}
+	changed := relocateLegacyRefreshSDCard(config)
+	if gpioContainsString(config.Migrations, gpioDefaultsMigrationRefreshSDCard) {
+		return changed
+	}
+	config.Migrations = append(config.Migrations, gpioDefaultsMigrationRefreshSDCard)
+	for index := range config.Buttons {
+		button := &config.Buttons[index]
+		if !gpioActionIsEmpty(button.Actions.Short) {
+			continue
+		}
+		// 只要用户配过任意一档长按，就认为他在管理按键，不再插手。
+		if !gpioActionIsEmpty(button.Actions.Hold3S) || !gpioActionIsEmpty(button.Actions.Hold9S) ||
+			!gpioActionIsEmpty(button.Actions.Hold15S) {
+			continue
+		}
+		if recommended := defaultGPIOShortActions[button.ID]; recommended != "" {
+			button.Actions.Short = recommended
+			changed = true
+		}
+	}
+	return changed
+}
+
+// relocateLegacyRefreshSDCard 处理上一版留下的「网络键长按 3 秒＝刷新SD卡」。
+// 只有在本机确实带着旧迁移标记时才动手，而且只搬动仍然等于刷新SD卡的那一档
+// ——用户自己改成别的动作之后就不再认作我们的默认值。短按档位只在「空着」或
+// 「还挂着我方旧默认值（重新应用插件）」时才被占用，用户自己选的动作不受影响。
+//
+// 两个约束，缺一个都会反复改写用户的绑定：
+//   - 处理完就把旧标记摘掉：留着的话每次 normalizeConfig 都会再跑一遍，用户
+//     升级后自己把某个键的长按 3 秒设成刷新SD卡，保存时又被我们清掉；
+//   - 只动 network 键：旧版的默认值只写在网络键上，别的键出现刷新SD卡一定是
+//     用户自己设的，不能碰。
+func relocateLegacyRefreshSDCard(config *GPIOConfig) bool {
+	if !gpioContainsString(config.Migrations, gpioDefaultsMigrationLegacyHold3S) {
+		return false
+	}
+	kept := make([]string, 0, len(config.Migrations))
+	for _, value := range config.Migrations {
+		if value != gpioDefaultsMigrationLegacyHold3S {
+			kept = append(kept, value)
+		}
+	}
+	config.Migrations = kept
+	changed := true
+	for index := range config.Buttons {
+		button := &config.Buttons[index]
+		if button.ID != "network" || button.Actions.Hold3S != GPIOActionRefreshSDCard {
+			continue
+		}
+		button.Actions.Hold3S = GPIOActionNone
+		changed = true
+		if gpioActionIsEmpty(button.Actions.Short) || button.Actions.Short == GPIOActionReapplyPlugin {
+			button.Actions.Short = GPIOActionRefreshSDCard
+		}
+	}
+	return changed
+}
+
+func gpioContainsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
+// gpioConfigLooksUnconfigured 判断一份 GPIO 配置是否仍是「从未配置」的旧默认值：
+// 关闭状态且四个档位全部为 none。历史版本的默认值正是这个样子，升级时可以直接
+// 换成新的开箱即用默认值；只要用户动过任何一个档位就不再认为未配置。
+//
+// 除了档位，还要看用户可能留下的其他痕迹：迁移标记、自定义脚本、存储插入提示音
+// 开关。它们都说明「用户来过并做过选择」。漏判的后果很重——SaveGPIOConfig 会把
+// 这种配置整份换成 DefaultGPIOConfig()，于是用户主动关掉的按键映射被重新打开、
+// 保存过的脚本被删掉、关掉的提示音被重开。
+func gpioConfigLooksUnconfigured(config GPIOConfig) bool {
+	if config.Enabled || len(config.Migrations) > 0 || len(config.Scripts) > 0 ||
+		config.StorageNotify != nil ||
+		len(config.Backups) > 0 || len(config.Autos) > 0 || len(config.AutoVolumes) > 0 {
+		return false
+	}
+	for _, button := range config.Buttons {
+		actions := button.Actions
+		if !gpioActionIsEmpty(actions.Short) || !gpioActionIsEmpty(actions.Hold3S) ||
+			!gpioActionIsEmpty(actions.Hold9S) || !gpioActionIsEmpty(actions.Hold15S) {
+			return false
+		}
+	}
+	return len(config.Buttons) == 0 || len(config.Buttons) == len(gpioButtonSpecs)
+}
+
+// preserveGPIOUserData 把「用户自己攒下来、不属于按键档位」的内容原样搬到新配置
+// 上：脚本、备份任务、自动备份规则、打标卷记录，以及存储插入提示音的开关。
+// 迁移只负责补默认值，不该顺手把这些删掉。
+func preserveGPIOUserData(next, previous GPIOConfig) GPIOConfig {
+	next.Scripts = append([]GPIOScript(nil), previous.Scripts...)
+	next.Backups = append([]GPIOBackupJob(nil), previous.Backups...)
+	next.Autos = append([]GPIOAutoBackup(nil), previous.Autos...)
+	next.AutoVolumes = append([]AutoBackupVolumeRecord(nil), previous.AutoVolumes...)
+	if previous.StorageNotify != nil {
+		notify := *previous.StorageNotify
+		next.StorageNotify = &notify
+	}
+	return next
+}
+
+// gpioActionIsEmpty 把缺字段的空字符串和显式的 "none" 都视为「无动作」。
+func gpioActionIsEmpty(action string) bool {
+	return action == "" || action == GPIOActionNone
 }
 
 func validateGPIOConfig(config GPIOConfig) error {
@@ -192,6 +358,23 @@ func validateGPIOConfig(config GPIOConfig) error {
 		scripts[script.ID] = script
 		names[nameKey] = true
 	}
+	if err := validateGPIOBackups(config.Backups); err != nil {
+		return err
+	}
+	if err := validateGPIOAutoBackups(config.Autos); err != nil {
+		return err
+	}
+	if err := validateGPIOAutoVolumeRecords(config.AutoVolumes); err != nil {
+		return err
+	}
+	backups := make(map[string]bool, len(config.Backups))
+	for _, job := range config.Backups {
+		backups[job.ID] = true
+	}
+	autos := make(map[string]bool, len(config.Autos))
+	for _, rule := range config.Autos {
+		autos[rule.ID] = true
+	}
 	wanted := make(map[string]bool, len(gpioButtonSpecs))
 	for _, spec := range gpioButtonSpecs {
 		wanted[spec.ID] = true
@@ -205,9 +388,10 @@ func validateGPIOConfig(config GPIOConfig) error {
 			return fmt.Errorf("duplicate gpio button %q", button.ID)
 		}
 		seen[button.ID] = true
-		// Short is intentionally retained for decoding configurations written by
-		// earlier releases, but is never validated or executed.
+		// 短按（short）与三个长按档位一样参与校验和派发。早期版本曾把短按
+		// 静默丢弃（既不校验也不执行），导致「按一下没反应」，现已恢复。
 		for stage, action := range map[string]string{
+			"short":   button.Actions.Short,
 			"hold_3s": button.Actions.Hold3S,
 			"hold_9s": button.Actions.Hold9S, "hold_15s": button.Actions.Hold15S,
 		} {
@@ -218,6 +402,20 @@ func validateGPIOConfig(config GPIOConfig) error {
 						continue
 					}
 					return fmt.Errorf("gpio button %s stage %s references missing script %q", button.ID, stage, scriptID)
+				}
+				backupID, isBackup := gpioBackupIDFromAction(action)
+				if isBackup {
+					if backups[backupID] {
+						continue
+					}
+					return fmt.Errorf("gpio button %s stage %s references missing backup job %q", button.ID, stage, backupID)
+				}
+				autoID, isAuto := gpioAutoBackupIDFromAction(action)
+				if isAuto {
+					if autos[autoID] {
+						continue
+					}
+					return fmt.Errorf("gpio button %s stage %s references missing auto backup rule %q", button.ID, stage, autoID)
 				}
 				return fmt.Errorf("gpio button %s stage %s has unsupported action %q", button.ID, stage, action)
 			}
@@ -371,8 +569,23 @@ func (m *Manager) PollGPIO(config GPIOConfig, reader io.ReaderAt, now time.Time)
 			continue
 		}
 		state.lastAction = action
+		if stage == gpioStageShortPress {
+			// 短按没有按住期的阈值确认，在松开时补一次与长按一致的反馈，
+			// 保证「每次按键操作都闪 3 下 + 滴滴滴 3 声」。
+			pattern := gpioStandardFeedback()
+			events = append(events, GPIOEvent{
+				ButtonID: spec.ID,
+				Name:     spec.Name,
+				Duration: duration,
+				Stage:    stage,
+				Kind:     GPIOEventFeedback,
+				Feedback: &pattern,
+			})
+		}
 		event := GPIOEvent{ButtonID: spec.ID, Name: spec.Name, Duration: duration, Stage: stage, Action: action, Kind: GPIOEventAction}
 		event.Script = gpioScriptForAction(config, action)
+		event.Backup = gpioBackupForAction(config, action)
+		event.Auto = gpioAutoBackupForAction(config, action)
 		m.gpioRuntime.lastEvent = fmt.Sprintf("%s %s（%.1f 秒）→ %s", spec.Name, stage, duration.Seconds(), gpioActionDisplay(config, action))
 		events = append(events, event)
 	}
@@ -396,7 +609,8 @@ func gpioActionForDuration(actions GPIOActions, duration time.Duration) (string,
 	case duration >= 3*time.Second:
 		return "长按 3 秒", actions.Hold3S
 	default:
-		return "", GPIOActionNone
+		// 短按：按下后经过去抖、还没到 3 秒就松开
+		return gpioStageShortPress, actions.Short
 	}
 }
 
@@ -406,11 +620,23 @@ type gpioHoldConfirmation struct {
 	pattern GPIOFeedbackPattern
 }
 
+// 所有档位统一使用同一套确认反馈（闪 3 下 + 滴滴滴 3 声），与 RR 官方插件
+// tad6s4n10g 的 btnLed 3 / btnBeep 3 表现一致。
+const (
+	gpioFeedbackTones   = 3
+	gpioFeedbackFlashes = 3
+	gpioStageShortPress = "短按"
+)
+
+func gpioStandardFeedback() GPIOFeedbackPattern {
+	return GPIOFeedbackPattern{Tones: gpioFeedbackTones, Flashes: gpioFeedbackFlashes}
+}
+
 func gpioFeedbackForDuration(duration time.Duration, confirmed uint8) []gpioHoldConfirmation {
 	thresholds := []gpioHoldConfirmation{
-		{mask: 1 << 0, stage: "长按 3 秒", pattern: GPIOFeedbackPattern{Tones: 1, Flashes: 1}},
-		{mask: 1 << 1, stage: "长按 9 秒", pattern: GPIOFeedbackPattern{Tones: 2, Flashes: 2}},
-		{mask: 1 << 2, stage: "长按 15 秒", pattern: GPIOFeedbackPattern{Tones: 3, Flashes: 3}},
+		{mask: 1 << 0, stage: "长按 3 秒", pattern: gpioStandardFeedback()},
+		{mask: 1 << 1, stage: "长按 9 秒", pattern: gpioStandardFeedback()},
+		{mask: 1 << 2, stage: "长按 15 秒", pattern: gpioStandardFeedback()},
 	}
 	minimums := []time.Duration{3 * time.Second, 9 * time.Second, 15 * time.Second}
 	var result []gpioHoldConfirmation
@@ -438,9 +664,34 @@ func (m *Manager) ExecuteGPIOActionContext(ctx context.Context, event GPIOEvent)
 		m.RefreshStorage(true)
 	case GPIOActionReapplyPlugin:
 		err = m.ApplyCurrent()
+	case GPIOActionRefreshSDCard:
+		// 重新识别读卡器要等内核枚举，好几秒；按键轮询循环不能被它堵住，
+		// 所以放到后台跑，结束时用蜂鸣 + 闪灯回执。
+		if startErr := m.StartRefreshSDCard(); startErr != nil {
+			err = startErr
+		} else {
+			output = "正在刷新SD卡…"
+		}
 	default:
 		if _, isScript := gpioScriptIDFromAction(event.Action); isScript && event.Script != nil {
 			output, err = executeGPIOScript(ctx, event)
+		} else if job := event.Backup; job != nil {
+			// 备份在后台跑：按键应该立刻有响应，长任务不能把轮询循环堵住。
+			// 结束时会用蜂鸣 + 闪灯给出回执。
+			err = m.StartBackupJob(*job, false)
+			if err == nil {
+				output = fmt.Sprintf("已开始备份：%s", job.Name)
+			}
+		} else if rule := event.Auto; rule != nil {
+			// 自动备份同样在后台跑：扫描打标卷可能要处理多块盘。
+			err = m.StartAutoBackupJob(*rule, false)
+			if err == nil {
+				output = fmt.Sprintf("已开始自动备份：%s", rule.Name)
+			}
+		} else if _, isBackup := gpioBackupIDFromAction(event.Action); isBackup {
+			err = fmt.Errorf("备份任务不存在或已被删除：%s", event.Action)
+		} else if _, isAuto := gpioAutoBackupIDFromAction(event.Action); isAuto {
+			err = fmt.Errorf("自动备份规则不存在或已被删除：%s", event.Action)
 		} else {
 			err = fmt.Errorf("unsupported gpio action %q", event.Action)
 		}
@@ -569,6 +820,12 @@ func GPIOActionDisplay(action string) string {
 		if id, ok := gpioScriptIDFromAction(action); ok {
 			return "脚本 " + id
 		}
+		if id, ok := gpioBackupIDFromAction(action); ok {
+			return "备份 " + id
+		}
+		if id, ok := gpioAutoBackupIDFromAction(action); ok {
+			return "自动备份 " + id
+		}
 		return strings.TrimSpace(action)
 	}
 }
@@ -576,6 +833,12 @@ func GPIOActionDisplay(action string) string {
 func gpioActionDisplay(config GPIOConfig, action string) string {
 	if script := gpioScriptForAction(config, action); script != nil {
 		return "脚本：" + script.Name
+	}
+	if job := gpioBackupForAction(config, action); job != nil {
+		return "备份：" + job.Name
+	}
+	if rule := gpioAutoBackupForAction(config, action); rule != nil {
+		return "自动备份：" + rule.Name
 	}
 	return GPIOActionDisplay(action)
 }

@@ -2238,12 +2238,12 @@ func TestFanDebugTakeoverAndPercent(t *testing.T) {
 	if err := manager.SetFanDebugValue("it8613:hwmon3:fan1", 50, "percent"); err == nil {
 		t.Fatal("percent set must fail when the fan is not taken over")
 	}
-	// 接管 fan1:从当前转速无缝接管(102 → 40%),fan2 不受影响
+	// 接管 fan1:从曲线当前应用值接管(45°C → 50%),fan2 不受影响
 	if err := manager.SetFanDebugTakeover("it8613:hwmon3:fan1", true); err != nil {
 		t.Fatal(err)
 	}
-	if got := manager.fanDebugTakenOver["it8613:hwmon3:fan1"]; got != 63 {
-		t.Fatalf("takeover should start at curve-applied percent (63 for 45C), got %d", got)
+	if got := manager.fanDebugTakenOver["it8613:hwmon3:fan1"]; got != 50 {
+		t.Fatalf("takeover should start at curve-applied percent (50 for 45C), got %d", got)
 	}
 	if err := manager.SetFanDebugValue("it8613:hwmon3:fan1", 50, "percent"); err != nil {
 		t.Fatal(err)
@@ -2263,15 +2263,15 @@ func TestFanDebugTakeoverAndPercent(t *testing.T) {
 		t.Fatalf("taken-over fan must resist curve apply, pwm1=%s", got)
 	}
 	// 释放:立即回到曲线控制(测试环境有 coretemp 45°C → CPU 曲线 40-55 段
-	// 插值 63%,pwm = 63*255/100 ≈ 161)
+	// 插值 50%,pwm = 50*255/100 ≈ 128)
 	if err := manager.SetFanDebugTakeover("it8613:hwmon3:fan1", false); err != nil {
 		t.Fatal(err)
 	}
 	if err := manager.ApplyFanCurrent(); err != nil {
 		t.Fatal(err)
 	}
-	if got, _ := os.ReadFile(pwm1); strings.TrimSpace(string(got)) != "161" {
-		t.Fatalf("released fan should apply CPU curve for 45C (63 to 161), got %s", got)
+	if got, _ := os.ReadFile(pwm1); strings.TrimSpace(string(got)) != "128" {
+		t.Fatalf("released fan should apply CPU curve for 45C (50 to 128), got %s", got)
 	}
 }
 

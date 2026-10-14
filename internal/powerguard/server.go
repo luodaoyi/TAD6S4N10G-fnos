@@ -100,6 +100,17 @@ func (s *Server) ListenAndServe() error {
 	mux.HandleFunc("/api/config/log", s.handleLogConfig)
 	mux.HandleFunc("/api/log/clear", s.handleLogClear)
 	mux.HandleFunc("/api/log/export", s.handleLogExport)
+	mux.HandleFunc("/api/backup/status", s.handleBackupStatus)
+	mux.HandleFunc("/api/backup/volumes", s.handleBackupVolumes)
+	mux.HandleFunc("/api/backup/browse", s.handleBackupBrowse)
+	mux.HandleFunc("/api/backup/mkdir", s.handleBackupMkdir)
+	mux.HandleFunc("/api/backup/marker", s.handleBackupMarker)
+	mux.HandleFunc("/api/backup/alias", s.handleBackupAlias)
+	mux.HandleFunc("/api/backup/run", s.handleBackupRun)
+	mux.HandleFunc("/api/backup/auto", s.handleBackupAuto)
+	mux.HandleFunc("/api/backup/auto/marker", s.handleBackupAutoMarker)
+	mux.HandleFunc("/api/backup/auto/run", s.handleBackupAutoRun)
+	mux.HandleFunc("/api/gpio/refresh-sdcard", s.handleRefreshSDCard)
 	mux.HandleFunc("/api/fans/debug", s.handleFansDebug)
 	mux.HandleFunc("/api/fans/debug/takeover", s.handleFansDebugTakeover)
 	mux.HandleFunc("/api/fans/debug/pwm", s.handleFansDebugPWM)
@@ -652,6 +663,325 @@ func (s *Server) handleGPIOConfig(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.Manager.Status())
 }
 
+func (s *Server) handleBackupStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	if !isAdmin(r) {
+		writeError(w, http.StatusForbidden, "只有管理员可以查看备份状态")
+		return
+	}
+	writeJSON(w, http.StatusOK, s.Manager.BackupStatus())
+}
+
+// handleBackupVolumes 列出可选的卷（含可移动介质），供界面快捷选择。
+func (s *Server) handleBackupVolumes(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	if !isAdmin(r) {
+		writeError(w, http.StatusForbidden, "仅管理员可以浏览存储设备")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"volumes": s.Manager.ListBackupVolumes()})
+}
+
+// handleBackupBrowse 目录浏览：返回子目录/文件以及卷快捷入口，供「浏览…」用。
+func (s *Server) handleBackupBrowse(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	if !isAdmin(r) {
+		writeError(w, http.StatusForbidden, "仅管理员可以浏览文件系统")
+		return
+	}
+	result, err := s.Manager.BrowseBackupPath(r.URL.Query().Get("path"), r.URL.Query().Get("scope"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+// handleBackupMkdir 在浏览对话框里新建一个子目录（「新建文件夹」按钮）。
+// 与浏览一样受 scope 约束：默认只能在「位置」范围内创建，防止手写路径摸到系统目录。
+func (s *Server) handleBackupMkdir(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeConfigRequest(w, r) {
+		return
+	}
+	var request struct {
+		Path  string `json:"path"`
+		Name  string `json:"name"`
+		Scope string `json:"scope"`
+	}
+	if err := decodeConfigRequest(r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, "请求格式错误: "+err.Error())
+		return
+	}
+	result, err := s.Manager.CreateBackupDirectory(request.Path, request.Name, request.Scope)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+// handleBackupMarker 把「源标识文件」写进源位置（.tad-backup/source）。
+// 内容留空时自动生成并回传，用户不需要自己编。刻意只由用户点击触发：
+// 若在备份时自动补写，插错介质也会被写成「对的介质」，校验就失去意义了。
+func (s *Server) handleBackupMarker(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeConfigRequest(w, r) {
+		return
+	}
+	var request struct {
+		Job *GPIOBackupJob `json:"job"`
+	}
+	if err := decodeConfigRequest(r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, "请求格式错误: "+err.Error())
+		return
+	}
+	if request.Job == nil {
+		writeError(w, http.StatusBadRequest, "缺少备份任务配置")
+		return
+	}
+	marker, written, err := s.Manager.WriteBackupMarker(*request.Job)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"marker": marker, "path": written})
+}
+
+// handleBackupAlias 设置远程挂载的显示名（界面上「✎ 改显示名」用）。name 为空
+// 表示恢复系统命名。
+func (s *Server) handleBackupAlias(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeConfigRequest(w, r) {
+		return
+	}
+	var request struct {
+		MountPoint string `json:"mount_point"`
+		Name       string `json:"name"`
+	}
+	if err := decodeConfigRequest(r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, "请求格式错误: "+err.Error())
+		return
+	}
+	if request.MountPoint == "" {
+		writeError(w, http.StatusBadRequest, "缺少远程挂载路径")
+		return
+	}
+	if err := s.Manager.SetRemoteAlias(request.MountPoint, request.Name); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// handleBackupRun 立刻执行一次备份。请求可以给已保存任务的 job_id，也可以
+// 直接给完整的 job 定义（界面「试跑」用它验证尚未保存的草稿）。dry_run 走同步
+// 执行并把结果直接回给界面；正式运行转后台，前端轮询 /api/backup/status。
+func (s *Server) handleBackupRun(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeConfigRequest(w, r) {
+		return
+	}
+	var request struct {
+		JobID  string         `json:"job_id"`
+		Job    *GPIOBackupJob `json:"job"`
+		DryRun bool           `json:"dry_run"`
+	}
+	if err := decodeConfigRequest(r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, "请求格式错误: "+err.Error())
+		return
+	}
+	var job GPIOBackupJob
+	if request.Job != nil {
+		job = *request.Job
+		if err := validateGPIOBackupJob(job); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	} else {
+		saved, ok := s.Manager.BackupJobByID(strings.TrimSpace(request.JobID))
+		if !ok {
+			writeError(w, http.StatusNotFound, "备份任务不存在，请先保存任务配置")
+			return
+		}
+		job = saved
+	}
+	if request.DryRun {
+		result, err := s.Manager.RunBackupJobNow(r.Context(), job, true)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error(), "result": result})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+		return
+	}
+	if err := s.Manager.StartBackupJob(job, false); err != nil {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusAccepted, s.Manager.BackupStatus())
+}
+
+// handleBackupAuto 打标列表：当前插着的存储设备（含尚未打标的）+ 已打标但当前
+// 离线的设备记录（离线项可以在界面上取消打标，设备下次上线时自动清除标记）。
+func (s *Server) handleBackupAuto(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	if !isAdmin(r) {
+		writeError(w, http.StatusForbidden, "仅管理员可以查看自动备份状态")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"devices":    s.Manager.AutoBackupDevices(),
+		"marker_dir": BackupAutoMarkerDirName + "/" + BackupAutoMarkerFileName,
+		"status":     s.Manager.BackupStatus(),
+	})
+}
+
+// handleBackupAutoMarker 打标操作。action 取值：
+//
+//	mark            整卷打标（可带 alias 设置别名）
+//	sub_add         给卷内子目录打标（可累积多个）
+//	sub_remove      取消某个子目录的打标
+//	unmark          取消打标（删掉卷内打标目录）
+//	offline_unmark  离线取消打标（记下「下次上线自动清除」）
+//	rename          修改别名
+func (s *Server) handleBackupAutoMarker(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeConfigRequest(w, r) {
+		return
+	}
+	var request struct {
+		Action   string `json:"action"`
+		Path     string `json:"path"`
+		Identity string `json:"identity"`
+		Alias    string `json:"alias"`
+		Marked   *bool  `json:"marked"` // 兼容更早的前端：只有 marked 没有 action
+	}
+	if err := decodeConfigRequest(r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, "请求格式错误: "+err.Error())
+		return
+	}
+	action := strings.TrimSpace(request.Action)
+	if action == "" {
+		action = "mark"
+		if request.Marked != nil && !*request.Marked {
+			action = "unmark"
+		}
+	}
+	message := ""
+	switch action {
+	case "mark":
+		volume, err := s.Manager.MarkAutoBackupVolume(request.Path, request.Alias)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		message = fmt.Sprintf("已给 %s 整块卷打标", volume.displayName())
+	case "sub_add":
+		volume, sub, err := s.Manager.AddAutoBackupSub(request.Path)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		message = fmt.Sprintf("已给 %s 的 %s 目录打标", volume.displayName(), sub)
+	case "sub_remove":
+		volume, sub, err := s.Manager.RemoveAutoBackupSub(request.Path)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		message = fmt.Sprintf("已取消 %s 的 %s 目录打标", volume.displayName(), sub)
+	case "unmark":
+		volume, err := s.Manager.ClearAutoBackupMark(request.Path)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		message = fmt.Sprintf("已取消 %s 的打标", volume.displayName())
+	case "offline_unmark":
+		if err := s.Manager.ForgetAutoBackupVolume(request.Identity); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		message = "已取消打标：该设备下次插上时会自动清除标记"
+	case "offline_keep":
+		if err := s.Manager.CancelPendingAutoBackupClear(request.Identity); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		message = "已撤销：这块盘下次插上时不再清除打标"
+	case "rename":
+		volume, err := s.Manager.SetAutoBackupAlias(request.Path, request.Alias)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		message = fmt.Sprintf("%s 的别名已更新", volume.displayName())
+	default:
+		writeError(w, http.StatusBadRequest, "未知的打标操作: "+action)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"action":  action,
+		"message": message,
+		"devices": s.Manager.AutoBackupDevices(),
+		"status":  s.Manager.BackupStatus(),
+	})
+}
+
+// handleBackupAutoRun 立刻执行一次自动备份：给已保存规则的 rule_id，正式运行
+// 转后台（前端轮询 /api/backup/status），试跑同步返回每块打标卷的结果。
+func (s *Server) handleBackupAutoRun(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeConfigRequest(w, r) {
+		return
+	}
+	var request struct {
+		RuleID string          `json:"rule_id"`
+		Rule   *GPIOAutoBackup `json:"rule"`
+		DryRun bool            `json:"dry_run"`
+	}
+	if err := decodeConfigRequest(r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, "请求格式错误: "+err.Error())
+		return
+	}
+	var rule GPIOAutoBackup
+	if request.Rule != nil {
+		rule = *request.Rule
+		if err := validateGPIOAutoBackup(rule); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	} else {
+		saved, ok := s.Manager.AutoBackupRuleByID(strings.TrimSpace(request.RuleID))
+		if !ok {
+			writeError(w, http.StatusNotFound, "自动备份规则不存在，请先保存规则配置")
+			return
+		}
+		rule = saved
+	}
+	if request.DryRun {
+		result, err := s.Manager.RunAutoBackupJobNow(r.Context(), rule, true)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error(), "result": result})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+		return
+	}
+	if err := s.Manager.StartAutoBackupJob(rule, false); err != nil {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusAccepted, s.Manager.BackupStatus())
+}
+
 func (s *Server) authorizeConfigRequest(w http.ResponseWriter, r *http.Request) bool {
 	if r.Method != http.MethodPost {
 		methodNotAllowed(w)
@@ -669,6 +999,25 @@ func decodeConfigRequest(r *http.Request, target any) error {
 	dec := json.NewDecoder(io.LimitReader(r.Body, configRequestMaxBytes))
 	dec.DisallowUnknownFields()
 	return dec.Decode(target)
+}
+
+// handleRefreshSDCard 手动刷新一次 SD 卡（重新识别 USB 读卡器）。刷新要让内核
+// 重新枚举，通常几秒，所以同步执行完再把结果回给界面。
+func (s *Server) handleRefreshSDCard(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	if !isAdmin(r) {
+		writeError(w, http.StatusForbidden, "仅管理员可以刷新 SD 卡")
+		return
+	}
+	result, err := s.Manager.RunRefreshSDCard(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusConflict, map[string]any{"error": err.Error(), "result": result})
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
 }
 
 func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {

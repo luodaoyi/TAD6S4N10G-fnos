@@ -62,6 +62,59 @@ func TestPlayGPIOTonesWritesEVSNDToneWithoutSleeping(t *testing.T) {
 	}
 }
 
+// 提示音按编排逐声播放：两声之间要静默 gpioToneGap，且每声的记录时长取自编排。
+func TestPlayGPIOChimeFollowsSpec(t *testing.T) {
+	writer := &fakeFeedbackWriter{}
+	var slept []time.Duration
+	tones := []GPIOToneSpec{
+		{FrequencyHz: 880, DurationMS: 800},
+		{FrequencyHz: 1200, DurationMS: 150},
+	}
+	if err := playGPIOChime(writer, tones, func(duration time.Duration) { slept = append(slept, duration) }); err != nil {
+		t.Fatal(err)
+	}
+	// 每声两次写（开声 / 关声），两声共 4 次。
+	if len(writer.writes) != 4 {
+		t.Fatalf("got %d input events, want 4", len(writer.writes))
+	}
+	if got := binary.LittleEndian.Uint32(writer.writes[0][20:24]); got != 880 {
+		t.Fatalf("第一声频率 = %d，应为 880", got)
+	}
+	if got := binary.LittleEndian.Uint32(writer.writes[2][20:24]); got != 1200 {
+		t.Fatalf("第二声频率 = %d，应为 1200", got)
+	}
+	if got := binary.LittleEndian.Uint32(writer.writes[1][20:24]); got != 0 {
+		t.Fatalf("第一声应当被关掉，实际 %d", got)
+	}
+	wantSlept := []time.Duration{800 * time.Millisecond, gpioToneGap, 150 * time.Millisecond}
+	if len(slept) != len(wantSlept) {
+		t.Fatalf("静默次数 = %v，应为 %v", slept, wantSlept)
+	}
+	for i, want := range wantSlept {
+		if slept[i] != want {
+			t.Fatalf("第 %d 段静默 = %v，应为 %v", i, slept[i], want)
+		}
+	}
+	if err := playGPIOChime(writer, nil, func(time.Duration) {}); err != nil {
+		t.Fatalf("空编排应当直接返回: %v", err)
+	}
+}
+
+// 非法参数回落到与按键反馈一致的默认值，别让一个坏参数把整段提示音弄哑。
+func TestPlayGPIOChimeFallsBackToDefaults(t *testing.T) {
+	writer := &fakeFeedbackWriter{}
+	var slept []time.Duration
+	if err := playGPIOChime(writer, []GPIOToneSpec{{}}, func(duration time.Duration) { slept = append(slept, duration) }); err != nil {
+		t.Fatal(err)
+	}
+	if got := binary.LittleEndian.Uint32(writer.writes[0][20:24]); got != gpioFeedbackToneHz {
+		t.Fatalf("频率应回落到 %d，实际 %d", gpioFeedbackToneHz, got)
+	}
+	if len(slept) != 1 || slept[0] != gpioToneDuration {
+		t.Fatalf("时长应回落到 %v，实际 %v", gpioToneDuration, slept)
+	}
+}
+
 func TestFlashGPIOLEDPreservesOtherBitsAndRestoresOriginalValue(t *testing.T) {
 	port := &fakeFeedbackPort{value: 0b1010_0110}
 	if err := flashGPIOLED(port, 2, func(time.Duration) {}); err != nil {

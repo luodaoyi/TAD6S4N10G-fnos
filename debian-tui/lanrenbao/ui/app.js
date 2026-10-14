@@ -1431,7 +1431,7 @@ function render(status, keepInputs = false) {
   renderFanHardwareWarning(fanStatus);
   $('gpio-status').textContent = gpioStatus.enabled
     ? (gpioStatus.available ? `监听中${gpioStatus.last_event ? ` · 最近：${gpioStatus.last_event}` : ''}` : `已启用但不可用：${gpioStatus.last_error || '无法读取 /dev/port'}`)
-    : (gpioStatus.available ? '硬件接口可用，按键映射尚未启用。' : '按键映射默认关闭。');
+    : (gpioStatus.available ? '硬件接口可用，按键映射尚未启用。' : '未检测到 GPIO 硬件接口。');
   $('gpio-status').className = `inline-status${gpioStatus.enabled && (!gpioStatus.available || gpioStatus.last_error) ? ' error' : ''}`;
   const issues = healthIssues(status, fanStatus, storageStatus, gpioStatus);
   const healthy = issues.length === 0;

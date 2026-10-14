@@ -33,7 +33,7 @@
       } catch (error) { /* localStorage 不可用时跟随系统 */ }
     })();
   </script>
-  <link rel="stylesheet" href="styles.css?v=0.10.19-t5-t5">
+  <link rel="stylesheet" href="styles.css?v=0.10.38">
   <script>
     // 样式自愈：升级包后浏览器可能仍持有带长缓存的远古样式表（无 CSS 变量，
     // 表现为图表坐标线消失、文字变黑、主题切换无反应）。绕过缓存拉取服务端
@@ -147,7 +147,7 @@
           <section class="card fan-editor" aria-labelledby="fan-heading">
             <div class="panel-heading fan-heading">
               <div>
-                <h2 id="fan-heading">CPU、HDD 与 NVMe 三温控曲线</h2>
+                <h2 id="fan-heading">HDD/SATA、NVMe 与 CPU 三温控曲线</h2>
                 <p>三条曲线分别计算目标转速，始终采用较高值；传感器异常或达到紧急温度时自动满速。</p>
               </div>
               <label class="toggle"><input id="fan-enabled" type="checkbox"><span></span>启用风扇曲线</label>
@@ -158,7 +158,7 @@
               <label class="field">
                 <span>最低转速</span>
                 <div class="input-wrap"><input id="fan-min" type="number" min="30" max="100" step="1" required><b>%</b></div>
-                <small>为防止停转，最低允许 30%</small>
+                <small>默认 40%；为防止停转，最低允许 30%</small>
               </label>
               <label class="field">
                 <span>紧急满速温度</span>
@@ -173,29 +173,42 @@
             </div>
 
             <div class="curve-tabs" role="tablist" aria-label="温控曲线编辑器切换">
-              <button id="curve-tab-cpu" type="button" class="curve-tab" role="tab" aria-selected="true" aria-controls="cpu-curve-editor">CPU</button>
-              <button id="curve-tab-hdd" type="button" class="curve-tab" role="tab" aria-selected="false" aria-controls="disk-curve-editor">HDD/SATA</button>
+              <button id="curve-tab-hdd" type="button" class="curve-tab" role="tab" aria-selected="true" aria-controls="disk-curve-editor">HDD/SATA</button>
               <button id="curve-tab-nvme" type="button" class="curve-tab" role="tab" aria-selected="false" aria-controls="nvme-curve-editor">NVMe</button>
+              <button id="curve-tab-cpu" type="button" class="curve-tab" role="tab" aria-selected="false" aria-controls="cpu-curve-editor">CPU</button>
+            </div>
+
+            <div class="curve-presets" role="group" aria-label="预设曲线模式与曲线导出">
+              <span class="curve-presets-label">曲线模式</span>
+              <button id="curve-preset-quiet" type="button" class="curve-preset">静音</button>
+              <button id="curve-preset-balanced" type="button" class="curve-preset">平衡</button>
+              <button id="curve-preset-performance" type="button" class="curve-preset">性能</button>
+              <span class="curve-presets-hint">点一下即替换三条曲线的全部节点，之后仍需点“保存风扇控制”才会生效</span>
+              <button id="curve-export" type="button" class="curve-export">导出曲线参数</button>
+            </div>
+
+            <div class="curve-presets curve-slots" role="group" aria-label="自定义曲线槽位">
+              <span class="curve-presets-label">自定义曲线</span>
+              <span class="curve-slot">
+                <button id="curve-custom-1" type="button" class="curve-slot-load">自定义 1</button>
+                <button id="curve-custom-1-save" type="button" class="curve-slot-mini" title="把当前三条曲线存进自定义 1">存</button>
+                <button id="curve-custom-1-export" type="button" class="curve-slot-mini" title="把自定义 1 的曲线导出成 JSON 文件">导</button>
+              </span>
+              <span class="curve-slot">
+                <button id="curve-custom-2" type="button" class="curve-slot-load">自定义 2</button>
+                <button id="curve-custom-2-save" type="button" class="curve-slot-mini" title="把当前三条曲线存进自定义 2">存</button>
+                <button id="curve-custom-2-export" type="button" class="curve-slot-mini" title="把自定义 2 的曲线导出成 JSON 文件">导</button>
+              </span>
+              <span class="curve-slot">
+                <button id="curve-custom-3" type="button" class="curve-slot-load">自定义 3</button>
+                <button id="curve-custom-3-save" type="button" class="curve-slot-mini" title="把当前三条曲线存进自定义 3">存</button>
+                <button id="curve-custom-3-export" type="button" class="curve-slot-mini" title="把自定义 3 的曲线导出成 JSON 文件">导</button>
+              </span>
+              <span class="curve-presets-hint">「存」＝把当前三条曲线记进槽位，「导」＝单独导出该槽位；槽位保存在本浏览器，导出成 JSON 即可备份或换机搬用</span>
             </div>
 
             <div class="curve-editors">
-              <section id="cpu-curve-editor" class="curve-editor" role="tabpanel" aria-labelledby="cpu-curve-heading" data-curve-kind="cpu">
-                <div class="curve-editor-heading">
-                  <h3 id="cpu-curve-heading">CPU 温度曲线</h3>
-                  <span>读取 coretemp 最高值</span>
-                </div>
-                <svg id="fan-curve-chart" class="curve-chart" viewBox="0 0 640 260" role="application" tabindex="0" aria-label="可拖拽的 CPU 温控曲线" aria-describedby="curve-help"></svg>
-                <div class="curve-toolbar">
-                  <div class="curve-actions">
-                    <button id="curve-add" type="button">+ 增加节点</button>
-                    <button id="curve-remove" type="button">删除选中节点</button>
-                  </div>
-                  <strong id="curve-selected">—</strong>
-                </div>
-                <fieldset class="curve-fan-selector"><legend>CPU 曲线控制的风扇</legend><div id="cpu-fan-options" class="curve-fan-options"></div></fieldset>
-                <p id="curve-help">拖动圆点调整 CPU 温度和转速；支持 2–8 个节点，也可使用方向键微调。</p>
-              </section>
-              <section id="disk-curve-editor" class="curve-editor" role="tabpanel" aria-labelledby="disk-curve-heading" data-curve-kind="hdd" hidden>
+              <section id="disk-curve-editor" class="curve-editor" role="tabpanel" aria-labelledby="disk-curve-heading" data-curve-kind="hdd">
                 <div class="curve-editor-heading">
                   <h3 id="disk-curve-heading">HDD/SATA 温度曲线</h3>
                   <span>取已勾选前置仓的最高温度</span>
@@ -237,8 +250,24 @@
                 </fieldset>
                 <p id="nvme-curve-help">默认沿用硬盘温控阈值，可独立拖拽调整；温度来自四个 M.2 槽位。</p>
               </section>
+              <section id="cpu-curve-editor" class="curve-editor" role="tabpanel" aria-labelledby="cpu-curve-heading" data-curve-kind="cpu" hidden>
+                <div class="curve-editor-heading">
+                  <h3 id="cpu-curve-heading">CPU 温度曲线</h3>
+                  <span>读取 coretemp 最高值</span>
+                </div>
+                <svg id="fan-curve-chart" class="curve-chart" viewBox="0 0 640 260" role="application" tabindex="0" aria-label="可拖拽的 CPU 温控曲线" aria-describedby="curve-help"></svg>
+                <div class="curve-toolbar">
+                  <div class="curve-actions">
+                    <button id="curve-add" type="button">+ 增加节点</button>
+                    <button id="curve-remove" type="button">删除选中节点</button>
+                  </div>
+                  <strong id="curve-selected">—</strong>
+                </div>
+                <fieldset class="curve-fan-selector"><legend>CPU 曲线控制的风扇</legend><div id="cpu-fan-options" class="curve-fan-options"></div></fieldset>
+                <p id="curve-help">拖动圆点调整 CPU 温度和转速；支持 2–8 个节点，也可使用方向键微调。</p>
+              </section>
             </div>
-            <p class="notice curve-notice">最终转速 = CPU、HDD/SATA 与 NVMe 三条曲线目标的最高值；某类盘温暂不可用时，该曲线不参与控制。</p>
+            <p class="notice curve-notice">最终转速 = HDD/SATA、NVMe 与 CPU 三条曲线目标的最高值；某类盘温暂不可用时，该曲线不参与控制。</p>
           </section>
           <div class="actions app-actions">
             <button id="save-fan" type="button" class="primary">保存风扇控制</button>
@@ -301,22 +330,34 @@
             <div class="panel-heading gpio-heading">
               <div>
                 <h2 id="gpio-heading">机箱按键映射</h2>
-                <p>固定读取主板 GPIO：复制键 0xA04/bit6、网络键 0xA00/bit3、后置重置键 0xA03/bit6；长按 3/9/15 秒可独立绑定内置动作或自定义 Bash 脚本。</p>
+                <p>固定读取主板 GPIO：复制键 0xA04/bit6、网络键 0xA00/bit3、后置重置键 0xA03/bit6（已实测核对）；每个按键的短按与长按 3/9/15 秒都可独立绑定内置动作或自定义 Bash 脚本。</p>
               </div>
               <label class="toggle"><input id="gpio-enabled" type="checkbox"><span></span>启用按键映射</label>
             </div>
             <div class="table-scroll">
               <table class="status-table gpio-table">
-                <thead><tr><th>按键</th><th>长按 3 秒</th><th>长按 9 秒</th><th>长按 15 秒</th></tr></thead>
+                <thead><tr><th>按键</th><th>短按（按一下）</th><th>长按 3 秒</th><th>长按 9 秒</th><th>长按 15 秒</th></tr></thead>
                 <tbody>
-                  <tr data-button="copy"><th data-label="按键"><span class="button-name"><img src="images/panel/复制按键.svg" alt="">复制按键</span></th><td data-label="长按 3 秒"><select class="gpio-action" data-stage="hold_3s"></select></td><td data-label="长按 9 秒"><select class="gpio-action" data-stage="hold_9s"></select></td><td data-label="长按 15 秒"><select class="gpio-action" data-stage="hold_15s"></select></td></tr>
-                  <tr data-button="network"><th data-label="按键"><span class="button-name"><img src="images/panel/网络按键.svg" alt="">网络按键</span></th><td data-label="长按 3 秒"><select class="gpio-action" data-stage="hold_3s"></select></td><td data-label="长按 9 秒"><select class="gpio-action" data-stage="hold_9s"></select></td><td data-label="长按 15 秒"><select class="gpio-action" data-stage="hold_15s"></select></td></tr>
-                  <tr data-button="rear_reset"><th data-label="按键"><span class="button-name"><img src="images/panel/RESET按键.svg" alt="">后置重置按键</span></th><td data-label="长按 3 秒"><select class="gpio-action" data-stage="hold_3s"></select></td><td data-label="长按 9 秒"><select class="gpio-action" data-stage="hold_9s"></select></td><td data-label="长按 15 秒"><select class="gpio-action" data-stage="hold_15s"></select></td></tr>
+                  <tr data-button="copy"><th data-label="按键"><span class="button-name"><img src="images/panel/复制按键.svg" alt="">复制按键</span></th><td data-label="短按（按一下）"><select class="gpio-action" data-stage="short"></select></td><td data-label="长按 3 秒"><select class="gpio-action" data-stage="hold_3s"></select></td><td data-label="长按 9 秒"><select class="gpio-action" data-stage="hold_9s"></select></td><td data-label="长按 15 秒"><select class="gpio-action" data-stage="hold_15s"></select></td></tr>
+                  <tr data-button="network"><th data-label="按键"><span class="button-name"><img src="images/panel/网络按键.svg" alt="">网络按键</span></th><td data-label="短按（按一下）"><select class="gpio-action" data-stage="short"></select></td><td data-label="长按 3 秒"><select class="gpio-action" data-stage="hold_3s"></select></td><td data-label="长按 9 秒"><select class="gpio-action" data-stage="hold_9s"></select></td><td data-label="长按 15 秒"><select class="gpio-action" data-stage="hold_15s"></select></td></tr>
+                  <tr data-button="rear_reset"><th data-label="按键"><span class="button-name"><img src="images/panel/RESET按键.svg" alt="">后置重置按键</span></th><td data-label="短按（按一下）"><select class="gpio-action" data-stage="short"></select></td><td data-label="长按 3 秒"><select class="gpio-action" data-stage="hold_3s"></select></td><td data-label="长按 9 秒"><select class="gpio-action" data-stage="hold_9s"></select></td><td data-label="长按 15 秒"><select class="gpio-action" data-stage="hold_15s"></select></td></tr>
                 </tbody>
               </table>
             </div>
-            <p id="gpio-status" class="inline-status">按键映射默认关闭。</p>
-            <p class="notice">短按不会触发动作；达到长按阈值时会尝试蜂鸣并闪灯确认，松开后执行对应动作。自定义脚本由插件服务以 root 运行，单次最长 30 秒并限制日志输出。请只保存你完全信任的脚本。</p>
+            <div class="actions app-actions gpio-save-row">
+              <button id="save-gpio" type="button" class="primary">保存按钮控制</button>
+            </div>
+            <p id="message-gpio" class="message" role="status" aria-live="polite"></p>
+            <div class="gpio-sdcard-row">
+              <button id="gpio-refresh-sdcard" type="button">刷新 SD 卡</button>
+              <span id="gpio-sdcard-status" class="inline-status" role="status" aria-live="polite">USB 读卡器换卡后迟迟认不出来时点这里（与按一下网络键同一个动作）。</span>
+            </div>
+            <div class="gpio-sdcard-row">
+              <label class="toggle"><input id="gpio-storage-notify" type="checkbox"><span></span>存储设备插入提示音</label>
+              <span id="gpio-storage-notify-status" class="inline-status" role="status" aria-live="polite">插入移动存储（U 盘 / 读卡器 / 移动硬盘）长响一次，插入内置存储（机箱里的 SATA / M.2 仓位）连续响两声。</span>
+            </div>
+            <p id="gpio-status" class="inline-status">按键映射默认开启；默认只有网络键的短按绑定「刷新 SD 卡」（换卡后读卡器认不出来时按一下），其余按键与档位默认无动作，按需自行绑定。</p>
+            <p class="notice">短按（按一下，松开即执行）与长按均会触发动作。每次按键确认或触发时，都会通过 Linux PC Speaker 滴滴滴响 3 声、并让复制键 LED 闪 3 下（与 RR 插件 tad6s4n10g 表现一致）；反馈设备不可用时只记录日志，不影响动作执行。自定义脚本由插件服务以 root 运行，单次最长 30 秒并限制日志输出。请只保存你完全信任的脚本。</p>
           </section>
           <section class="card gpio-scripts-panel" aria-labelledby="gpio-scripts-heading">
             <div class="panel-heading">
@@ -349,10 +390,211 @@
             <p id="gpio-script-message" class="inline-status" role="status" aria-live="polite"></p>
             <p class="notice script-risk-notice">高风险功能：脚本拥有 root 权限，可以修改或删除系统数据。插件只负责固定使用 Bash、限制执行时间和输出大小，不会分析脚本是否安全。</p>
           </section>
-          <div class="actions app-actions">
-            <button id="save-gpio" type="button" class="primary">保存按钮控制</button>
-          </div>
-          <p id="message-gpio" class="message" role="status" aria-live="polite"></p>
+          <section class="card gpio-backup-panel" aria-labelledby="gpio-backup-heading">
+            <div class="panel-heading">
+              <div>
+                <h2 id="gpio-backup-heading">备份任务</h2>
+                <p>点「浏览…」选好源和目标、挑一种复制方式即可，不用写脚本。保存后在上方按键下拉框里选“备份：任务名”，按一下按键就开始备份。</p>
+              </div>
+              <button id="backup-job-add" type="button" class="primary">+ 新增备份任务</button>
+            </div>
+            <div id="backup-job-list" class="backup-job-list"></div>
+
+            <div id="backup-job-editor" class="backup-job-editor" hidden>
+              <input id="backup-job-id" type="hidden">
+              <label class="field script-name-field">
+                <span>任务名称</span>
+                <input id="backup-job-name" class="text-input" type="text" maxlength="64" placeholder="例如：U 盘照片备份到硬盘" autocomplete="off">
+              </label>
+
+              <div class="backup-location">
+                <span class="backup-location-label">源（要备份的内容）</span>
+                <div class="backup-location-row">
+                  <input id="backup-job-source" class="text-input backup-path-input" type="text" readonly placeholder="尚未选择">
+                  <button id="backup-job-source-pick" type="button">浏览…</button>
+                  <button id="backup-job-source-volume" type="button">可移动卷</button>
+                  <button id="backup-job-source-clear" type="button" class="ghost">清除</button>
+                </div>
+                <p id="backup-job-source-hint" class="backup-hint"></p>
+              </div>
+
+              <div class="backup-location">
+                <span class="backup-location-label">目标（备份放到哪里）</span>
+                <div class="backup-location-row">
+                  <input id="backup-job-target" class="text-input backup-path-input" type="text" readonly placeholder="尚未选择">
+                  <button id="backup-job-target-pick" type="button">浏览…</button>
+                  <button id="backup-job-target-volume" type="button">可移动卷</button>
+                  <button id="backup-job-target-clear" type="button" class="ghost">清除</button>
+                </div>
+                <p id="backup-job-target-hint" class="backup-hint"></p>
+              </div>
+
+              <fieldset class="backup-mode">
+                <legend>复制方式</legend>
+                <label class="backup-mode-option" id="backup-job-mode-archive">
+                  <input type="radio" name="backup-mode" value="archive">
+                  <span><strong>按日期增量归档（硬链接增量）</strong><small>每次生成一个带时间戳的快照；没变化的文件用硬链接复用上一份，几乎不额外占用空间。源文件不动。</small></span>
+                </label>
+                <label class="backup-mode-option" id="backup-job-mode-move-archive">
+                  <input type="radio" name="backup-mode" value="move_archive">
+                  <span><strong>按日期转移归档（复制后清空源）</strong><small>在目标下建一个日期目录，把源文件复制进去之后删除源里的文件。适合「导入到 NAS 后清空来源」。</small></span>
+                </label>
+                <label class="field backup-keep-field backup-mode-keep" id="backup-job-keep-row" hidden>
+                  <span>归档保留份数（0 = 不限）</span>
+                  <input id="backup-job-keep" class="text-input" type="number" min="0" max="1000" step="1" value="0">
+                </label>
+                <label class="backup-mode-option">
+                  <input type="radio" name="backup-mode" value="sync">
+                  <span><strong>同步文件</strong><small>让目标与源完全一致，目标里多出来的文件会被删除。源文件不动。</small></span>
+                </label>
+                <label class="backup-mode-option">
+                  <input type="radio" name="backup-mode" value="copy">
+                  <span><strong>直接复制覆盖</strong><small>把源里的内容复制进目标；同名文件覆盖。目标中多出来的文件原样保留。</small></span>
+                </label>
+                <label class="backup-mode-option">
+                  <input type="radio" name="backup-mode" value="move_overwrite">
+                  <span><strong>移动覆盖（复制后删源）</strong><small>复制成功后删除源里的文件；同名文件覆盖，目标中多出来的文件原样保留。</small></span>
+                </label>
+              </fieldset>
+
+              <div class="backup-options">
+                <label class="toggle backup-overwrite"><input id="backup-job-overwrite" type="checkbox" checked><span></span>覆盖目标中已存在的同名文件</label>
+              </div>
+              <p class="backup-hint" id="backup-job-mode-hint"></p>
+
+              <div class="field script-name-field">
+                <label class="toggle backup-marker-toggle"><input id="backup-job-marker-write" type="checkbox"><span></span>在源中创建标识文件</label>
+                <span>源介质标识（可选，用来确认没认错盘）</span>
+                <input id="backup-job-marker" class="text-input" type="text" maxlength="128" placeholder="留空＝不校验" autocomplete="off">
+              </div>
+              <p class="backup-hint" id="backup-marker-hint">
+                作用：在源介质里放一个名为 <code>.tad-backup/source</code> 的小文件，内容就是上面的标识。每次备份前会先核对它，对不上就拒绝执行，用来防止 U 盘/移动硬盘插错、或者换接口后挂载到别的路径时复制错盘。如果您的数据需要严谨对待那么请创建标识文件，否则：留空＝不校验。
+              </p>
+              <p class="backup-hint">
+                用法：<b>不需要自己写内容</b>。打开开关会自动生成一串随机标识并立刻写进源介质（标识文件不会被复制到备份里）。请务必在插着正确介质时打开，否则会把错误的盘标成「对的盘」。
+              </p>
+
+              <div class="script-editor-footer">
+                <span id="backup-job-message" class="inline-status" role="status" aria-live="polite"></span>
+                <div class="actions">
+                  <button id="backup-job-test" type="button">试跑</button>
+                  <button id="backup-job-cancel" type="button">取消</button>
+                  <button id="backup-job-commit" type="button" class="primary">保存任务</button>
+                </div>
+              </div>
+            </div>
+
+            <p id="backup-status" class="inline-status" role="status" aria-live="polite"></p>
+            <p class="notice">备份由系统 rsync 执行、以 root 运行。正式运行前建议先点「试跑」，它会只列出将要复制的文件而不真正写入。</p>
+          </section>
+          <section class="card gpio-backup-panel" aria-labelledby="auto-backup-heading">
+            <div class="panel-heading">
+              <div>
+                <h2 id="auto-backup-heading">自动备份（打标卷）</h2>
+                <p>给 U 盘 / 移动硬盘打标（记录在卷内的 <code>.tad-backup/mark.json</code> 里），再建一条规则绑定到按键。按键按下后自动扫描当前插着的<b>所有打标设备</b>逐个执行——同一个按键可以服务任意多块盘，不用为每块盘单独建任务。</p>
+              </div>
+              <button id="auto-backup-add" type="button" class="primary">+ 新增自动备份规则</button>
+            </div>
+
+            <div class="auto-marker-bar">
+              <button id="auto-backup-marker-pick" type="button">给整块卷打标…</button>
+              <button id="auto-backup-sub-pick" type="button">给子目录打标…</button>
+              <button id="auto-backup-marker-refresh" type="button">刷新列表</button>
+            </div>
+            <p class="backup-hint">
+              打标只写在卷内的 <code>.tad-backup/</code> 目录里，不会往卷根丢文件。选卷内任意目录即可认定这块盘；
+              <b>整块卷打标</b>＝整块盘参与，<b>子目录打标</b>可以给多个子目录分别打标（例如 DCIM、VIDEO），之后只操作这些子目录的内容，
+              导入 NAS 时保留目录名（<code>目标/DCIM/…</code>）。              打标时填个<b>别名</b>，列表里一眼就能认出是哪块盘。
+              移动类模式（移动覆盖 / 按日期转移归档）在「打标卷 → NAS」方向可直接使用；
+              反过来（NAS → 打标卷）会删除 NAS 上的源文件，需要逐条勾选确认，并且每次只作用于一块打标盘。
+            </p>
+
+            <div id="auto-backup-devices" class="auto-device-list"></div>
+
+            <div id="auto-backup-list" class="backup-job-list"></div>
+
+            <div id="auto-backup-editor" class="backup-job-editor" hidden>
+              <input id="auto-backup-id" type="hidden">
+              <label class="field script-name-field">
+                <span>规则名称</span>
+                <input id="auto-backup-name" class="text-input" type="text" maxlength="64" placeholder="例如：相机卡导入" autocomplete="off">
+              </label>
+
+              <fieldset class="backup-mode">
+                <legend>方向</legend>
+                <label class="backup-mode-option">
+                  <input type="radio" name="auto-backup-direction" value="from_volume">
+                  <span><strong>打标卷 → NAS</strong><small>把打标盘里的资料导入 NAS；配合「按日期转移归档」可在导入后自动清空 U 盘。</small></span>
+                </label>
+                <label class="backup-mode-option">
+                  <input type="radio" name="auto-backup-direction" value="to_volume">
+                  <span><strong>NAS → 打标卷</strong><small>把 NAS 上选定的目录备份进打标盘（卷内目标子目录不存在时会自动创建）。选移动类模式会删除 NAS 上的源文件，需要勾选确认。</small></span>
+                </label>
+              </fieldset>
+
+              <div class="backup-location">
+                <span class="backup-location-label" id="auto-backup-fixed-label">NAS 侧目标（导入到哪里）</span>
+                <div class="backup-location-row">
+                  <input id="auto-backup-fixed" class="text-input backup-path-input" type="text" readonly placeholder="尚未选择">
+                  <button id="auto-backup-fixed-pick" type="button">浏览…</button>
+                  <button id="auto-backup-fixed-clear" type="button" class="ghost">清除</button>
+                </div>
+                <p id="auto-backup-fixed-hint" class="backup-hint"></p>
+              </div>
+
+              <label class="field backup-keep-field" id="auto-backup-sub-field" hidden>
+                <span>打标卷内目标子目录（可选，留空 = 卷根）</span>
+                <input id="auto-backup-sub" class="text-input" type="text" maxlength="256" placeholder="例如 DCIM" autocomplete="off">
+              </label>
+              <p class="backup-hint" id="auto-backup-sub-hint">「打标卷 → NAS」方向的卷内范围由<b>打标时标记的子目录</b>决定（整卷打标就是整块卷），这里不用填。</p>
+
+              <fieldset class="backup-mode">
+                <legend>复制方式</legend>
+                <label class="backup-mode-option" id="auto-backup-mode-archive">
+                  <input type="radio" name="auto-backup-mode" value="archive">
+                  <span><strong>按日期增量归档（硬链接增量）</strong><small>每次生成一个带时间戳的快照；没变化的文件用硬链接复用上一份，几乎不额外占用空间。源文件不动。</small></span>
+                </label>
+                <label class="backup-mode-option" id="auto-backup-mode-move-archive">
+                  <input type="radio" name="auto-backup-mode" value="move_archive">
+                  <span><strong>按日期转移归档（复制后清空源）</strong><small>在目标下建一个日期目录，把源文件复制进去之后删除源里的文件。适合「导入到 NAS 后清空来源」。</small></span>
+                </label>
+                <label class="field backup-keep-field backup-mode-keep" id="auto-backup-keep-row" hidden>
+                  <span>归档保留份数（0 = 不限）</span>
+                  <input id="auto-backup-keep" class="text-input" type="number" min="0" max="1000" step="1" value="0">
+                </label>
+                <label class="backup-mode-option">
+                  <input type="radio" name="auto-backup-mode" value="sync">
+                  <span><strong>同步文件</strong><small>让目标与源完全一致，目标里多出来的文件会被删除。源文件不动。</small></span>
+                </label>
+                <label class="backup-mode-option">
+                  <input type="radio" name="auto-backup-mode" value="copy">
+                  <span><strong>直接复制覆盖</strong><small>把源里的内容复制进目标；同名文件覆盖。目标中多出来的文件原样保留。</small></span>
+                </label>
+                <label class="backup-mode-option">
+                  <input type="radio" name="auto-backup-mode" value="move_overwrite">
+                  <span><strong>移动覆盖（复制后删源）</strong><small>复制成功后删除源里的文件；同名文件覆盖，目标中多出来的文件原样保留。</small></span>
+                </label>
+              </fieldset>
+
+              <div class="backup-options">
+                <label class="toggle backup-overwrite"><input id="auto-backup-overwrite" type="checkbox" checked><span></span>覆盖目标中已存在的同名文件</label>
+              </div>
+              <p class="backup-hint" id="auto-backup-mode-hint"></p>
+              <label class="toggle backup-danger-toggle" id="auto-backup-allow-move-field" hidden><input id="auto-backup-allow-move" type="checkbox"><span></span>我确认：这条规则可以删除 NAS 上的源文件</label>
+
+              <div class="script-editor-footer">
+                <span id="auto-backup-message" class="inline-status" role="status" aria-live="polite"></span>
+                <div class="actions">
+                  <button id="auto-backup-test" type="button">试跑</button>
+                  <button id="auto-backup-cancel" type="button">取消</button>
+                  <button id="auto-backup-commit" type="button" class="primary">保存规则</button>
+                </div>
+              </div>
+            </div>
+
+            <p id="auto-backup-status" class="inline-status" role="status" aria-live="polite"></p>
+            <p class="notice">两种移动模式只删除已被 rsync 确认复制成功的文件（复制成功一个删一个），中途出错时没传完的文件仍留在卷里；空目录结构会保留，盘还能继续用。</p>
+          </section>
         </section>
 
         <section id="panel-power" class="tab-panel" role="tabpanel" aria-labelledby="tab-power" hidden>
@@ -522,7 +764,7 @@
             </div>
             <div class="about-features">
               <article><h3>监控面板</h3><p>显示主机名称、系统版本、CPU 型号温度、风扇转速，以及硬盘位置、温度、活动和健康状态。</p></article>
-              <article><h3>风扇控制</h3><p>通过 CPU、HDD 和 NVMe 三条温度曲线智能调度散热，并支持按风扇独立选择温度来源。</p></article>
+              <article><h3>风扇控制</h3><p>通过 HDD、NVMe 和 CPU 三条温度曲线智能调度散热，并支持按风扇独立选择温度来源。</p></article>
               <article><h3>按键映射</h3><p>适配前置复制、网络按键和后置 RESET 孔，每个按键支持四种触发时长与自定义 Bash 脚本。</p></article>
               <article><h3>功耗设置</h3><p>提供节能、标准、性能和自定义功耗模式，直观限制 PL1 与 PL2 功耗墙。</p></article>
             </div>
@@ -552,6 +794,68 @@
       <button id="app-modal-close" type="button" class="primary" data-modal-close>关闭</button>
     </div>
   </div>
-  <script src="app.js?v=0.10.19-t5-t5" defer></script>
+  <div id="path-picker" class="app-modal path-picker-modal" hidden>
+    <div class="app-modal-backdrop" data-picker-close></div>
+    <div class="app-modal-dialog path-picker-dialog" role="dialog" aria-modal="true" aria-labelledby="path-picker-title">
+      <header class="path-picker-head">
+        <h3 id="path-picker-title">选择目录</h3>
+        <button id="path-picker-close" type="button" class="ghost" data-picker-close>关闭</button>
+      </header>
+      <nav id="path-picker-crumbs" class="path-picker-crumbs" aria-label="当前位置"></nav>
+      <div class="path-picker-body">
+        <aside id="path-picker-places" class="path-picker-places" aria-label="位置"></aside>
+        <div id="path-picker-entries" class="path-picker-entries" role="listbox" aria-label="目录内容"></div>
+      </div>
+      <p id="path-picker-warning" class="path-picker-warning" hidden></p>
+      <footer class="path-picker-foot">
+        <span id="path-picker-message" class="inline-status" role="status" aria-live="polite"></span>
+        <div class="actions">
+          <button id="path-picker-mkdir" type="button" class="ghost">新建文件夹</button>
+          <button id="path-picker-advanced" type="button" class="ghost">高级：原生目录模式</button>
+          <button id="path-picker-up" type="button">上一级</button>
+          <button id="path-picker-select" type="button" class="primary">选择当前目录</button>
+        </div>
+      </footer>
+    </div>
+  </div>
+
+  <div id="volume-picker" class="app-modal path-picker-modal" hidden>
+    <div class="app-modal-backdrop" data-volume-close></div>
+    <div class="app-modal-dialog path-picker-dialog" role="dialog" aria-modal="true" aria-labelledby="volume-picker-title">
+      <header class="path-picker-head">
+        <h3 id="volume-picker-title">选择可移动卷</h3>
+        <button id="volume-picker-close" type="button" class="ghost" data-volume-close>关闭</button>
+      </header>
+      <p class="backup-hint">任务会记住这个卷本身（卷标或 UUID）：以后不管插到哪个接口、系统挂载到哪个路径，都能自动找到它。</p>
+      <div id="volume-picker-list" class="path-picker-entries" role="listbox" aria-label="可移动卷"></div>
+      <label class="field backup-keep-field"><span>卷内子目录（可选）</span><input id="volume-picker-sub" class="text-input" type="text" maxlength="256" placeholder="留空表示整个卷，例如 DCIM" autocomplete="off"></label>
+      <footer class="path-picker-foot">
+        <span id="volume-picker-message" class="inline-status" role="status" aria-live="polite"></span>
+        <div class="actions">
+          <button id="volume-picker-refresh" type="button">刷新</button>
+          <button id="volume-picker-confirm" type="button" class="primary">使用该卷</button>
+        </div>
+      </footer>
+    </div>
+  </div>
+  <div id="app-confirm" class="app-modal confirm-modal" hidden>
+    <div class="app-modal-backdrop" data-confirm-close></div>
+    <div class="app-modal-dialog confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title">
+      <div class="confirm-head">
+        <div id="confirm-icon" class="confirm-icon" aria-hidden="true">!</div>
+        <h3 id="confirm-title">确认操作</h3>
+      </div>
+      <p id="confirm-message" class="confirm-message"></p>
+      <label id="confirm-input-row" class="confirm-input-row" hidden>
+        <span id="confirm-input-label"></span>
+        <input id="confirm-input" class="text-input" type="text" maxlength="64" autocomplete="off">
+      </label>
+      <footer class="confirm-actions">
+        <button id="confirm-cancel" type="button">取消</button>
+        <button id="confirm-ok" type="button" class="primary">确定</button>
+      </footer>
+    </div>
+  </div>
+  <script src="app.js?v=0.10.38" defer></script>
 </body>
 </html>

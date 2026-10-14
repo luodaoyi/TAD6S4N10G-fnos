@@ -74,6 +74,9 @@ type Config struct {
 	FanRPMBase     map[string]int         `json:"fan_rpm_base,omitempty"`  // 风扇满转基准（键为风扇 ID；全速运转时按实测自动标定，缺省 2000）
 	FanRPMMap      map[string]map[int]int `json:"fan_rpm_map,omitempty"`   // 风扇 PWM→转速特性表（键为风扇 ID,内层键为 16 步长 PWM 档位；稳态工况自动学习）
 	UIPrefs        UIPrefsConfig          `json:"ui_prefs"`                // 前端界面偏好（随 status 下发，独立小接口保存）
+	// RemoteAliases 远程挂载的显示名（键为挂载点，如 /vol02/1000-1-xxx）。云盘友好名
+	// 尽力从挂载进程推断，拿不到就靠用户手动改名；见 backup.go 的 SetRemoteAlias。
+	RemoteAliases map[string]string `json:"remote_aliases,omitempty"`
 }
 
 // UIPrefsConfig 纯界面偏好，与功能配置分开存放：历史/风扇等保存接口整段
@@ -208,6 +211,7 @@ type Status struct {
 	Storage           StorageStatus        `json:"storage"`
 	GPIO              GPIOStatus           `json:"gpio"`
 	Serial            SerialSensorInfo     `json:"serial"`
+	StorageNotify     StorageNotifyStatus  `json:"storage_notify"`
 	LastApply         time.Time            `json:"last_apply,omitempty"`
 	LastError         string               `json:"last_error,omitempty"`
 }
@@ -272,7 +276,15 @@ type Manager struct {
 	storageStatus StorageStatus
 	gpioMu        sync.Mutex
 	gpioRuntime   gpioRuntime
-	usbLastError  string // USB 温度计最近一次读取错误（变化才记日志），随 m.mu 保护
+	backupMu      sync.Mutex // 备份运行状态（backup_runner.go）
+	backupRun     backupRunState
+	sdcardMu      sync.Mutex // 刷新SD卡运行状态（sdcard.go）
+	sdcardRun     sdcardRunState
+	// 存储设备插入提示音（storage_notify.go）：前后两拍块设备快照的差分状态。
+	// 锁序固定在 m.mu 之后（MonitorStorageInserts 先放掉 m.mu 再拿它）。
+	storageNotifyMu sync.Mutex
+	storageNotify   storageNotifyState
+	usbLastError    string // USB 温度计最近一次读取错误（变化才记日志），随 m.mu 保护
 	// USB HID 温度计读数缓存（usb_temper.go）：读取是秒级阻塞 IO，只能在
 	// USBTemperatureLoop 里锁外做；extraTemperatures 只采信新鲜缓存。随 m.mu 保护。
 	usbTempReadings []usbTempReading
@@ -721,6 +733,10 @@ func (m *Manager) SaveGPIOConfig(gpio GPIOConfig) error {
 		m.lastError = err.Error()
 		return err
 	}
+	// 打标卷记录由打标接口（backup_auto.go）独占维护：前端保存按键配置时整段覆盖
+	// GPIO 配置，若不在这里保住，用户每点一次「保存按钮控制」都会把打标记录抹掉，
+	// 列表里的离线设备随之消失。
+	gpio.AutoVolumes = append([]AutoBackupVolumeRecord(nil), cfg.GPIO.AutoVolumes...)
 	cfg.GPIO = gpio
 	normalizeConfig(&cfg)
 	if err := validateGPIOConfig(cfg.GPIO); err != nil {
@@ -1155,6 +1171,7 @@ func (m *Manager) Status() Status {
 	status.FanControl = m.fanStatusLocked(status.Config.Fan)
 	status.Storage = m.StorageStatus()
 	status.GPIO = m.GPIOStatus(status.Config.GPIO)
+	status.StorageNotify = m.StorageInsertNotifyStatus(status.Config.GPIO.StorageNotifyEnabled())
 	return status
 }
 

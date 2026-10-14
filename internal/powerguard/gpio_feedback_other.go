@@ -12,3 +12,12 @@ func (m *Manager) PlayGPIOFeedback(event GPIOEvent) error {
 	}
 	return fmt.Errorf("%w: PC speaker and /dev/port feedback require linux/amd64", ErrGPIOFeedbackUnavailable)
 }
+
+// PlayStorageChime is unavailable outside linux/amd64 for the same reason as
+// PlayGPIOFeedback: it drives the PC speaker through /dev/input.
+func (m *Manager) PlayStorageChime(tones []GPIOToneSpec) error {
+	if len(tones) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%w: PC speaker feedback requires linux/amd64", ErrGPIOFeedbackUnavailable)
+}

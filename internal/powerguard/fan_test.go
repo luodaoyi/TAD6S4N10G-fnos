@@ -37,14 +37,14 @@ func TestDefaultFanConfigIsSafeAndDisabled(t *testing.T) {
 	if cfg.Enabled {
 		t.Fatal("fan control must be disabled by default")
 	}
-	if cfg.MinPWMPercent != 60 || cfg.EmergencyTempC != 85 || cfg.PollSeconds != 2 {
+	if cfg.MinPWMPercent != 40 || cfg.EmergencyTempC != 85 || cfg.PollSeconds != 2 {
 		t.Fatalf("unexpected defaults: %+v", cfg)
 	}
-	if len(cfg.Curve) != 4 || cfg.Curve[len(cfg.Curve)-1].PWMPercent != 100 {
+	if len(cfg.Curve) != 4 || cfg.Curve[0].PWMPercent != 40 || cfg.Curve[len(cfg.Curve)-1].PWMPercent != 100 {
 		t.Fatalf("unexpected default curve: %+v", cfg.Curve)
 	}
 	for name, curve := range map[string][]FanPoint{"HDD": cfg.HDDCurve, "NVMe": cfg.NVMeCurve} {
-		if len(curve) != 3 || curve[0].TempC != 25 || curve[0].PWMPercent != 60 || curve[1].TempC != 35 || curve[1].PWMPercent != 85 || curve[2].TempC != 50 || curve[2].PWMPercent != 100 {
+		if len(curve) != 3 || curve[0].TempC != 25 || curve[0].PWMPercent != 40 || curve[1].TempC != 35 || curve[1].PWMPercent != 85 || curve[2].TempC != 50 || curve[2].PWMPercent != 100 {
 			t.Fatalf("unexpected default %s curve: %+v", name, curve)
 		}
 	}
@@ -54,21 +54,22 @@ func TestDefaultFanConfigIsSafeAndDisabled(t *testing.T) {
 }
 
 func TestInterpolatePWMPercent(t *testing.T) {
-	curve := DefaultFanConfig().Curve
+	cfg := DefaultFanConfig()
+	curve := cfg.Curve
 	tests := []struct {
 		temp float64
 		want int
 	}{
-		{30, 60},
-		{40, 60},
-		{47.5, 65},
+		{30, 40},
+		{40, 40},
+		{47.5, 55},
 		{55, 70},
 		{70, 85},
 		{80, 100},
 		{85, 100},
 	}
 	for _, test := range tests {
-		if got := interpolatePWMPercent(curve, test.temp, 60, 85); got != test.want {
+		if got := interpolatePWMPercent(curve, test.temp, cfg.MinPWMPercent, cfg.EmergencyTempC); got != test.want {
 			t.Errorf("temperature %.1f: got %d%%, want %d%%", test.temp, got, test.want)
 		}
 	}
@@ -162,11 +163,75 @@ func TestNormalizeConfigMigratesFanDefaults(t *testing.T) {
 	if !normalizeConfig(&cfg) {
 		t.Fatal("legacy config was not migrated")
 	}
-	if cfg.Fan.Enabled || cfg.Fan.MinPWMPercent != 60 || len(cfg.Fan.Curve) != 4 || len(cfg.Fan.HDDCurve) != 3 || len(cfg.Fan.NVMeCurve) != 3 || len(cfg.Fan.HDDSlotIDs) != 6 || len(cfg.Fan.NVMeSlotIDs) != 4 {
+	if cfg.Fan.Enabled || cfg.Fan.MinPWMPercent != 40 || len(cfg.Fan.Curve) != 4 || len(cfg.Fan.HDDCurve) != 3 || len(cfg.Fan.NVMeCurve) != 3 || len(cfg.Fan.HDDSlotIDs) != 6 || len(cfg.Fan.NVMeSlotIDs) != 4 {
 		t.Fatalf("unexpected migrated fan config: %+v", cfg.Fan)
 	}
 	if normalizeConfig(&cfg) {
 		t.Fatal("normalized config was migrated a second time")
+	}
+}
+
+// 旧出厂默认（最低转速 60% + 三条曲线都从 60% 起）在升级时整体升到新默认；
+// 只要用户动过最低转速或任意一条曲线，就一个字都不改。
+func TestNormalizeConfigUpgradesUntouchedLegacyFanDefaults(t *testing.T) {
+	legacy := func() FanConfig {
+		return FanConfig{
+			Enabled:        false,
+			MinPWMPercent:  60,
+			EmergencyTempC: 85,
+			PollSeconds:    2,
+			Curve: []FanPoint{
+				{TempC: 40, PWMPercent: 60}, {TempC: 55, PWMPercent: 70},
+				{TempC: 70, PWMPercent: 85}, {TempC: 80, PWMPercent: 100},
+			},
+			HDDCurve:    legacyDefaultStorageCurve(),
+			NVMeCurve:   legacyDefaultStorageCurve(),
+			HDDSlotIDs:  storageSlotIDs("front"),
+			NVMeSlotIDs: storageSlotIDs("m2"),
+		}
+	}
+	// 先把 history/log 等无关段归一化，之后只看风扇段是否被动过
+	settle := func(fan FanConfig) Config {
+		cfg := Config{GPIO: DefaultGPIOConfig()}
+		normalizeConfig(&cfg)
+		cfg.Fan = fan
+		return cfg
+	}
+
+	cfg := settle(legacy())
+	if !normalizeConfig(&cfg) {
+		t.Fatal("未改动的旧默认风扇配置没有被升级")
+	}
+	if cfg.Fan.MinPWMPercent != 40 || cfg.Fan.Curve[0].PWMPercent != 40 || cfg.Fan.HDDCurve[0].PWMPercent != 40 || cfg.Fan.NVMeCurve[0].PWMPercent != 40 {
+		t.Fatalf("旧默认没有整体升到新默认: %+v", cfg.Fan)
+	}
+	if cfg.Fan.Curve[1].PWMPercent != 70 || cfg.Fan.Curve[len(cfg.Fan.Curve)-1].PWMPercent != 100 || cfg.Fan.HDDCurve[1].PWMPercent != 85 {
+		t.Fatalf("升级改动了曲线形态: %+v", cfg.Fan)
+	}
+	if normalizeConfig(&cfg) {
+		t.Fatal("升级后二次归一化不该再改")
+	}
+
+	// 只改过最低转速 → 曲线原样保留（不能被升级覆盖）
+	modified := legacy()
+	modified.MinPWMPercent = 55
+	cfg = settle(modified)
+	if normalizeConfig(&cfg) {
+		t.Fatal("改过最低转速的配置不该被升级")
+	}
+	if cfg.Fan.MinPWMPercent != 55 || cfg.Fan.Curve[0].PWMPercent != 60 {
+		t.Fatalf("用户配置被改动: %+v", cfg.Fan)
+	}
+
+	// 只改过一条曲线 → 最低转速也保持原样
+	modified = legacy()
+	modified.NVMeCurve = []FanPoint{{TempC: 30, PWMPercent: 60}, {TempC: 70, PWMPercent: 100}}
+	cfg = settle(modified)
+	if normalizeConfig(&cfg) {
+		t.Fatal("改过曲线的配置不该被升级")
+	}
+	if cfg.Fan.MinPWMPercent != 60 || cfg.Fan.Curve[0].PWMPercent != 60 {
+		t.Fatalf("用户配置被改动: %+v", cfg.Fan)
 	}
 }
 

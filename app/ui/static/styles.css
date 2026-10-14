@@ -284,6 +284,12 @@ input:focus-visible,
   margin-bottom: 12px;
 }
 
+/* 卡片右上角的新增按钮：固定尺寸、文字不换行、不被左侧说明挤压 */
+.panel-heading > button {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
 .panel-heading p,
 small {
   color: var(--muted);
@@ -1009,6 +1015,74 @@ body.modal-open { overflow: hidden; }
   color: #fff;
 }
 .curve-tab:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+
+/* 预设曲线模式（静音/平衡/性能）与「导出曲线参数」：与标签栏同一视觉语言，
+   三个胶囊按钮一组，导出按钮推到最右侧。窄屏整组换行。 */
+.curve-presets {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.curve-presets-label { color: var(--muted); font-size: 12px; font-weight: 700; }
+
+.curve-preset {
+  height: 28px;
+  padding: 0 14px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--text-body);
+  font-size: 12px;
+  font-weight: 620;
+  cursor: pointer;
+}
+
+.curve-preset:hover { border-color: var(--primary); color: var(--primary); }
+.curve-preset:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+
+.curve-presets-hint { color: var(--muted); font-size: 11px; }
+
+.curve-export { margin-left: auto; }
+
+/* 自定义曲线槽位：每槽 = 载入按钮 + 「存」「导」两个小按钮。
+   槽位有内容时载入按钮描边变主色，空槽位是普通样式。 */
+.curve-slots { margin-top: 8px; }
+
+.curve-slot { display: inline-flex; align-items: center; gap: 4px; }
+
+.curve-slot-load {
+  height: 28px;
+  padding: 0 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text-body);
+  font-size: 12px;
+  font-weight: 620;
+  cursor: pointer;
+}
+
+.curve-slot-load:hover { border-color: var(--primary); color: var(--primary); }
+.curve-slot-load.filled { border-color: var(--primary); color: var(--primary); background: var(--primary-soft); }
+.curve-slot-load:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+
+.curve-slot-mini {
+  height: 28px;
+  padding: 0 9px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 620;
+  cursor: pointer;
+}
+
+.curve-slot-mini:hover { border-color: var(--primary); color: var(--primary); }
+.curve-slot-mini:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
 /* 卡片自身未设 display，hidden 属性默认即生效；显式写出防未来样式回归 */
 .curve-editor[hidden] { display: none; }
 
@@ -1305,13 +1379,10 @@ body.modal-open { overflow: hidden; }
   min-width: 240px;
   max-width: 100%;
 }
-/* 值标签跟随拇指：--thumb-pct 由 JS 写入（CSS 变量，非 style 属性，CSP 安全），
-   translateX(-50%) 以标签自身宽度居中对准拇指；百分比由 JS 夹在 6%–94%，
-   标签不会溢出滑杆容器 */
+/* 值标签固定在滑杆正中上方：不跟随拇指左右移动，读数位置稳定、
+   拖到两端也不会溢出容器（align-self 让它在纵向 flex 里按内容宽度居中） */
 .history-range-value {
-  position: relative;
-  left: var(--thumb-pct, 92%);
-  transform: translateX(-50%);
+  align-self: center;
   white-space: nowrap;
   font-size: 12px;
   line-height: 1.4;
@@ -1476,12 +1547,23 @@ body.modal-open { overflow: hidden; }
 
 .curve-notice { margin-top: 12px; }
 
-.gpio-table { table-layout: fixed; }
-.gpio-table th:first-child,
+.gpio-table { table-layout: fixed; }.gpio-table th:first-child,
 .gpio-table td:first-child,
 .gpio-table tbody th { width: 132px; }
 .gpio-table select { min-width: 0; padding: 8px 10px; border-radius: 8px; font-size: 12px; }
 .gpio-table select:disabled { cursor: not-allowed; opacity: .55; }
+
+/* 刷新 SD 卡：不用跑到机器跟前按网络键的手动入口 */
+.gpio-sdcard-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin: 10px 0 6px;
+}
+
+.gpio-sdcard-row button { min-width: 120px; }
+.gpio-sdcard-row .inline-status { margin: 0; }
 
 .button-name {
   display: inline-flex;
@@ -1799,6 +1881,9 @@ body.modal-open { overflow: hidden; }
 }
 
 .app-actions { margin-top: 0; }
+
+/* 按键表格正下方的「保存按钮控制」：紧跟后置重置按键那一行，改完就能存 */
+.gpio-save-row { margin: 10px 0 2px; }
 
 button {
   height: 32px;
@@ -2134,3 +2219,650 @@ button.danger {
   font-weight: 650;
   white-space: nowrap;
 }
+
+/* ---------------------------------------------------------------------------
+   备份任务：图形化配置源/目标/复制方式（对应 internal/powerguard/backup.go）
+   --------------------------------------------------------------------------- */
+
+.gpio-backup-panel .panel-heading { align-items: center; }
+
+.backup-job-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.backup-job-card {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+}
+
+.backup-job-card strong {
+  display: block;
+  overflow: hidden;
+  color: var(--text-body);
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.backup-job-card .backup-job-flow {
+  margin: 6px 0 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.backup-job-card small {
+  display: block;
+  margin: 6px 0 10px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.backup-job-card .actions { gap: 6px; }
+.backup-job-card button { height: 28px; padding: 0 10px; font-size: 12px; }
+.backup-job-card .delete-script { color: var(--danger); border-color: #f0c9c6; background: #fff7f6; }
+
+.backup-job-editor {
+  display: grid;
+  gap: 14px;
+  margin-top: 12px;
+  padding: 14px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: var(--surface-soft);
+}
+
+.backup-job-editor[hidden] { display: none; }
+
+.backup-location { display: grid; gap: 6px; }
+
+.backup-location-label {
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.backup-location-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.backup-path-input {
+  flex: 1 1 220px;
+  min-width: 0;
+  background: var(--surface-muted);
+}
+
+.backup-hint {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: normal;
+}
+
+.backup-hint:empty { display: none; }
+
+.backup-hint code {
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: var(--surface-muted);
+  font-size: 11px;
+}
+
+.backup-mode {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding: 8px 12px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.backup-mode legend {
+  padding: 0 6px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.backup-mode-option {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  padding: 6px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.backup-mode-option:hover { background: var(--surface-muted); }
+.backup-mode-option input { margin: 3px 0 0; flex: 0 0 auto; }
+.backup-mode-option span { display: grid; gap: 2px; }
+
+.backup-mode-option strong { color: var(--text-body); font-size: 13px; }
+
+.backup-mode-option small {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.backup-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 18px;
+  align-items: flex-end;
+}
+
+.backup-keep-field { flex: 0 1 200px; }
+.backup-keep-field .text-input { width: 100%; }
+
+/* 归档保留份数：只在选中「归档」档位时出现，紧贴在该档位正下方（位置由 app.js 的
+   syncBackupKeepRow 决定）。文字与文本框排在同一行、尽量短；.backup-mode 是 grid，
+   所以左边留出缩进，对齐档位文字。 */
+.backup-mode-keep {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 6px 30px;
+}
+
+.backup-mode-keep > span { margin-bottom: 0; white-space: nowrap; }
+.backup-mode-keep .text-input { flex: 0 0 auto; width: 80px; padding: 4px 8px; }
+
+/* 「在源中创建标识文件」开关：与「覆盖目标中已存在的同名文件」同一种 toggle 风格，
+   排在同组的「源介质标识」输入框上方。 */
+.backup-marker-toggle { margin: 0 0 8px; }
+.backup-overwrite:has(input:disabled) { opacity: .45; cursor: not-allowed; }
+.backup-keep-field:has(input:disabled) { opacity: .45; }
+
+/* --- 自动备份（打标卷）--- */
+
+.auto-marker-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin-top: 12px;
+}
+
+.auto-marker-bar button { height: 30px; padding: 0 12px; font-size: 12px; }
+
+/* 打标列表：在线设备与离线记录都列出来，每台一张小卡片 */
+.auto-device-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.auto-device-item {
+  display: grid;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface-soft);
+}
+
+.auto-device-item.offline { border-style: dashed; opacity: .8; }
+
+/* 内置存储：只是一行「不支持打标」的说明，样式比真实设备条目更淡 */
+.auto-device-item.builtin {
+  border-style: dashed;
+  background: transparent;
+  padding: 8px 12px;
+}
+
+.auto-device-item.builtin strong {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.auto-device-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: baseline;
+}
+
+.auto-device-head strong { font-size: 13px; }
+
+.auto-device-head small { color: var(--muted); font-size: 11px; }
+
+.auto-device-badge {
+  padding: 1px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  font-size: 11px;
+  color: var(--muted);
+  background: var(--surface);
+}
+
+.auto-device-badge.on { color: #1a7f37; border-color: #bfe3c8; background: #f2fbf4; }
+
+.auto-device-badge.pending { color: var(--danger); border-color: #f0c9c6; background: #fff7f6; }
+
+.auto-device-subs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  font-size: 12px;
+}
+
+.auto-device-subs .empty { color: var(--muted); }
+
+.auto-device-sub {
+  display: inline-flex;
+  gap: 4px;
+  align-items: center;
+  padding: 2px 4px 2px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface);
+}
+
+.auto-device-sub button {
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  line-height: 1;
+  border-color: transparent;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--danger);
+  font-size: 11px;
+}
+
+.auto-device-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+
+.auto-device-actions button { height: 26px; padding: 0 10px; border-radius: 8px; font-size: 12px; }
+
+.auto-device-actions button.danger { color: var(--danger); border-color: #f0c9c6; background: #fff7f6; }
+
+.auto-device-empty { color: var(--muted); font-size: 12px; }
+
+.gpio-backup-panel .backup-mode-option input[type="radio"]:disabled + span { opacity: .45; }
+
+/* --- 目录浏览 / 卷选择对话框 --- */
+
+.path-picker-modal .path-picker-dialog {
+  width: min(800px, 100%);
+  max-height: min(84vh, 700px);
+  gap: 10px;
+  overflow: hidden;
+  grid-template-rows: auto auto minmax(220px, 1fr) auto auto;
+}
+
+.path-picker-head {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.path-picker-head h3 { margin: 0; }
+
+.path-picker-head button { height: 28px; }
+
+.path-picker-crumbs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  align-items: center;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-muted);
+  font-size: 12px;
+}
+
+.path-picker-crumbs button {
+  height: 22px;
+  padding: 0 6px;
+  border: 0;
+  border-radius: 4px;
+  color: var(--primary);
+  background: transparent;
+  font-size: 12px;
+}
+
+.path-picker-crumbs button:hover { background: var(--primary-soft); }
+.path-picker-crumbs .crumb-sep { color: var(--muted); }
+
+.path-picker-body {
+  display: grid;
+  grid-template-columns: 200px minmax(0, 1fr);
+  gap: 10px;
+  min-height: 0;
+}
+
+.path-picker-places {
+  display: grid;
+  gap: 10px;
+  align-content: start;
+  min-height: 0;
+  padding-right: 2px;
+  overflow: auto;
+}
+
+.place-group {
+  display: grid;
+  gap: 4px;
+}
+
+.place-group-title {
+  margin: 0;
+  padding: 0 2px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: .02em;
+}
+
+/* 没有内容的位置分类也要显示出来，说明「这里为什么是空的」，
+   否则用户会以为功能缺失。 */
+.place-empty {
+  margin: 0;
+  padding: 6px 10px;
+  border: 1px dashed var(--line);
+  border-radius: 6px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+/* 全局 button 钉了 32px 高，位置条目有两行（名称+副标题），必须恢复自适应高度，
+   否则文字会被拦腰截断。 */
+.place-item {
+  display: grid;
+  gap: 2px;
+  height: auto;
+  width: 100%;
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--text-body);
+  background: var(--surface);
+  font-size: 12.5px;
+  line-height: 1.35;
+  text-align: left;
+}
+
+.place-item:hover { border-color: var(--primary); color: var(--primary); }
+
+.place-item.active {
+  border-color: var(--primary);
+  color: var(--primary);
+  background: var(--primary-soft);
+}
+
+.place-item.removable {
+  border-style: dashed;
+}
+
+/* 远程挂载条目上的「改名」入口（span，按钮里不能再嵌按钮） */
+.place-rename {
+  justify-self: start;
+  color: var(--primary);
+  font-size: 11px;
+  cursor: pointer;
+  opacity: .8;
+}
+
+.place-rename:hover { opacity: 1; text-decoration: underline; }
+
+/* 高级（原生目录）模式：隐藏位置侧栏，让目录内容占满整行 */
+.path-picker-body.advanced { grid-template-columns: minmax(0, 1fr); }
+.path-picker-body.advanced .path-picker-places { display: none; }
+
+/* 高级按钮做成红色警示样式：这个入口能碰整个文件系统，值得被看见 */
+#path-picker-advanced {
+  color: var(--danger);
+  border-color: #f0c9c6;
+  background: #fff7f6;
+}
+
+#path-picker-advanced:hover {
+  border-color: var(--danger);
+  background: #ffefec;
+}
+
+[data-theme="dark"] #path-picker-advanced {
+  color: #f19d97;
+  border-color: #6b3a37;
+  background: #2c1b19;
+}
+
+[data-theme="dark"] #path-picker-advanced:hover { border-color: #a0524c; }
+
+.place-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 500;
+}
+
+.place-sub {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.path-picker-warning {
+  margin: 0;
+  padding: 8px 10px;
+  border: 1px solid #d9a441;
+  border-radius: 8px;
+  color: #8a5b00;
+  background: #fff6e0;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+[data-theme="dark"] .path-picker-warning {
+  border-color: #6b5526;
+  color: #f0cf8a;
+  background: #2c2415;
+}
+
+.path-picker-guide {
+  display: grid;
+  gap: 6px;
+  align-content: start;
+  padding: 12px 14px;
+  color: var(--text-body);
+  font-size: 13px;
+}
+
+.path-picker-guide p { margin: 0; }
+.path-picker-guide-item { color: var(--text-body); }
+.path-picker-guide-tip { color: var(--muted); font-size: 12px; }
+
+.path-picker-entries {
+  display: grid;
+  gap: 2px;
+  align-content: start;
+  min-height: 0;
+  padding: 4px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  overflow: auto;
+}
+
+.path-entry {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  width: 100%;
+  height: 32px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 6px;
+  color: var(--text-body);
+  background: transparent;
+  font-size: 13px;
+  text-align: left;
+}
+
+.path-entry:hover { background: var(--surface-muted); }
+.path-entry.selected { color: var(--primary); background: var(--primary-soft); }
+
+.path-entry-icon {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 11px;
+  border-radius: 2px;
+  background: var(--line-strong);
+}
+
+.path-entry.is-dir .path-entry-icon { background: var(--primary); }
+
+.path-entry-name {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.path-entry-meta {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.path-entry-badge {
+  flex: 0 0 auto;
+  padding: 1px 6px;
+  border: 1px solid var(--primary);
+  border-radius: 999px;
+  color: var(--primary);
+  font-size: 10px;
+}
+
+.path-picker-foot {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.path-picker-foot .actions { padding: 0; justify-content: flex-end; }
+.path-picker-foot .inline-status { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+
+#path-picker-advanced.active {
+  border-color: #d9a441;
+  color: #8a5b00;
+  background: #fff6e0;
+}
+
+[data-theme="dark"] #path-picker-advanced.active {
+  border-color: #6b5526;
+  color: #f0cf8a;
+  background: #2c2415;
+}
+
+/* 内置确认 / 输入对话框：替代 window.confirm 的应用内弹窗 */
+.confirm-modal .confirm-dialog {
+  width: min(440px, 100%);
+  padding: 22px;
+  gap: 12px;
+}
+
+.confirm-head {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
+
+.confirm-icon {
+  flex: 0 0 auto;
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  color: #fff;
+  background: var(--danger);
+  font-size: 20px;
+  font-weight: 700;
+}
+
+.confirm-head h3 { margin: 0; font-size: 15px; }
+
+.confirm-message {
+  margin: 0;
+  color: var(--text-body);
+  font-size: 13px;
+  line-height: 1.65;
+}
+
+/* hidden 必须压得住 display：下面这些元素平时靠 display 排版，若不给 [hidden]
+   兜底，「进入原生目录模式」这类不带输入框的确认框会残留一个空输入框。 */
+.confirm-input-row { display: grid; gap: 6px; }
+.confirm-input-row[hidden] { display: none !important; }
+.backup-keep-field[hidden] { display: none !important; }
+/* 「NAS → 打标卷 + 移动模式」的确认开关：同样要压住 .toggle 的 display:flex */
+.backup-danger-toggle[hidden] { display: none !important; }
+.backup-danger-toggle { margin-top: 8px; color: var(--danger); }
+/* 没勾确认就去保存/试跑：那一行抖一下并保持描边高亮，直到用户勾上或换到别的档位。
+   高亮只用 outline（不占位、不改变布局），免得抖动时整段文字跟着位移。 */
+@keyframes backup-confirm-shake {
+  0%, 100% { transform: translateX(0); }
+  15% { transform: translateX(-6px); }
+  30% { transform: translateX(5px); }
+  45% { transform: translateX(-4px); }
+  60% { transform: translateX(3px); }
+  75% { transform: translateX(-2px); }
+}
+.backup-danger-toggle.needs-confirm {
+  border-radius: 6px;
+  outline: 1px solid var(--danger);
+  outline-offset: 4px;
+  background: rgba(226, 76, 76, .07);
+}
+.backup-danger-toggle.needs-confirm.shake { animation: backup-confirm-shake .5s ease-in-out; }
+[data-theme="dark"] .backup-danger-toggle.needs-confirm { background: rgba(241, 106, 106, .14); }
+@media (prefers-reduced-motion: reduce) {
+  .backup-danger-toggle.needs-confirm.shake { animation: none; }
+}
+.backup-hint.danger { color: var(--danger); }
+.confirm-input-row span { color: var(--muted); font-size: 12px; }
+
+.confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 2px;
+}
+
+.confirm-actions button { min-width: 88px; height: 32px; }
+
+.confirm-actions button.danger {
+  margin-left: 0;
+  color: #fff;
+  border-color: var(--danger);
+  background: var(--danger);
+}
+
+.confirm-actions button.danger:hover { border-color: var(--danger-hover, var(--danger)); filter: brightness(.94); }
+
+[data-theme="dark"] .confirm-message { color: var(--text-body); }
+
+[data-theme="dark"] .backup-job-card .delete-script { color: #f39a9a; border-color: #6b3532; background: #2c1615; }
+[data-theme="dark"] .path-entry:hover { background: var(--surface-muted); }

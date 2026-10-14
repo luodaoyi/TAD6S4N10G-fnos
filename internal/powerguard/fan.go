@@ -94,14 +94,18 @@ type originalFanState struct {
 	Fans       []originalFan `json:"fans"`
 }
 
+// defaultMinPWMPercent 是最低转速的出厂默认值（0.10.37 起由 60 降为 40）。
+// 校验下限仍是 30（硬性防停转），这里只是新建配置时的默认档。
+const defaultMinPWMPercent = 40
+
 func DefaultFanConfig() FanConfig {
 	config := FanConfig{
 		Enabled:        false,
-		MinPWMPercent:  60,
+		MinPWMPercent:  defaultMinPWMPercent,
 		EmergencyTempC: 85,
 		PollSeconds:    2,
 		Curve: []FanPoint{
-			{TempC: 40, PWMPercent: 60},
+			{TempC: 40, PWMPercent: defaultMinPWMPercent},
 			{TempC: 55, PWMPercent: 70},
 			{TempC: 70, PWMPercent: 85},
 			{TempC: 80, PWMPercent: 100},
@@ -131,6 +135,56 @@ func defaultStorageFanCurve(minimum int) []FanPoint {
 		{TempC: 35, PWMPercent: max(minimum, 85)},
 		{TempC: 50, PWMPercent: 100},
 	}
+}
+
+// 0.10.36 及以前的出厂默认（最低转速 60%、三条曲线都从 60% 起）。
+// 只用于识别「一个字都没改过」的旧默认，见 migrateLegacyFanDefaults。
+var legacyDefaultCPUCurve = []FanPoint{
+	{TempC: 40, PWMPercent: 60},
+	{TempC: 55, PWMPercent: 70},
+	{TempC: 70, PWMPercent: 85},
+	{TempC: 80, PWMPercent: 100},
+}
+
+func legacyDefaultStorageCurve() []FanPoint {
+	return []FanPoint{
+		{TempC: 25, PWMPercent: 60},
+		{TempC: 35, PWMPercent: 85},
+		{TempC: 50, PWMPercent: 100},
+	}
+}
+
+func fanPointsEqual(a, b []FanPoint) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// migrateLegacyFanDefaults 把「完全没动过」的旧出厂默认整体升到新出厂默认
+// （最低转速 60% → 40%）。最低转速或三条曲线里任何一项被改过就整体保持原样，
+// 免得把用户自己调过的转速悄悄改掉。新旧默认值都在这里判定，改默认值时同步更新。
+func migrateLegacyFanDefaults(fan *FanConfig) bool {
+	if fan.MinPWMPercent != 60 {
+		return false
+	}
+	legacyStorage := legacyDefaultStorageCurve()
+	if !fanPointsEqual(fan.Curve, legacyDefaultCPUCurve) ||
+		!fanPointsEqual(fan.HDDCurve, legacyStorage) ||
+		!fanPointsEqual(fan.NVMeCurve, legacyStorage) {
+		return false
+	}
+	defaults := DefaultFanConfig()
+	fan.MinPWMPercent = defaults.MinPWMPercent
+	fan.Curve = defaults.Curve
+	fan.HDDCurve = defaults.HDDCurve
+	fan.NVMeCurve = defaults.NVMeCurve
+	return true
 }
 
 func normalizeConfig(cfg *Config) bool {
@@ -183,11 +237,32 @@ func normalizeConfig(cfg *Config) bool {
 		cfg.Fan.DiskCurve = nil
 		changed = true
 	}
+	if migrateLegacyFanDefaults(&cfg.Fan) {
+		changed = true
+	}
 	if normalizeFanSelections(&cfg.Fan) {
 		changed = true
 	}
 	if cfg.GPIO.Version == 0 {
-		cfg.GPIO = DefaultGPIOConfig()
+		// 老得连版本号都没有。只有确实没配置过的才整份换成新默认值（用户攒下的
+		// 脚本、备份任务、打标卷记录与提示音开关仍要原样带过去）；已经配置过的
+		// 一字不动地保留——只补版本号，否则后续 validateGPIOConfig 会拒绝
+		// version 0。
+		if gpioConfigLooksUnconfigured(cfg.GPIO) {
+			cfg.GPIO = preserveGPIOUserData(DefaultGPIOConfig(), cfg.GPIO)
+		} else {
+			cfg.GPIO.Version = gpioConfigVersion
+		}
+		changed = true
+	} else if gpioConfigLooksUnconfigured(cfg.GPIO) {
+		// 旧版本的默认值是「关闭 + 四个档位全为无动作」，从未配置过的机器
+		// 升级后自动套用新的开箱即用默认值，避免用户以为按键坏了。
+		cfg.GPIO = preserveGPIOUserData(DefaultGPIOConfig(), cfg.GPIO)
+		changed = true
+	}
+	if applyGPIORecommendedDefaults(&cfg.GPIO) {
+		// 已配置过的老配置：只给还空着的档位补推荐动作（网络键短按＝刷新SD卡），
+		// 用户自己填过的不动，且靠 Migrations 保证只补一次。
 		changed = true
 	}
 	if cfg.History.MaxSizeMB == 0 {
@@ -220,9 +295,18 @@ func normalizeConfig(cfg *Config) bool {
 		changed = true
 	}
 	for index := range cfg.GPIO.Buttons {
-		if cfg.GPIO.Buttons[index].Actions.Short != GPIOActionNone {
-			cfg.GPIO.Buttons[index].Actions.Short = GPIOActionNone
-			changed = true
+		// 短按动作与长按同样保留，不再被归一化清除；缺字段的空字符串统一写成
+		// none，否则校验会把它当成「不支持的动作」而拒绝整份配置。
+		for _, stage := range []*string{
+			&cfg.GPIO.Buttons[index].Actions.Short,
+			&cfg.GPIO.Buttons[index].Actions.Hold3S,
+			&cfg.GPIO.Buttons[index].Actions.Hold9S,
+			&cfg.GPIO.Buttons[index].Actions.Hold15S,
+		} {
+			if *stage == "" {
+				*stage = GPIOActionNone
+				changed = true
+			}
 		}
 	}
 	return changed

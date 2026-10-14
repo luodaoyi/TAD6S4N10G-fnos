@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<title>备份编辑器排布预览（v0.10.36）</title>
+<!-- 本机预览页：直接吃插件真实样式表，只用来核对排布，不是插件页面本身 -->
+<link rel="stylesheet" href="../app/ui/static/styles.css">
+<style>
+  body { padding: 20px; background: var(--bg); }
+  .preview-bar { display: flex; gap: 10px; align-items: center; margin-bottom: 14px; }
+  .preview-note { font-size: 12px; color: var(--muted); }
+</style>
+</head>
+<body>
+  <div class="preview-bar">
+    <button id="preview-theme" type="button">切换深/浅色</button>
+    <span class="preview-note">点「复制方式」里的档位，看「归档保留份数」跟着走；「源介质标识」在开关下方。</span>
+  </div>
+
+  <section class="card gpio-backup-panel">
+    <div class="panel-heading">
+      <div>
+        <h2>备份任务</h2>
+        <p>排布预览：复制方式 + 源介质标识。</p>
+      </div>
+    </div>
+
+    <div class="backup-job-editor">
+      <label class="field script-name-field">
+        <span>任务名称</span>
+        <input id="backup-job-name" class="text-input" type="text" maxlength="64" placeholder="例如：U 盘照片备份到硬盘" autocomplete="off">
+      </label>
+
+      <fieldset class="backup-mode">
+        <legend>复制方式</legend>
+        <label class="backup-mode-option" id="backup-job-mode-archive">
+          <input type="radio" name="backup-mode" value="archive">
+          <span><strong>按日期增量归档（硬链接增量）</strong><small>每次生成一个带时间戳的快照；没变化的文件用硬链接复用上一份，几乎不额外占用空间。源文件不动。</small></span>
+        </label>
+        <label class="backup-mode-option" id="backup-job-mode-move-archive">
+          <input type="radio" name="backup-mode" value="move_archive">
+          <span><strong>按日期转移归档（复制后清空源）</strong><small>在目标下建一个日期目录，把源文件复制进去之后删除源里的文件。适合「导入到 NAS 后清空来源」。</small></span>
+        </label>
+        <label class="field backup-keep-field backup-mode-keep" id="backup-job-keep-row" hidden>
+          <span>归档保留份数（0 = 不限）</span>
+          <input id="backup-job-keep" class="text-input" type="number" min="0" max="1000" step="1" value="0">
+        </label>
+        <label class="backup-mode-option">
+          <input type="radio" name="backup-mode" value="sync">
+          <span><strong>同步文件</strong><small>让目标与源完全一致，目标里多出来的文件会被删除。源文件不动。</small></span>
+        </label>
+        <label class="backup-mode-option">
+          <input type="radio" name="backup-mode" value="copy">
+          <span><strong>直接复制覆盖</strong><small>把源里的内容复制进目标；同名文件覆盖。目标中多出来的文件原样保留。</small></span>
+        </label>
+        <label class="backup-mode-option">
+          <input type="radio" name="backup-mode" value="move_overwrite">
+          <span><strong>移动覆盖（复制后删源）</strong><small>复制成功后删除源里的文件；同名文件覆盖，目标中多出来的文件原样保留。</small></span>
+        </label>
+      </fieldset>
+
+      <div class="backup-options">
+        <label class="toggle backup-overwrite"><input id="backup-job-overwrite" type="checkbox" checked><span></span>覆盖目标中已存在的同名文件</label>
+      </div>
+      <p class="backup-hint" id="backup-job-mode-hint"></p>
+
+      <div class="field script-name-field">
+        <label class="toggle backup-marker-toggle"><input id="backup-job-marker-write" type="checkbox"><span></span>在源中创建标识文件</label>
+        <span>源介质标识（可选，用来确认没认错盘）</span>
+        <input id="backup-job-marker" class="text-input" type="text" maxlength="128" placeholder="留空＝不校验" autocomplete="off">
+      </div>
+      <p class="backup-hint" id="backup-marker-hint">
+        作用：在源介质里放一个名为 <code>.tad-backup/source</code> 的小文件，内容就是上面的标识。每次备份前会先核对它，对不上就拒绝执行，用来防止 U 盘/移动硬盘插错、或者换接口后挂载到别的路径时复制错盘。如果您的数据需要严谨对待那么请创建标识文件，否则：留空＝不校验。
+      </p>
+      <p class="backup-hint">
+        用法：<b>不需要自己写内容</b>。打开开关会自动生成一串随机标识并立刻写进源介质（标识文件不会被复制到备份里）。请务必在插着正确介质时打开，否则会把错误的盘标成「对的盘」。
+      </p>
+    </div>
+  </section>
+
+<script>
+  // 与 app.js 里同名函数同样的逻辑，只为了在这张预览页里演示排布变化。
+  var $ = function (id) { return document.getElementById(id); };
+
+  function backupKeepAnchorID(mode, prefix) {
+    if (mode === 'archive') return prefix + '-mode-archive';
+    if (mode === 'move_archive') return prefix + '-mode-move-archive';
+    return '';
+  }
+
+  function syncBackupKeepRow(rowID, anchorID) {
+    var row = $(rowID);
+    if (!row) return;
+    if (!anchorID) { row.hidden = true; return; }
+    var anchor = $(anchorID);
+    row.hidden = false;
+    if (anchor && anchor.nextElementSibling !== row) anchor.insertAdjacentElement('afterend', row);
+  }
+
+  function update() {
+    var checked = document.querySelector('input[name="backup-mode"]:checked');
+    var mode = checked ? checked.value : 'copy';
+    var moveMode = mode === 'move_overwrite' || mode === 'move_archive';
+    $('backup-job-overwrite').disabled = mode !== 'copy';
+    $('backup-job-keep').disabled = mode !== 'archive' && mode !== 'move_archive';
+    syncBackupKeepRow('backup-job-keep-row', backupKeepAnchorID(mode, 'backup-job'));
+    $('backup-job-mode-hint').textContent = moveMode
+      ? '移动类模式固定覆盖同名文件，并在复制成功后删除源里的文件（只删已成功复制的，目录结构保留）。源不能是整个「我的文件」「团队文件」或远程挂载根目录，也不能是系统目录。'
+      : '';
+  }
+
+  Array.prototype.forEach.call(document.querySelectorAll('input[name="backup-mode"]'), function (radio) {
+    radio.addEventListener('change', update);
+  });
+  document.querySelector('input[name="backup-mode"][value="archive"]').checked = true;
+  update();
+
+  $('preview-theme').addEventListener('click', function () {
+    var root = document.documentElement;
+    root.dataset.theme = root.dataset.theme === 'dark' ? 'light' : 'dark';
+  });
+</script>
+</body>
+</html>

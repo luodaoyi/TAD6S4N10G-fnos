@@ -219,6 +219,8 @@ func serve(args []string) error {
 	go fanLoop(ctx, manager, logger)
 	go storageLoop(ctx, manager, logger)
 	go storageActivityLoop(ctx, manager)
+	go storageNotifyLoop(ctx, manager, logger)
+	go autoBackupClearLoop(ctx, manager, logger)
 	go gpioLoop(ctx, manager, logger)
 	// USB 串口温度传感器读取器：未配置时内部低频空转，常驻无副作用
 	go manager.SerialSensorLoop(ctx, logger)
@@ -296,6 +298,45 @@ func storageActivityLoop(ctx context.Context, manager *powerguard.Manager) {
 			return
 		case <-ticker.C:
 			manager.RefreshStorageActivity()
+		}
+	}
+}
+
+// storageNotifyLoop 监视「有没有插入新的存储设备」：移动存储长响一次、内置存储
+// 连续响两声（见 internal/powerguard/storage_notify.go）。采样只是 glob /sys/block
+// 加几个小文件读，2 秒一拍也几乎没有开销；首拍只建立基线，开机时已经在的盘不响。
+func storageNotifyLoop(ctx context.Context, manager *powerguard.Manager, logger *log.Logger) {
+	manager.MonitorStorageInserts()
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			manager.MonitorStorageInserts()
+		}
+	}
+}
+
+// autoBackupClearLoop 执行挂起的「离线取消打标」：设备重新插上后删掉卷内的打标
+// 标记（backup_auto.go 的 ProcessAutoBackupClears）。15 秒一拍，没有挂起项时
+// 只读一次配置就返回，开销可以忽略。
+func autoBackupClearLoop(ctx context.Context, manager *powerguard.Manager, logger *log.Logger) {
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			cleared, err := manager.ProcessAutoBackupClears()
+			if err != nil {
+				logger.Printf("auto backup clear failed: %v", err)
+			}
+			if cleared > 0 {
+				logger.Printf("auto backup: cleared %d pending volume marker(s)", cleared)
+			}
 		}
 	}
 }

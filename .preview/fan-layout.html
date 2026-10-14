@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>风扇控制排布预览（v0.10.37）</title>
+<link rel="stylesheet" href="../app/ui/static/styles.css">
+<style>
+  /* 预览页：吃掉插件真实样式表，只把两栏栅格收成单栏，去掉侧栏 */
+  html, body { height: auto; overflow: auto; }
+  .app-layout { grid-template-columns: minmax(0, 1fr); }
+  .preview-bar {
+    position: sticky; top: 0; z-index: 5;
+    display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
+    padding: 10px 16px; margin-bottom: 12px;
+    border-bottom: 1px solid var(--line); background: var(--surface);
+  }
+  .preview-bar strong { color: var(--text-body); font-size: 13px; }
+  .preview-bar span { color: var(--muted); font-size: 12px; }
+  .preview-bar .spacer { margin-left: auto; }
+  .preview-chart {
+    display: block; width: 100%; height: auto; aspect-ratio: 640 / 260;
+    border: 1px solid var(--line); border-radius: 8px; background: var(--surface);
+  }
+</style>
+</head>
+<body>
+<main class="shell">
+  <div class="app-layout">
+    <form id="config-form" class="tab-form">
+      <div class="preview-bar">
+        <strong>风扇控制 · 排布预览（v0.10.37）</strong>
+        <span>吃插件真实样式表；标签顺序、预设行、自定义槽位行、历史读数都为改后效果</span>
+        <span class="spacer"></span>
+        <button id="preview-theme" type="button">切换深浅色</button>
+      </div>
+
+      <section id="panel-fan" class="tab-panel" role="tabpanel">
+        <section class="card fan-editor">
+          <div class="panel-heading fan-heading">
+            <div>
+              <h2 id="fan-heading">HDD/SATA、NVMe 与 CPU 三温控曲线</h2>
+              <p>三条曲线分别计算目标转速，始终采用较高值；传感器异常或达到紧急温度时自动满速。</p>
+            </div>
+            <label class="toggle"><input id="fan-enabled" type="checkbox"><span></span>启用风扇曲线</label>
+          </div>
+
+          <div class="field-grid fan-settings">
+            <label class="field">
+              <span>最低转速</span>
+              <div class="input-wrap"><input id="fan-min" type="number" min="30" max="100" step="1" value="40"><b>%</b></div>
+              <small>为防止停转，最低允许 30%</small>
+            </label>
+            <label class="field">
+              <span>紧急满速温度</span>
+              <div class="input-wrap"><input id="fan-emergency" type="number" min="70" max="100" step="1" value="85"><b>°C</b></div>
+              <small>达到此温度立即强制 100%</small>
+            </label>
+            <label class="field">
+              <span>采样间隔</span>
+              <div class="input-wrap"><input id="fan-poll" type="number" min="1" max="10" step="1" value="2"><b>秒</b></div>
+              <small>建议保持 2 秒</small>
+            </label>
+          </div>
+
+          <div class="curve-tabs" role="tablist" aria-label="温控曲线编辑器切换">
+            <button id="curve-tab-hdd" type="button" class="curve-tab active" role="tab" aria-selected="true" aria-controls="disk-curve-editor">HDD/SATA</button>
+            <button id="curve-tab-nvme" type="button" class="curve-tab" role="tab" aria-selected="false" aria-controls="nvme-curve-editor">NVMe</button>
+            <button id="curve-tab-cpu" type="button" class="curve-tab" role="tab" aria-selected="false" aria-controls="cpu-curve-editor">CPU</button>
+          </div>
+
+          <div class="curve-presets" role="group" aria-label="预设曲线模式与曲线导出">
+            <span class="curve-presets-label">曲线模式</span>
+            <button type="button" class="curve-preset">静音</button>
+            <button type="button" class="curve-preset">平衡</button>
+            <button type="button" class="curve-preset">性能</button>
+            <span class="curve-presets-hint">点一下即替换三条曲线的全部节点，之后仍需点“保存风扇控制”才会生效</span>
+            <button type="button" class="curve-export">导出曲线参数</button>
+          </div>
+
+          <div class="curve-presets curve-slots" role="group" aria-label="自定义曲线槽位">
+            <span class="curve-presets-label">自定义曲线</span>
+            <span class="curve-slot">
+              <button type="button" class="curve-slot-load filled">自定义 1</button>
+              <button type="button" class="curve-slot-mini">存</button>
+              <button type="button" class="curve-slot-mini">导</button>
+            </span>
+            <span class="curve-slot">
+              <button type="button" class="curve-slot-load">自定义 2</button>
+              <button type="button" class="curve-slot-mini">存</button>
+              <button type="button" class="curve-slot-mini">导</button>
+            </span>
+            <span class="curve-slot">
+              <button type="button" class="curve-slot-load">自定义 3</button>
+              <button type="button" class="curve-slot-mini">存</button>
+              <button type="button" class="curve-slot-mini">导</button>
+            </span>
+            <span class="curve-presets-hint">「存」＝把当前三条曲线记进槽位，「导」＝单独导出该槽位；槽位保存在本浏览器，导出成 JSON 即可备份或换机搬用</span>
+          </div>
+
+          <div class="curve-editors">
+            <section id="disk-curve-editor" class="curve-editor" data-curve-kind="hdd">
+              <div class="curve-editor-heading">
+                <h3>HDD/SATA 温度曲线</h3>
+                <span>取已勾选前置仓的最高温度</span>
+              </div>
+              <svg class="preview-chart" viewBox="0 0 640 260" aria-hidden="true"></svg>
+              <div class="curve-toolbar">
+                <div class="curve-actions">
+                  <button type="button">+ 增加节点</button>
+                  <button type="button" style="color:var(--danger)">删除选中节点</button>
+                </div>
+                <strong>节点 1/3 · 25 °C · 40%</strong>
+              </div>
+              <fieldset class="curve-fan-selector"><legend>HDD/SATA 曲线控制的风扇</legend><div class="curve-fan-options"><label class="curve-fan-option"><input type="checkbox" checked><span>机箱风扇 1<small>1180 RPM</small></span></label></div></fieldset>
+              <fieldset class="curve-slot-selector">
+                <legend>参与 HDD/SATA 温控的槽位</legend>
+                <p>取消勾选后，该槽位温度不再影响风扇；温度缓存约每 60 秒更新。</p>
+                <div class="curve-slot-options"><label class="curve-slot-option"><input type="checkbox" checked><span>SATA 1</span></label></div>
+              </fieldset>
+              <p>默认 25°C 使用最低转速、35°C 使用 85%、50°C 使用 100%；温度来自前置 SATA 仓。</p>
+            </section>
+            <section id="nvme-curve-editor" class="curve-editor" data-curve-kind="nvme" hidden>
+              <div class="curve-editor-heading"><h3>NVMe 温度曲线</h3><span>取已勾选 M.2 槽的最高温度</span></div>
+              <svg class="preview-chart" viewBox="0 0 640 260" aria-hidden="true"></svg>
+              <p>默认沿用硬盘温控阈值，可独立拖拽调整；温度来自四个 M.2 槽位。</p>
+            </section>
+            <section id="cpu-curve-editor" class="curve-editor" data-curve-kind="cpu" hidden>
+              <div class="curve-editor-heading"><h3>CPU 温度曲线</h3><span>读取 coretemp 最高值</span></div>
+              <svg class="preview-chart" viewBox="0 0 640 260" aria-hidden="true"></svg>
+              <p>拖动圆点调整 CPU 温度和转速；支持 2–8 个节点，也可使用方向键微调。</p>
+            </section>
+          </div>
+          <p class="notice curve-notice">最终转速 = HDD/SATA、NVMe 与 CPU 三条曲线目标的最高值；某类盘温暂不可用时，该曲线不参与控制。</p>
+        </section>
+
+        <section class="card history-card">
+          <div class="panel-heading">
+            <div>
+              <h2>历史温度</h2>
+              <p>温度（左轴，°C）与风扇转速（右轴，占满量程百分比）随时间的变化。</p>
+            </div>
+            <div class="history-range" role="group" aria-label="时间范围">
+              <div class="history-range-slider">
+                <output id="preview-range-value" class="history-range-value">30 分钟</output>
+                <input id="preview-range-slider" class="history-range-input" type="range" min="0" max="1000" step="1" value="240" aria-label="历史时间范围">
+                <div class="history-range-ticks layout-7" aria-hidden="true">
+                  <span class="history-range-tick" data-tick="cont-min">30分</span>
+                  <span class="history-range-tick" data-tick="cont-max">2时</span>
+                  <span class="history-range-tick" data-tick="6h">6时</span>
+                  <span class="history-range-tick" data-tick="12h">12时</span>
+                  <span class="history-range-tick" data-tick="24h">24时</span>
+                  <span class="history-range-tick" data-tick="7d">7天</span>
+                  <span class="history-range-tick" data-tick="30d">30天</span>
+                </div>
+              </div>
+            </div>
+          </div>
+          <p class="notice history-limit-notice">拖动上面的滑杆看看：读数固定在滑杆正中，不再跟着滑块跑。</p>
+        </section>
+      </section>
+    </form>
+  </div>
+</main>
+
+<script>
+  // 标签切换
+  document.querySelectorAll('.curve-tab').forEach((tab) => {
+    tab.addEventListener('click', () => {
+      const kind = tab.id.replace('curve-tab-', '');
+      document.querySelectorAll('.curve-tab').forEach((item) => {
+        const active = item === tab;
+        item.classList.toggle('active', active);
+        item.setAttribute('aria-selected', String(active));
+      });
+      document.querySelectorAll('.curve-editor').forEach((editor) => {
+        editor.hidden = editor.dataset.curveKind !== kind;
+      });
+    });
+  });
+
+  // 历史范围读数：只改文字，位置由 CSS 固定在正中
+  const slider = document.getElementById('preview-range-slider');
+  const value = document.getElementById('preview-range-value');
+  const label = (pos) => {
+    const minutes = 30 + pos * 0.09;
+    if (minutes < 60) return `${Math.round(minutes)} 分钟`;
+    const hours = minutes / 60;
+    if (hours < 24) return `${hours < 10 ? hours.toFixed(1) : Math.round(hours)} 小时`;
+    return `${Math.round(hours / 24)} 天`;
+  };
+  slider.addEventListener('input', () => { value.textContent = label(Number(slider.value)); });
+  value.textContent = label(Number(slider.value));
+
+  // 深浅色
+  document.getElementById('preview-theme').addEventListener('click', () => {
+    const root = document.documentElement;
+    root.dataset.theme = root.dataset.theme === 'dark' ? 'light' : 'dark';
+  });
+</script>
+</body>
+</html>
