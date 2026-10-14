@@ -1074,6 +1074,51 @@ func TestHandleHistoryClear(t *testing.T) {
 	}
 }
 
+// /api/history 的 max_points 查询参数：窗口式回看（30 分钟–24 小时档拉取
+// 数倍跨度数据）靠大 max_points 保住窗口内密度。缺省仍按 480 点聚合上限，
+// 非法值回落缺省（parseFloatQuery 语义）。
+func TestHandleHistoryMaxPoints(t *testing.T) {
+	manager := newHistoryTestManager(t)
+	store := newTestStore(t)
+	server := &Server{Manager: manager, History: store, Logger: log.New(os.Stderr, "", 0)}
+	now := time.Now().Unix()
+	for i := 0; i < 600; i++ {
+		if err := store.Append(HistorySample{TS: now - int64(600-i)*60, CPUC: float64(40 + i%10)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fetch := func(url string) int {
+		req := httptest.NewRequest(http.MethodGet, url, nil)
+		rec := httptest.NewRecorder()
+		server.handleHistory(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET %s: status=%d body=%s", url, rec.Code, rec.Body.String())
+		}
+		var payload historyFile
+		if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+			t.Fatalf("GET %s: decode response: %v", url, err)
+		}
+		return len(payload.Samples)
+	}
+	if got := fetch("/api/history?range=24"); got > 480 {
+		t.Fatalf("default max_points should cap at 480, got %d", got)
+	}
+	if got := fetch("/api/history?range=24&max_points=2000"); got != 600 {
+		t.Fatalf("max_points=2000 should return all 600 minute samples un-aggregated, got %d", got)
+	}
+	if got := fetch("/api/history?range=24&max_points=not-a-number"); got > 480 {
+		t.Fatalf("invalid max_points should fall back to 480 cap, got %d", got)
+	}
+	// NaN 绕过一切数值比较（ParseFloat 接受），必须按无效参数回落缺省，
+	// 否则聚合步长算出 ≤1 直接返回全部原始采样；Inf 同理按无效处理。
+	if got := fetch("/api/history?range=24&max_points=NaN"); got > 480 {
+		t.Fatalf("NaN max_points should fall back to 480 cap, got %d", got)
+	}
+	if got := fetch("/api/history?range=24&max_points=Inf"); got > 480 {
+		t.Fatalf("Inf max_points should fall back to 480 cap, got %d", got)
+	}
+}
+
 // /api/config/history 保存后立即按新保留期清理一次（存储保留 9 天，
 // 10 天前的数据当场删除），且响应仍是 Status()。
 func TestHandleHistoryConfigAppliesRetentionImmediately(t *testing.T) {
@@ -1268,8 +1313,10 @@ func TestHistoryExportCSVSkipsOrphanSubRows(t *testing.T) {
 	if strings.Contains(content, "ghost:fan9") {
 		t.Fatalf("orphan fan (ts not in main) must not become a column:\n%s", content)
 	}
-	if strings.Contains(content, "99") {
-		t.Fatalf("orphan sensor value must not leak into export:\n%s", content)
+	// 按键名断言而不是值（99）：裸子串会撞上采样 ts 里的数字（如
+	// 1791993195），测试随墙钟间歇性失败。
+	if strings.Contains(content, "orphan") {
+		t.Fatalf("orphan sensor must not leak into export:\n%s", content)
 	}
 	if !strings.Contains(content, "it87:fan1_rpm") || !strings.Contains(content, "900") {
 		t.Fatalf("real data must survive orphan handling:\n%s", content)

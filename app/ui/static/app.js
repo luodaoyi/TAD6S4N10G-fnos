@@ -1368,11 +1368,16 @@ function historySeriesEnabledFor(groupKey) {
 }
 let historyChildSelection = loadHistoryChildSelection(); // 组内勾选；未记录的组走默认（见 defaultHistoryChildSelection）
 
-// ---- 30 分钟档回看（监控录像机式拖动窗口）----
-// 拉取 7.5 小时分钟级原始数据：451 点落在服务端 480 点聚合上限内，保持
-// 1 分钟粒度不聚合；图表固定显示 30 点窗口，在这段数据上左右拖动回看。
-const HISTORY_SCRUB_FETCH_HOURS = 7.5;
-const HISTORY_SCRUB_POINTS = 30;
+// ---- 窗口式回看（30 分钟–24 小时各档，监控录像机式拖动窗口）----
+// 横轴永远只显示所选档位的时间跨度（窗口），背后拉取约 8 倍跨度的数据，
+// 在图上左右拖动即回看更早的记录，拖回最右跟随实时。
+// 拉取密度：窗口式请求带 max_points=2000（服务端聚合桶取峰值），24 小时
+// 窗口约 240 点（6 分钟/点）；30 分钟档拉 7.5 小时分钟级原始数据（451 点，
+// 落在默认 480 上限内不聚合）。7 天/30 天仍为全览，不走窗口。
+const HISTORY_SCRUB_FETCH_HOURS = 7.5;   // 30 分钟档拉取跨度
+const HISTORY_WINDOW_MAX_HOURS = 24;     // ≤24 小时的档位均为窗口式
+const HISTORY_WINDOW_LOOKBACK = 8;       // 窗口式档位拉取 8 倍跨度回看
+const HISTORY_WINDOW_MAX_POINTS = 2000;  // 窗口式拉取的 max_points（服务端钳 10–2000）
 let historyScrubEndTs = null;      // 回看窗口末端采样 ts；null=贴最新（实时跟随）
 let historyIntervalSeconds = 60;   // 渲染时缓存的服务端采样间隔，拖动吸附换算用
 let historyXDomain = { start: 0, end: 0 }; // 渲染时缓存的横轴时间域，供十字线换算
@@ -1577,20 +1582,34 @@ function historyFilterRange(samples, rangeHours, nowTs) {
   return samples.filter((sample) => sample.ts >= cutoff);
 }
 
-// 30 分钟档的拉取范围：回看模式取 7.5 小时原始数据，其余档位原样。
-function historyFetchHoursFor(rangeHours) {
-  return rangeHours === 0.5 ? HISTORY_SCRUB_FETCH_HOURS : rangeHours;
+// 窗口式档位的拉取范围：30 分钟档取 7.5 小时原始数据，其余 ≤24 小时档位
+// 拉 8 倍跨度供拖动回看；7 天/30 天全览原样。
+function historyIsWindowed(rangeHours) {
+  return rangeHours <= HISTORY_WINDOW_MAX_HOURS;
 }
 
-// 回看窗口：固定 points 个采样槽位，末端吸附采样网格（以最旧样本为基准）
-// 并夹在 [最旧+span, 最新] 内。数据不足 points 个点时窗口覆盖全部数据。
-// 纯函数，node --test 直接断言。
-function historyScrubWindow(samples, intervalSeconds, endTs, points = HISTORY_SCRUB_POINTS) {
+// 当前档位的历史拉取地址；窗口式档位带大 max_points 保住窗口内密度
+function historyRequestUrl() {
+  return historyIsWindowed(historyRangeHours)
+    ? `api/history?range=${historyFetchHoursFor(historyRangeHours)}&max_points=${HISTORY_WINDOW_MAX_POINTS}`
+    : `api/history?range=${historyFetchHoursFor(historyRangeHours)}`;
+}
+
+function historyFetchHoursFor(rangeHours) {
+  if (rangeHours === 0.5) return HISTORY_SCRUB_FETCH_HOURS;
+  if (historyIsWindowed(rangeHours)) return Math.min(720, rangeHours * HISTORY_WINDOW_LOOKBACK);
+  return rangeHours;
+}
+
+// 回看窗口：横轴固定覆盖 spanSeconds 时间跨度，末端吸附采样网格（以最旧
+// 样本为基准）并夹在 [最旧+span, 最新] 内。数据不足一个窗口时窗口覆盖全部
+// 数据。纯函数，node --test 直接断言。
+function historyScrubWindow(samples, intervalSeconds, endTs, spanSeconds) {
   const interval = Math.max(1, intervalSeconds);
   if (!samples.length) return { start: 0, end: 0, atLive: true };
   const oldest = samples[0].ts;
   const latest = samples[samples.length - 1].ts;
-  const span = (points - 1) * interval;
+  const span = Math.max(interval, spanSeconds);
   if (latest - oldest < span) return { start: oldest, end: latest, atLive: true };
   const snapped = oldest + Math.round((endTs - oldest) / interval) * interval;
   const end = Math.min(latest, Math.max(oldest + span, snapped));
@@ -1821,7 +1840,10 @@ function historyChildColor(groupKey, childID, allIDs) {
 }
 
 // 组曲线：父类开关 + 子类勾选共同决定可见性；聚合项视为一个普通子类。
+// 窗口式档位虽然拉取数倍跨度数据，但只画窗口内的点（≤约 240 点），不做
+// 渲染抽稀——按全览档位抽稀会把窗口内容抽成稀疏点。
 function historyGroupSeries(groupKey, samples, intervalSeconds) {
+  const windowed = historyIsWindowed(historyRangeHours);
   const childIDs = historyGroupChildIDs(groupKey, samples);
   const selection = historyChildSelectionFor(groupKey);
   const visible = (childID) => selection === null || selection.has(childID);
@@ -1833,8 +1855,8 @@ function historyGroupSeries(groupKey, samples, intervalSeconds) {
         id: `${groupKey}:${childID}`,
         color: historyChildColor(groupKey, childID, childIDs),
         segments: historySplitSegments(points, intervalSeconds)
-          .map((segment) => historyThinByStride(segment, historyDecimationStride(historyRangeHours)))
-          .map((segment) => historyThinOut(segment)),
+          .map((segment) => historyThinByStride(segment, historyDecimationStride(windowed ? 0.5 : historyRangeHours)))
+          .map((segment) => historyThinOut(segment, windowed ? HISTORY_WINDOW_MAX_POINTS : undefined)),
       };
     });
 }
@@ -1858,14 +1880,14 @@ function renderHistoryChart() {
   const ranged = historyFilterRange(samples, historyFetchHoursFor(historyRangeHours), nowTs);
   historyRangedSamples = ranged;
   historyIntervalSeconds = intervalSeconds;
-  // 回看模式（30 分钟档）：横轴域是 30 点滑动窗口；末端贴最新时解除钉住，
-  // 让自动刷新继续跟随实时
-  const scrub = historyRangeHours === 0.5 && ranged.length > 0;
+  // 窗口式回看（30 分钟–24 小时档）：横轴域是所选档位跨度的滑动窗口；
+  // 末端贴最新时解除钉住，让自动刷新继续跟随实时
+  const scrub = historyIsWindowed(historyRangeHours) && ranged.length > 0;
   if (scrub && historyScrubEndTs !== null && historyScrubEndTs >= ranged[ranged.length - 1].ts) {
     historyScrubEndTs = null;
   }
   const win = scrub
-    ? historyScrubWindow(ranged, intervalSeconds, historyScrubEndTs ?? ranged[ranged.length - 1].ts)
+    ? historyScrubWindow(ranged, intervalSeconds, historyScrubEndTs ?? ranged[ranged.length - 1].ts, historyRangeHours * 3600)
     : null;
   const domain = win ? { start: win.start, end: win.end } : { start: nowTs - historyRangeHours * 3600, end: nowTs };
   historyXDomain = domain;
@@ -1882,7 +1904,10 @@ function renderHistoryChart() {
     });
   });
 
-  const tempValues = tempLines.flatMap((line) => line.segments.flat().map((point) => point.value));
+  // 窗口式回看只按窗口内的点定轴范围与画线：拉取的 8 倍跨度数据若混进
+  // Y 轴统计，久远的温度峰值会把当前窗口的曲线整体压扁
+  const inWindow = (point) => !win || (point.ts >= win.start && point.ts <= win.end);
+  const tempValues = tempLines.flatMap((line) => line.segments.flat().filter(inWindow).map((point) => point.value));
   const bounds = historyYBounds(tempValues, 20, 90);
   historyYBoundsState = bounds;
 
@@ -1913,7 +1938,7 @@ function renderHistoryChart() {
   [0, 25, 50, 75, 100].forEach((tick) => {
     svg.append(svgElement('text', { x: plot.right + axisPad, y: yFan(tick) + textSize * 0.35, class: 'chart-axis-text', 'font-size': textSize, 'text-anchor': 'start' }, `${tick}%`));
   });
-  const timeTicks = historyTimeTicks(domain.start, domain.end, win ? 0.5 : historyRangeHours);
+  const timeTicks = historyTimeTicks(domain.start, domain.end, historyRangeHours);
   const tickStep = timeTicks.length > 1 ? timeTicks[1] - timeTicks[0] : 0;
   // 网格线按档位步长全画；刻度文字过密时抽稀，可容纳的标签数随缩放比例减少
   const maxLabels = Math.min(10, Math.max(5, Math.round(10 * chartScale)));
@@ -1937,7 +1962,7 @@ function renderHistoryChart() {
   const drawSeries = (line, yScale) => {
     line.segments.forEach((segment) => {
       // 回看模式只画窗口内的点：窗口外的点若靠 clamp 会堆在绘图区两缘
-      const visible = win ? segment.filter((point) => point.ts >= win.start && point.ts <= win.end) : segment;
+      const visible = segment.filter(inWindow);
       if (visible.length < 2) return;
       svg.append(svgElement('polyline', {
         points: visible.map((point) => `${x(point.ts)},${yScale(point.value)}`).join(' '),
@@ -2100,10 +2125,10 @@ async function fetchHistory(force = false) {
     return historyCache;
   }
   try {
-    const requestedRange = historyFetchHoursFor(historyRangeHours);
-    const data = await request(`api/history?range=${requestedRange}`);
+    const query = historyRequestUrl();
+    const data = await request(query);
     // 快速切换范围时丢弃过期响应：慢的旧请求不能覆盖当前范围的缓存
-    if (requestedRange !== historyFetchHoursFor(historyRangeHours)) return historyCache;
+    if (query !== historyRequestUrl()) return historyCache;
     if (data && Array.isArray(data.samples)) {
       historyCache = data;
       historyFetchedAt = Date.now();
@@ -2355,9 +2380,9 @@ function setupHistoryCursor() {
   svg.addEventListener('mouseleave', hideHistoryCursor);
 }
 
-// ---- 30 分钟档回看：状态条 + 图表拖动 ----
-// 图表固定显示 30 点窗口；在图上左右拖动（鼠标/触摸）移动窗口，拖回最右
-// 跟随实时。回看状态条显示窗口时段，离开实时边缘时提供“回到最新”。
+// ---- 窗口式回看：状态条 + 图表拖动 ----
+// 图表固定显示所选档位跨度的窗口；在图上左右拖动（鼠标/触摸）移动窗口，
+// 拖回最右跟随实时。回看状态条显示窗口时段，离开实时边缘时提供“回到最新”。
 
 function renderHistoryScrubBar(active, win) {
   const bar = $('history-scrub-bar');
@@ -2369,7 +2394,13 @@ function renderHistoryScrubBar(active, win) {
   bar.hidden = false;
   const label = $('history-scrub-range');
   if (label) {
-    const span = `${historyFormatClock(win.start)}–${historyFormatClock(win.end)}`;
+    // 窗口跨天（如 24 小时档）时两端时钟可能相同，补日期消歧
+    const sameDay = new Date(win.start * 1000).toDateString() === new Date(win.end * 1000).toDateString();
+    const fmt = (ts) => {
+      const date = new Date(ts * 1000);
+      return sameDay ? historyFormatClock(ts) : `${date.getMonth() + 1}/${date.getDate()} ${historyFormatClock(ts)}`;
+    };
+    const span = `${fmt(win.start)}–${fmt(win.end)}`;
     label.textContent = win.atLive
       ? `实时 ${span} · 在图上左右拖动回看历史`
       : `回看 ${span}`;
@@ -2381,15 +2412,19 @@ function renderHistoryScrubBar(active, win) {
 function setupHistoryScrub() {
   const svg = $('history-chart');
   if (!svg) return;
-  let drag = null; // { pointerId, startX, baseEndTs }
-  const pxPerSlot = () => Math.max(1, (historyPlotBox.right - historyPlotBox.left) / (HISTORY_SCRUB_POINTS - 1));
+  let drag = null; // { pointerId, startX, baseEndTs, chartScale }
+  // 内容跟手换算：event.clientX 是屏幕像素，historyPlotBox 是 SVG viewBox
+  // 单位，按 curveChartScale（屏幕 px / viewBox 单位）折算后均摊窗口时间
+  // 跨度——否则桌面拖动偏快、窄屏偏慢一个缩放系数。按下时测量并缓存。
+  const pxPerSecond = (chartScale) => ((historyPlotBox.right - historyPlotBox.left) * chartScale) / Math.max(60, historyRangeHours * 3600);
   svg.addEventListener('pointerdown', (event) => {
-    if (historyRangeHours !== 0.5 || event.button > 0) return;
+    if (!historyIsWindowed(historyRangeHours) || event.button > 0) return;
     if (!historyRangedSamples.length) return;
     drag = {
       pointerId: event.pointerId,
       startX: event.clientX,
       baseEndTs: historyScrubEndTs ?? historyRangedSamples[historyRangedSamples.length - 1].ts,
+      chartScale: curveChartScale(svg) || 1,
     };
     historyScrubDragging = true;
     hideHistoryCursor();
@@ -2400,8 +2435,7 @@ function setupHistoryScrub() {
     if (!drag || event.pointerId !== drag.pointerId) return;
     const oldest = historyRangedSamples[0].ts;
     // 内容跟手：向右拖 = 看更早的数据，窗口末端随位移左移并吸附采样网格
-    const deltaSlots = (event.clientX - drag.startX) / pxPerSlot();
-    const rawEnd = drag.baseEndTs - deltaSlots * historyIntervalSeconds;
+    const rawEnd = drag.baseEndTs - (event.clientX - drag.startX) / pxPerSecond(drag.chartScale);
     historyScrubEndTs = oldest + Math.round((rawEnd - oldest) / historyIntervalSeconds) * historyIntervalSeconds;
     renderHistoryChart();
   });

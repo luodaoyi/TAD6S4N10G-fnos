@@ -524,7 +524,7 @@ test('档位记忆挂后端：切档 POST api/config/ui-prefs；首帧采纳后�
   const adoptApp = loadAppContext({ fetch: adopt.fetch });
   adoptApp.resolve('applyBackendHistoryRange')({ history_range_hours: 2 });
   assert.equal(adoptApp.resolve('historyRangeHours'), 2, '应采纳后端档位');
-  assert.ok(adopt.requests.some((req) => req.url.includes('api/history?range=2')), '采纳后应按新档位取数');
+  assert.ok(adopt.requests.some((req) => req.url.includes('range=16&max_points=2000')), '采纳后应按新档位取数（窗口式拉 8 倍跨度 + 大点数上限）');
   // 已采纳过后再下发不同档位：不覆盖
   adoptApp.resolve('applyBackendHistoryRange')({ history_range_hours: 12 });
   assert.equal(adoptApp.resolve('historyRangeHours'), 2, '二次下发不应覆盖');
@@ -741,30 +741,50 @@ function assertWindow(actual, start, end, atLive, message) {
   assert.equal(actual.atLive, atLive, message);
 }
 
-test('30 分钟档回看：拉取范围、窗口吸附/夹取/贴最新与数据不足全覆盖', () => {
+test('窗口式回看：拉取范围、窗口吸附/夹取/贴最新与数据不足全覆盖', () => {
   const historyFetchHoursFor = resolve('historyFetchHoursFor');
+  const historyIsWindowed = resolve('historyIsWindowed');
   const historyScrubWindow = resolve('historyScrubWindow');
-  // 拉取范围解耦：仅 30 分钟档改拉 7.5 小时（480 点聚合上限内），其余档位原样
+  // 拉取范围：30 分钟档拉 7.5 小时；≤24 小时档位拉 8 倍跨度；7 天/30 天全览原样
+  assert.equal(historyIsWindowed(0.5), true);
+  assert.equal(historyIsWindowed(2), true);
+  assert.equal(historyIsWindowed(24), true);
+  assert.equal(historyIsWindowed(168), false);
   assert.equal(historyFetchHoursFor(0.5), 7.5);
-  assert.equal(historyFetchHoursFor(1), 1);
+  assert.equal(historyFetchHoursFor(1), 8);
+  assert.equal(historyFetchHoursFor(6), 48);
+  assert.equal(historyFetchHoursFor(24), 192);
+  assert.equal(historyFetchHoursFor(168), 168);
   assert.equal(historyFetchHoursFor(720), 720);
 
-  // 45 个分钟点：默认贴最新 → 窗口=最后 30 点，末端=最新点
+  // 45 个分钟点、30 分钟窗口：默认贴最新 → 窗口=最后 30 分钟，末端=最新点
   const samples = Array.from({ length: 45 }, (_, i) => ({ ts: 1000 + i * 60 }));
   const latest = 1000 + 44 * 60;
-  assertWindow(historyScrubWindow(samples, 60, latest), latest - 29 * 60, latest, true, '默认贴最新');
+  assertWindow(historyScrubWindow(samples, 60, latest, 30 * 60), latest - 30 * 60, latest, true, '默认贴最新');
   // 拖到中间：末端吸附网格（ts=latest-10*60），atLive=false
-  assertWindow(historyScrubWindow(samples, 60, latest - 10 * 60), latest - 10 * 60 - 29 * 60, latest - 10 * 60, false, '拖到中间');
+  assertWindow(historyScrubWindow(samples, 60, latest - 10 * 60, 30 * 60), latest - 10 * 60 - 30 * 60, latest - 10 * 60, false, '拖到中间');
   // 末端不在网格上时吸附到最近采样槽（latest+7 → latest）
-  const snapped = historyScrubWindow(samples, 60, latest + 7);
+  const snapped = historyScrubWindow(samples, 60, latest + 7, 30 * 60);
   assert.equal(snapped.end, latest, '末端吸附采样网格');
   assert.equal(snapped.atLive, true, '吸附回最新点视为实时');
-  // 越过最旧边界：末端夹在 最旧+span，窗口保持 30 点
-  assertWindow(historyScrubWindow(samples, 60, 1000), 1000, 1000 + 29 * 60, false, '越过最旧边界被夹取');
-  // 数据不足 30 点：窗口覆盖全部并视为实时
-  assertWindow(historyScrubWindow(samples.slice(0, 10), 60, 1000 + 9 * 60), 1000, 1000 + 9 * 60, true, '数据不足全覆盖');
+  // 越过最旧边界：末端夹在 最旧+span，窗口保持完整跨度
+  assertWindow(historyScrubWindow(samples, 60, 1000, 30 * 60), 1000, 1000 + 30 * 60, false, '越过最旧边界被夹取');
+  // 数据不足一个窗口：窗口覆盖全部并视为实时
+  assertWindow(historyScrubWindow(samples.slice(0, 10), 60, 1000 + 9 * 60, 30 * 60), 1000, 1000 + 9 * 60, true, '数据不足全覆盖');
   // 空数据兜底
-  assertWindow(historyScrubWindow([], 60, 0), 0, 0, true, '空数据兜底');
+  assertWindow(historyScrubWindow([], 60, 0, 30 * 60), 0, 0, true, '空数据兜底');
+
+  // 24 小时窗口在 8 天数据上（6 分钟采样）：贴最新与拖到中间各覆盖 24 小时跨度
+  const daySamples = Array.from({ length: 8 * 240 }, (_, i) => ({ ts: 5000 + i * 360 }));
+  const dayLatest = 5000 + (8 * 240 - 1) * 360;
+  assertWindow(historyScrubWindow(daySamples, 360, dayLatest, 24 * 3600), dayLatest - 24 * 3600, dayLatest, true, '24 小时窗口贴最新');
+  assertWindow(
+    historyScrubWindow(daySamples, 360, dayLatest - 48 * 3600, 24 * 3600),
+    dayLatest - 48 * 3600 - 24 * 3600,
+    dayLatest - 48 * 3600,
+    false,
+    '24 小时窗口拖到两天前',
+  );
 });
 
 test('串口传感器状态行（多设备）：未保存/未启用/等待/已连接/失败与读数年龄', () => {

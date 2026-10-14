@@ -7,6 +7,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -142,7 +143,10 @@ func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rangeHours := parseFloatQuery(r, "range", 24)
-	samples, interval, err := s.History.Aggregated(r.Context(), rangeHours, historyMaxPoints, time.Now())
+	// 窗口式回看（30 分钟–24 小时档）会拉取数倍跨度的数据，靠大 max_points
+	// 保住窗口内密度；Aggregated 内部钳制到 [10, 2000]。
+	maxPoints := parseFloatQuery(r, "max_points", historyMaxPoints)
+	samples, interval, err := s.History.Aggregated(r.Context(), rangeHours, maxPoints, time.Now())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "读取历史数据失败: "+err.Error())
 		return
@@ -213,6 +217,11 @@ func parseFloatQuery(r *http.Request, name string, fallback float64) float64 {
 	}
 	value, err := strconv.ParseFloat(raw, 64)
 	if err != nil {
+		return fallback
+	}
+	// ParseFloat 接受 NaN/Inf；NaN 与任何值比较都为 false，会绕过调用方的
+	// 上下界钳制（如 max_points 的 [10, 2000]），统一按无效参数回落缺省。
+	if math.IsNaN(value) || math.IsInf(value, 0) {
 		return fallback
 	}
 	return value
