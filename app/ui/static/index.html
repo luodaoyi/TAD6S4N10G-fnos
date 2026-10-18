@@ -60,6 +60,7 @@
           <button id="tab-fan" type="button" role="tab" aria-selected="false" aria-controls="panel-fan" tabindex="-1"><img src="images/panel/风扇控制图标.svg" alt="">风扇控制</button>
           <button id="tab-gpio" type="button" role="tab" aria-selected="false" aria-controls="panel-gpio" tabindex="-1"><img src="images/panel/按键映射图标.svg" alt="">按键映射</button>
           <button id="tab-power" type="button" role="tab" aria-selected="false" aria-controls="panel-power" tabindex="-1"><img src="images/panel/功耗设置图标.svg" alt="">功耗设置</button>
+          <button id="tab-crps" type="button" role="tab" aria-selected="false" aria-controls="panel-crps" tabindex="-1"><img src="images/panel/CRPS图标.svg" alt="">CRPS 电源</button>
           <button id="tab-debug" type="button" role="tab" aria-selected="false" aria-controls="panel-debug" tabindex="-1"><span class="debug-tab-icon" aria-hidden="true">&lt;/&gt;</span>调试</button>
           <button id="tab-about" type="button" role="tab" aria-selected="false" aria-controls="panel-about" tabindex="-1"><img src="images/panel/关于我们图标.svg" alt="">关于</button>
         </nav>
@@ -384,6 +385,10 @@
             <button id="restore" type="button" class="danger">恢复安装前配置</button>
           </div>
           <p id="message-global" class="message" role="status" aria-live="polite"></p>
+        </section>
+
+        <section id="panel-crps" class="tab-panel crps-panel" role="tabpanel" aria-labelledby="tab-crps" hidden>
+          <iframe id="crps-frame" data-src="crps/" title="CRPS 电源监控"></iframe>
         </section>
 
         <section id="panel-debug" class="tab-panel" role="tabpanel" aria-labelledby="tab-debug" hidden>

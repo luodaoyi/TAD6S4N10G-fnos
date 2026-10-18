@@ -2134,3 +2134,17 @@ button.danger {
   font-weight: 650;
   white-space: nowrap;
 }
+
+/* ---- CRPS 电源监控页 (iframe 内嵌独立页面) ---- */
+/* iframe 高度由 JS 按内容自适应: 内部不再滚动, 由主应用整页滚动, 滚动条直达页面底部 */
+.tab-panel.crps-panel {
+  height: auto;
+  min-height: 320px;
+}
+.tab-panel.crps-panel iframe {
+  width: 100%;
+  height: 720px; /* JS 加载后按内容高度覆盖 */
+  border: none;
+  background: transparent;
+  display: block;
+}
