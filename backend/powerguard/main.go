@@ -7,12 +7,14 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"syscall"
 	"time"
 
+	"fnos-powerguard/internal/crpsump"
 	"fnos-powerguard/internal/powerguard"
 )
 
@@ -205,8 +207,12 @@ func serve(args []string) error {
 		}
 		go powerguard.HistoryLoop(ctx, manager, logger, history)
 	}
+	// CRPS PMBus 监控板块 (crpsump)：可选功能，硬件缺失/未配置时仅 CRPS 页面降级，
+	// 主功能照常——与 history 同样的失败哲学。配置走独立 crps.json（与主配置同目录），
+	// 耗电统计 energy.json 同目录落盘，退出时保存。
+	crpsHandler, crpsEnergySave := initCrps(logger, filepath.Join(filepath.Dir(*config), "crps.json"))
 	go func() {
-		server := &powerguard.Server{Manager: manager, Socket: *socket, WebRoot: *webRoot, BasePath: "/app/tad-module", Logger: logger, History: history, LogPath: *logPath}
+		server := &powerguard.Server{Manager: manager, Socket: *socket, WebRoot: *webRoot, BasePath: "/app/tad-module", Logger: logger, History: history, LogPath: *logPath, Crps: crpsHandler}
 		done <- server.ListenAndServe()
 	}()
 	// 日志大小清理：独立于历史数据库大小上限（log.max_size_mb，默认 16MB），
@@ -230,6 +236,9 @@ func serve(args []string) error {
 	select {
 	case <-ctx.Done():
 		logger.Printf("stopping: restoring captured power and fan settings")
+		if crpsEnergySave != nil {
+			crpsEnergySave() // CRPS 耗电统计退出落盘
+		}
 		err := manager.Restore()
 		if errors.Is(err, powerguard.ErrOriginalStateCPUMismatch) {
 			logger.Printf("restore skipped because saved state belongs to different hardware: %v", err)
@@ -424,4 +433,36 @@ func gpioLoop(ctx context.Context, manager *powerguard.Manager, logger *log.Logg
 
 func usage() {
 	fmt.Fprintln(os.Stderr, "usage: tad-module <serve|probe|init|apply|restore|version> [options]")
+}
+
+// initCrps 初始化 CRPS PMBus 监控板块 (可选功能)。配置读独立文件 cfgPath
+// (scl_pin/sda_pin, 缺省 Pin19/Pin20, 有文件即视为已在界面设置过)，
+// 耗电统计落盘 <cfgPath 同目录>/energy.json。NewBus 对非法引脚名内部回退默认值、
+// 硬件不可达在请求时降级为 no-gpio，因此本函数不返回错误，CRPS 始终挂载。
+// 日志沿用 crpsump 自有的 /tmp/psu-monitor.log (自带按大小轮转)，不并入主日志。
+func initCrps(logger *log.Logger, cfgPath string) (http.Handler, func()) {
+	sclPin, sdaPin := crpsump.DefaultSCL, crpsump.DefaultSDA
+	configured := false
+	if data, err := os.ReadFile(cfgPath); err == nil {
+		var cfg struct {
+			Scl string `json:"scl_pin"`
+			Sda string `json:"sda_pin"`
+		}
+		if json.Unmarshal(data, &cfg) == nil {
+			if cfg.Scl != "" {
+				sclPin = cfg.Scl
+			}
+			if cfg.Sda != "" {
+				sdaPin = cfg.Sda
+			}
+			configured = true
+		}
+	}
+	bus := crpsump.NewBus(sclPin, sdaPin, configured)
+	energy := crpsump.StartEnergy(bus, filepath.Join(filepath.Dir(cfgPath), "energy.json"))
+	crpsump.StartStatusRefresher(bus) // 状态快照后台刷新: CRPS 页面首开即有数据
+	crpsump.LogStartup(bus, sclPin, sdaPin)
+	logger.Printf("crps module enabled config=%s energy=%s", cfgPath, filepath.Join(filepath.Dir(cfgPath), "energy.json"))
+	srv := &crpsump.AppServer{Bus: bus, ConfigPath: cfgPath}
+	return srv.APIHandler(), energy.Save
 }

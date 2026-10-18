@@ -26,7 +26,8 @@ type Server struct {
 	SocketGroup string
 	Logger      *log.Logger
 	History     *HistoryStore
-	LogPath     string // 守护进程文本日志路径；空 = stderr 模式，日志端点降级
+	LogPath     string        // 守护进程文本日志路径；空 = stderr 模式，日志端点降级
+	Crps        http.Handler // 可选: CRPS PMBus 监控板块 API (nil = 不挂载); 宿主以 StripPrefix("/api/crps") 挂入
 }
 
 const configRequestMaxBytes = 3 << 20
@@ -108,6 +109,10 @@ func (s *Server) ListenAndServe() error {
 	mux.HandleFunc("/api/fans/debug/calibrate", s.handleFansDebugCalibrate)
 	mux.HandleFunc("/api/apply", s.handleApply)
 	mux.HandleFunc("/api/restore", s.handleRestore)
+	if s.Crps != nil {
+		// CRPS 板块: handler 内部把 /api/crps/<ep> 改写为板块原路由 /api/<ep>
+		mux.Handle("/api/crps/", s.Crps)
+	}
 	mux.Handle("/", http.FileServer(http.Dir(s.WebRoot)))
 
 	handler := s.securityHeaders(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
