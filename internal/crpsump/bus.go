@@ -38,11 +38,9 @@
 //       GET  /api/bus /api/log /api/config /api/energy
 //       POST /api/fan /api/config /api/detect /api/energy (耗电统计清零)
 //
-// 用法: psu-monitor-go serve --addr 127.0.0.1 --port 3878 --web-root ui/static
-//       psu-monitor-go serve --socket /path/psu-monitor.sock --web-root ui/static --config cfg.json --pid pid
 
 // Package crpsump 实现 CRPS 电源 PMBus 监控: GPIO bitbang I2C 总线、PMBus 读写、
-// 风扇控制、耗电统计与 HTTP API; serve 入口见 backend/crpsump。
+// 风扇控制、耗电统计与 HTTP API; 由主应用 (backend/powerguard) 挂载为 /api/crps/*。
 package crpsump
 
 import (
