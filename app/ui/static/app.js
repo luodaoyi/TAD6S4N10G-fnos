@@ -922,8 +922,17 @@ function activateTab(tabID, focus = false) {
     if (frame && !frame.src && frame.dataset.src) {
       frame.src = frame.dataset.src;
       frame.addEventListener('load', () => {
+        const mobileMQ = window.matchMedia('(max-width: 640px)');
         const fit = () => {
           try {
+            // 手机端: iframe 固定为可视高度, 内部自滚动。
+            // 若撑成内容全高, 移动 WebView 会把 iframe 区域内的滑动手势
+            // 消费在无滚可滚的内部文档上, 整页无法滑动。
+            if (mobileMQ.matches) {
+              const top = frame.getBoundingClientRect().top;
+              frame.style.height = Math.max(320, Math.round(window.innerHeight - top - 4)) + 'px';
+              return;
+            }
             const doc = frame.contentDocument;
             if (doc && doc.documentElement) {
               frame.style.height = doc.documentElement.scrollHeight + 'px';
