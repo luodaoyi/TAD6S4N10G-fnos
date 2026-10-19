@@ -131,6 +131,7 @@ func probe(args []string) error {
 	return nil
 }
 
+// serve 启动守护进程: 应用配置、挂载 HTTP(socket) 服务与各后台循环, 退出时恢复原始功耗/风扇状态
 func serve(args []string) error {
 	set := flag.NewFlagSet("serve", flag.ContinueOnError)
 	config := set.String("config", "", "config file")
@@ -211,6 +212,9 @@ func serve(args []string) error {
 	// 主功能照常——与 history 同样的失败哲学。配置走独立 crps.json（与主配置同目录），
 	// 耗电统计 energy.json 同目录落盘，退出时保存。
 	crpsHandler, crpsEnergySave := initCrps(logger, filepath.Join(filepath.Dir(*config), "crps.json"))
+	if crpsEnergySave != nil {
+		defer crpsEnergySave() // CRPS 耗电统计退出落盘 (ctx.Done 与 server 错误两条路径均覆盖)
+	}
 	go func() {
 		server := &powerguard.Server{Manager: manager, Socket: *socket, WebRoot: *webRoot, BasePath: "/app/tad-module", Logger: logger, History: history, LogPath: *logPath, Crps: crpsHandler}
 		done <- server.ListenAndServe()
@@ -236,9 +240,6 @@ func serve(args []string) error {
 	select {
 	case <-ctx.Done():
 		logger.Printf("stopping: restoring captured power and fan settings")
-		if crpsEnergySave != nil {
-			crpsEnergySave() // CRPS 耗电统计退出落盘
-		}
 		err := manager.Restore()
 		if errors.Is(err, powerguard.ErrOriginalStateCPUMismatch) {
 			logger.Printf("restore skipped because saved state belongs to different hardware: %v", err)
@@ -458,6 +459,11 @@ func initCrps(logger *log.Logger, cfgPath string) (http.Handler, func()) {
 			configured = true
 		}
 	}
+	// 与宿主对齐: 写接口走宿主同一套管理员鉴权 (X-Trim-Isadmin),
+	// /dev/port 访问与宿主按键轮询/LED 反馈共用同一把锁。须在 NewBus 前注入
+	// (configured=true 时 NewBus 即写 GPIO 方向)。
+	crpsump.AdminCheck = powerguard.IsAdminRequest
+	crpsump.PortIOLocker = powerguard.PortIOLocker()
 	bus := crpsump.NewBus(sclPin, sdaPin, configured)
 	energy := crpsump.StartEnergy(bus, filepath.Join(filepath.Dir(cfgPath), "energy.json"))
 	crpsump.StartStatusRefresher(bus) // 状态快照后台刷新: CRPS 页面首开即有数据

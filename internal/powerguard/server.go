@@ -27,11 +27,12 @@ type Server struct {
 	Logger      *log.Logger
 	History     *HistoryStore
 	LogPath     string        // 守护进程文本日志路径；空 = stderr 模式，日志端点降级
-	Crps        http.Handler // 可选: CRPS PMBus 监控板块 API (nil = 不挂载); 宿主以 StripPrefix("/api/crps") 挂入
+	Crps        http.Handler // 可选: CRPS PMBus 监控板块 API (nil = 不挂载); 直接挂在 /api/crps/, handler 自行改写为 /api/<ep>
 }
 
 const configRequestMaxBytes = 3 << 20
 
+// ListenAndServe 在 Unix socket 上启动 HTTP 服务 (含可选 CRPS 子板块挂载), 阻塞至服务退出
 func (s *Server) ListenAndServe() error {
 	if s.Manager == nil {
 		return errors.New("manager is required")
@@ -718,10 +719,15 @@ func (s *Server) securityHeaders(next http.Handler) http.Handler {
 	})
 }
 
+// isAdmin 校验请求头 X-Trim-Isadmin 是否为管理员
 func isAdmin(r *http.Request) bool {
 	value := strings.ToLower(strings.TrimSpace(r.Header.Get("X-Trim-Isadmin")))
 	return value == "true" || value == "1" || value == "yes"
 }
+
+// IsAdminRequest 导出宿主管理员鉴权, 供挂载的子板块 (如 crpsump) 注入,
+// 保证子板块写接口与宿主走同一套 X-Trim-Isadmin 校验。
+func IsAdminRequest(r *http.Request) bool { return isAdmin(r) }
 
 func methodNotAllowed(w http.ResponseWriter) {
 	writeError(w, http.StatusMethodNotAllowed, "method not allowed")

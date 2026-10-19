@@ -56,7 +56,6 @@ import (
 
 const (
 	DefaultAddr   = 0x5b // 光宝 PS-2551-5L PMBus 从机地址
-	LogPath       = "/tmp/psu-monitor.log"
 	LogMaxSize    = 1 << 20                // 日志单文件上限 1MB, 超出轮转
 	Delay         = 100 * time.Microsecond // bitbang 半周期
 	AppVersion    = "1.0.49"
@@ -66,6 +65,9 @@ const (
 	GatewayPrefix = "/app/psu-monitor"
 	ReadableTTL   = 2 // 秒: /api/config 的 readable 缓存, 避免轮询持续压总线
 )
+
+// LogPath 运行日志路径 (var 以便宿主按自身日志策略覆盖)
+var LogPath = "/tmp/psu-monitor.log"
 
 // ---- GPIO 引脚表 (Pin19~22, 全部实测可双向) ----
 // 每针: Port=数据口, Bit=数据位, DirReg=方向寄存器(LDN7配置区), DirBit=方向位; 方向位 1=输出, 0=输入
@@ -121,8 +123,10 @@ type Bus struct {
 	sdaName    string
 	sclCfg     GPPin
 	sdaCfg     GPPin
+	pio        portIO // 端口实现 (默认真实硬件, 单测可 mock)
 	sclOut     bool // 方向缓存
 	sdaOut     bool
+	dirsInit   bool // 是否已写过方向寄存器 (用于切换引脚时只释放自己驱动过的旧针)
 	mu         sync.Mutex // 总线 I/O 与引脚配置
 	stateMu    sync.Mutex // configured / fanMode / readable 缓存
 	ok         bool
@@ -132,6 +136,7 @@ type Bus struct {
 	lastTs     int64
 }
 
+// NewBus 创建 GPIO bitbang PMBus 总线: 校验引脚名, configured 时初始化方向寄存器
 func NewBus(scl, sda string, configured bool) *Bus {
 	// 校验引脚名: 非法名会令 GPPins 返回零值 GPPin{0,0,0,0}, 导致向 port 0x000(DMA 区) 写入
 	if _, ok := GPPins[scl]; !ok {
@@ -152,27 +157,41 @@ func NewBus(scl, sda string, configured bool) *Bus {
 		sdaName:    sda,
 		sclCfg:     GPPins[scl],
 		sdaCfg:     GPPins[sda],
+		pio:        defaultPortIO,
 		configured: configured,
 		fanMode:    "auto",
-		ok:         true,
 	}
-	// 初始化: SCL=输出, SDA=输入(释放)
-	b.initDirs()
+	// /dev/port 不可达 (无 root/非 Linux/容器限制): ok=false, 接口降级 no-gpio,
+	// 不再做无谓的方向写入与后续大量失败的系统调用
+	if !portAvailable() {
+		Logf("警告: 无法打开 /dev/port, CRPS GPIO 不可用, 接口降级 no-gpio")
+		return b
+	}
+	b.ok = true
+	// 初始化: SCL=输出, SDA=输入(释放)。
+	// 仅在已配置时写方向寄存器: 未配置的机器(可能无 CRPS 硬件)启动不得触碰 GPIO 方向,
+	// 首次界面保存/探测成功(reconfigure)时才写。
+	if configured {
+		b.initDirs()
+	}
 	return b
 }
 
-// setPinDir 无条件写 SIO 方向寄存器 (被带缓存的 ensure* 调用)
+// setPinDir 无条件写 SIO 方向寄存器 (被带缓存的 ensure* 调用)。
+// 整段 sioEnter..sioExit 在 PortIOLocker 下进行, 与宿主 GPIO 访问串行化。
 func (b *Bus) setPinDir(cfg GPPin, out bool) {
-	sioEnter()
-	sioWrite(0x07, 0x07) // 选 LDN7 (GPIO)
-	cur := sioRead(byte(cfg.DirReg))
+	PortIOLocker.Lock()
+	defer PortIOLocker.Unlock()
+	sioEnter(b.pio)
+	sioWrite(b.pio, 0x07, 0x07) // 选 LDN7 (GPIO)
+	cur := sioRead(b.pio, byte(cfg.DirReg))
 	if out {
 		cur |= 1 << uint(cfg.DirBit)
 	} else {
 		cur &^= 1 << uint(cfg.DirBit)
 	}
-	sioWrite(byte(cfg.DirReg), cur)
-	sioExit()
+	sioWrite(b.pio, byte(cfg.DirReg), cur)
+	sioExit(b.pio)
 }
 
 // ensure* 只在方向缓存与实际不符时才写 SIO (方向寄存器缓存)
@@ -183,6 +202,8 @@ func (b *Bus) ensureSclOut() {
 	b.setPinDir(b.sclCfg, true)
 	b.sclOut = true
 }
+
+// ensureSdaOut 确保 SDA 引脚为输出方向 (方向缓存命中时不写 SIO)
 func (b *Bus) ensureSdaOut() {
 	if b.sdaOut {
 		return
@@ -190,6 +211,8 @@ func (b *Bus) ensureSdaOut() {
 	b.setPinDir(b.sdaCfg, true)
 	b.sdaOut = true
 }
+
+// ensureSdaIn 确保 SDA 引脚为输入方向 (方向缓存命中时不写 SIO)
 func (b *Bus) ensureSdaIn() {
 	if !b.sdaOut {
 		return
@@ -198,28 +221,38 @@ func (b *Bus) ensureSdaIn() {
 	b.sdaOut = false
 }
 
+// initDirs 初始化引脚方向: SCL=输出, SDA=输入(释放), 并标记方向已写
 func (b *Bus) initDirs() {
 	b.setPinDir(b.sclCfg, true)
 	b.sclOut = true
 	b.setPinDir(b.sdaCfg, false)
 	b.sdaOut = false
+	b.dirsInit = true
 }
 
 // ---- 状态字段访问 (stateMu) ----
 
+// isConfigured 读 configured 状态 (stateMu 保护)
 func (b *Bus) isConfigured() bool { b.stateMu.Lock(); defer b.stateMu.Unlock(); return b.configured }
+
+// setConfigured 写 configured 状态 (stateMu 保护)
 func (b *Bus) setConfigured(v bool) {
 	b.stateMu.Lock()
 	b.configured = v
 	b.stateMu.Unlock()
 }
+
+// fanModeNow 读当前风扇模式 (stateMu 保护)
 func (b *Bus) fanModeNow() string { b.stateMu.Lock(); defer b.stateMu.Unlock(); return b.fanMode }
+
+// setFanMode 写风扇模式 (stateMu 保护)
 func (b *Bus) setFanMode(v string) {
 	b.stateMu.Lock()
 	b.fanMode = v
 	b.stateMu.Unlock()
 }
 
+// isOK 读总线硬件可用状态 (持 mu)
 func (b *Bus) isOK() bool { b.mu.Lock(); defer b.mu.Unlock(); return b.ok }
 
 // pinNames 加锁读当前引脚名 (配合 switchPin 在锁内改写)
@@ -245,10 +278,23 @@ func (b *Bus) switchPin(scl, sda string) (bool, string) {
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	// 释放不再使用的旧引脚为输入, 避免 F_PANEL 针脚残留推挽输出与外部线路冲突。
+	// 只释放本总线驱动过的针 (dirsInit): 从未初始化过方向时不触碰任何 GPIO。
+	if b.dirsInit {
+		for _, old := range []string{b.sclName, b.sdaName} {
+			if old != scl && old != sda {
+				b.setPinDir(GPPins[old], false)
+			}
+		}
+	}
 	b.sclName = scl
 	b.sclCfg = sc
 	b.sdaName = sda
 	b.sdaCfg = sd
+	if !portAvailable() { // 引脚已切换, 硬件暂不可达: 接口降级 no-gpio
+		b.ok = false
+		return true, "ok"
+	}
 	b.initDirs() // 重置方向缓存为新引脚
 	b.ok = true
 	return true, "ok"
@@ -359,37 +405,53 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 }
 
 // ---- bit 操作 (调用方须持 mu) ----
+//
+// 每处数据口的读-改-写都在 PortIOLocker 临界区内完成, 与宿主的按键轮询/LED 反馈
+// (同处 0xA0x GPIO 块) 串行化; 锁粒度为单次 RMW, bitbang 位间可被宿主轮询插入,
+// 不影响 I2C 时序正确性 (Delay 为软件定时)。
 
+// scl 写 SCL 电平 (v!=0 为高, 0 为低)
 func (b *Bus) scl(v int) {
-	cur := inb(b.sclCfg.Port)
+	PortIOLocker.Lock()
+	cur := b.pio.inb(b.sclCfg.Port)
 	if v != 0 {
 		cur |= 1 << uint(b.sclCfg.Bit)
 	} else {
 		cur &^= 1 << uint(b.sclCfg.Bit)
 	}
-	outb(b.sclCfg.Port, cur)
+	b.pio.outb(b.sclCfg.Port, cur)
+	PortIOLocker.Unlock()
 }
 
+// sdaWrite 写 SDA 电平 (自动确保 SDA 为输出方向)
 func (b *Bus) sdaWrite(v int) {
 	b.ensureSdaOut()
-	cur := inb(b.sdaCfg.Port)
+	PortIOLocker.Lock()
+	cur := b.pio.inb(b.sdaCfg.Port)
 	if v != 0 {
 		cur |= 1 << uint(b.sdaCfg.Bit)
 	} else {
 		cur &^= 1 << uint(b.sdaCfg.Bit)
 	}
-	outb(b.sdaCfg.Port, cur)
+	b.pio.outb(b.sdaCfg.Port, cur)
+	PortIOLocker.Unlock()
 }
 
+// sdaRead 读 SDA 电平 (自动确保 SDA 为输入方向)
 func (b *Bus) sdaRead() int {
 	b.ensureSdaIn()
-	return int((inb(b.sdaCfg.Port) >> uint(b.sdaCfg.Bit)) & 1)
+	PortIOLocker.Lock()
+	v := int((b.pio.inb(b.sdaCfg.Port) >> uint(b.sdaCfg.Bit)) & 1)
+	PortIOLocker.Unlock()
+	return v
 }
 
+// sdaRelease 释放 SDA (切为输入, 由外部上拉拉高)
 func (b *Bus) sdaRelease() { b.ensureSdaIn() }
 
 // ---- I2C 时序 (调用方须持 mu) ----
 
+// i2cStart 产生 I2C START 时序
 func (b *Bus) i2cStart() {
 	b.ensureSclOut()
 	b.sdaWrite(1)
@@ -401,6 +463,7 @@ func (b *Bus) i2cStart() {
 	time.Sleep(Delay)
 }
 
+// i2cStop 产生 I2C STOP 时序
 func (b *Bus) i2cStop() {
 	b.sdaWrite(0)
 	b.scl(1)
@@ -430,6 +493,7 @@ func (b *Bus) busReset() {
 	time.Sleep(50 * time.Millisecond)
 }
 
+// i2cWriteByte 写一个字节并读 ACK, 返回是否被从机应答
 func (b *Bus) i2cWriteByte(v byte) bool {
 	for i := 7; i >= 0; i-- {
 		b.sdaWrite(int((v >> uint(i)) & 1))
@@ -449,6 +513,7 @@ func (b *Bus) i2cWriteByte(v byte) bool {
 	return ack == 1
 }
 
+// i2cReadByte 读一个字节; ack=true 应答继续读, false 不应答结束
 func (b *Bus) i2cReadByte(ack bool) int {
 	val := 0
 	for i := 7; i >= 0; i-- {
@@ -601,6 +666,7 @@ func (b *Bus) writeWordCmd(cmd, lsb, msb byte) bool {
 
 // ---- 风扇 ----
 
+// writeFanPct 按百分比写风扇占空比 (钳制到 10~100)
 func (b *Bus) writeFanPct(pct int) bool {
 	if pct < 10 { // 手动指定占比下限 10% (光宝固件 10% 以下实测无效)
 		pct = 10
@@ -611,11 +677,13 @@ func (b *Bus) writeFanPct(pct int) bool {
 	return b.writeFanRaw(byte(pct&0xFF), byte((pct>>8)&0xFF))
 }
 
+// fanRpm 读风扇转速 (RPM), 失败返回 nil
 func (b *Bus) fanRpm() *float64 {
 	raw := b.readWord(Cmd["READ_FAN1"])
 	return linear11Ptr(raw)
 }
 
+// readTemp1 读进风口温度 T1 (°C), 失败返回 nil
 func (b *Bus) readTemp1() *float64 {
 	raw := b.readWord(Cmd["READ_T1"])
 	return linear11Ptr(raw)
@@ -627,6 +695,11 @@ func (b *Bus) readTemp1() *float64 {
 //	auto   -> 恢复电源固件自动温控。实测光宝固件: FAN_COMMAND_1=10% 会触发释放控制、
 //	          回到自动温控(约2700转低速档); 0 / 0xFFFF / 0x00FF 均实测无效。10% 即软切回触发值
 func (b *Bus) setFan(ctx context.Context, mode string, pct int) bool {
+	// 光宝固件: FAN_COMMAND_1=10% 即释放手动、回自动温控的触发值。手动 10% 与"自动"
+	// 写的是同一值, 模式须如实记为 auto, 否则 fan_mode 与电源真实状态不符。
+	if mode == "manual" && pct <= 10 {
+		mode = "auto"
+	}
 	if mode == "manual" {
 		ok := b.writeFanPct(pct)
 		if ok {
@@ -682,6 +755,7 @@ func linear11(w uint16) float64 {
 	return round2(float64(mant) * math.Pow(2, float64(exp)))
 }
 
+// linear11Ptr linear11 的指针版: nil 入 nil 出, 便于读数失败透传
 func linear11Ptr(w *uint16) *float64 {
 	if w == nil {
 		return nil
@@ -693,38 +767,53 @@ func linear11Ptr(w *uint16) *float64 {
 // readVoutReal 用 VOUT_MODE(0x20) 定义的指数解码真实 VOUT (VOUT 为无符号)
 func readVoutReal(b *Bus) *float64 {
 	mode := b.readWord(Cmd["VOUT_MODE"])
-	if mode != nil && (*mode&0x80) == 0 { // bit7=0 表示 Linear 模式
-		exp := int(*mode & 0x1F)
-		if exp >= 16 {
-			exp -= 32
-		}
-		raw := b.readWord(Cmd["READ_VOUT"])
-		if raw != nil {
-			v := round2(float64(*raw) * math.Pow(2, float64(exp)))
-			return &v
-		}
+	if mode == nil || (*mode&0x80) != 0 { // bit7=0 才表示 Linear 模式
+		return nil
 	}
-	return nil
+	return decodeVout(mode, b.readWord(Cmd["READ_VOUT"]))
+}
+
+// decodeVout VOUT_MODE Linear 模式指数解码 (纯函数, 便于单测)
+func decodeVout(mode, raw *uint16) *float64 {
+	if mode == nil || raw == nil || (*mode&0x80) != 0 {
+		return nil
+	}
+	exp := int(*mode & 0x1F)
+	if exp >= 16 {
+		exp -= 32
+	}
+	v := round2(float64(*raw) * math.Pow(2, float64(exp)))
+	return &v
 }
 
 // ---------------- 四舍五入 helpers (对齐 Python round 显示精度) ----------------
 
+// round1 保留 1 位小数
 func round1(x float64) float64 { return math.Round(x*10) / 10 }
+
+// round2 保留 2 位小数
 func round2(x float64) float64 { return math.Round(x*100) / 100 }
+
+// round3 保留 3 位小数
 func round3(x float64) float64 { return math.Round(x*1000) / 1000 }
 
+// fval *float64 转 any (nil 透传), 供 JSON 输出
 func fval(p *float64) any {
 	if p == nil {
 		return nil
 	}
 	return *p
 }
+
+// ptrStr 格式化浮点指针为日志文本 (nil 显示 "None")
 func ptrStr(p *float64) string {
 	if p == nil {
 		return "None"
 	}
 	return fmt.Sprintf("%g", *p)
 }
+
+// rawStr 格式化原始 word 为日志后缀 (nil 返回空串)
 func rawStr(raw *uint16) string {
 	if raw == nil {
 		return ""
@@ -735,12 +824,17 @@ func rawStr(raw *uint16) string {
 // ---------------- 全局状态 ----------------
 
 var (
-	mfrMu    sync.Mutex
-	mfrID    string
-	mfrModel string
-	mfrTs    int64
+	mfrMu     sync.Mutex
+	mfrID     string
+	mfrModel  string
+	mfrTs     int64
+	mfrFailTs int64 // 读取失败负缓存时间戳: 失败时每次 readAll 重试会阻塞 ~1.2s+ 并霸占 mfrMu
 )
 
+// MfrFailTTL 失败负缓存时长 (秒): 远短于成功缓存, 电源接回后很快恢复真实读取
+const MfrFailTTL = 10
+
+// getMfr 读厂商 ID/型号 (带成功缓存与失败负缓存, 防轮询阻塞总线)
 func getMfr(b *Bus) (string, string) {
 	now := time.Now().Unix()
 	mfrMu.Lock()
@@ -748,16 +842,22 @@ func getMfr(b *Bus) (string, string) {
 	if mfrTs > 0 && now-mfrTs < MfrCacheTTL {
 		return mfrID, mfrModel
 	}
+	if mfrFailTs > 0 && now-mfrFailTs < MfrFailTTL { // 失败负缓存期内直接返回旧值
+		return mfrID, mfrModel
+	}
 	id := b.readMfr(Cmd["MFR_ID"])
 	model := b.readMfr(Cmd["MFR_MODEL"])
-	if id != "" || model != "" {
-		if id != "" {
-			mfrID = id
-		}
-		if model != "" {
-			mfrModel = model
-		}
-		mfrTs = now
+	if id == "" && model == "" {
+		mfrFailTs = now
+		return mfrID, mfrModel
 	}
+	mfrFailTs = 0
+	if id != "" {
+		mfrID = id
+	}
+	if model != "" {
+		mfrModel = model
+	}
+	mfrTs = now
 	return mfrID, mfrModel
 }

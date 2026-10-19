@@ -13,6 +13,7 @@ var (
 	logFile *os.File
 )
 
+// ensureLogFile 懒打开日志文件并进程级复用 (调用方须持 logMu)
 func ensureLogFile() *os.File {
 	if logFile != nil {
 		return logFile

@@ -48,6 +48,7 @@ type energyFile struct {
 	Months    map[string]float64 `json:"months"`
 }
 
+// NewEnergy 创建耗电统计实例并载入既有落盘数据
 func NewEnergy(path string) *EnergyStats {
 	e := &EnergyStats{
 		path:   path,
@@ -58,6 +59,7 @@ func NewEnergy(path string) *EnergyStats {
 	return e
 }
 
+// load 从磁盘恢复统计; 文件缺失/损坏忽略, 短暂中断期按断电前功率补计
 func (e *EnergyStats) load() {
 	data, err := os.ReadFile(e.path)
 	if err != nil {

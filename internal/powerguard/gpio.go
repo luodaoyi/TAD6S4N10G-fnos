@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -274,6 +275,16 @@ func (m *Manager) GPIOPortPath() string {
 	return m.rooted("/dev/port")
 }
 
+// portIOMu 串行化进程内所有 /dev/port 访问 (按键轮询读、LED 反馈写, 以及
+// 挂载的 CRPS 板块 bitbang/SuperIO 配置序列)。CRPS 板块经 PortIOLocker()
+// 注入同一把锁, 禁止并行进入 SuperIO 配置空间或并发读写同一 GPIO 数据块。
+// 约定为叶子锁: 持锁期间不得再获取其他锁 (gpioMu 等在拿本锁之前持有)。
+var portIOMu sync.Mutex
+
+// PortIOLocker 返回与宿主 GPIO 访问共用的 /dev/port 锁, 供挂载的子板块
+// (如 crpsump) 注入, 对齐同一份串行化。
+func PortIOLocker() sync.Locker { return &portIOMu }
+
 func (m *Manager) ResetGPIO(enabled, available bool, cause error) {
 	m.gpioMu.Lock()
 	defer m.gpioMu.Unlock()
@@ -302,6 +313,9 @@ func (m *Manager) PollGPIO(config GPIOConfig, reader io.ReaderAt, now time.Time)
 
 	m.gpioMu.Lock()
 	defer m.gpioMu.Unlock()
+	// 端口读与 CRPS bitbang/LED 反馈共用同一把叶子锁, 防止并发读写 0xA0x 数据块
+	portIOMu.Lock()
+	defer portIOMu.Unlock()
 	if m.gpioRuntime.buttons == nil {
 		m.gpioRuntime.buttons = make(map[string]*gpioButtonRuntime, len(gpioButtonSpecs))
 	}

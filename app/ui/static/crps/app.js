@@ -10,6 +10,7 @@
     var stored = localStorage.getItem("tad-theme");
     if (stored === "dark" || stored === "light" || stored === "auto") themeMode = stored;
   } catch (e) { /* localStorage 不可用时跟随系统 */ }
+  // parentThemeMode 读父窗口(fnOS 同源内嵌)的主题模式, 不可读返回 ""
   var parentThemeMode = function () {
     try {
       var p = window.parent;
@@ -18,6 +19,7 @@
       return m === "dark" || m === "light" ? m : "";
     } catch (e) { return ""; } // 父窗口跨域不可读
   };
+  // applyTheme 按当前主题模式计算并应用 dark/light 到 <html data-theme>
   var applyTheme = function () {
     var theme = themeMode;
     if (themeMode === "auto") {
@@ -42,11 +44,13 @@
   var cssVar = function (name) {
     return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
   };
+  // hexToRgba 把 #RRGGBB 颜色转 rgba() 字符串 (a 为透明度)
   var hexToRgba = function (hex, a) {
     var n = parseInt(hex.replace("#", ""), 16);
     return "rgba(" + ((n >> 16) & 255) + "," + ((n >> 8) & 255) + "," + (n & 255) + "," + a + ")";
   };
 
+  // $ getElementById 简写
   var $ = function (id) { return document.getElementById(id); };
 
   var METRIC_DEFS = [
@@ -62,6 +66,7 @@
     { key: "temp2", label: "出风口温度", unit: "°C", fmt: "%.1f", w: "%.1f" },
   ];
 
+  // fmt 按 "%.Nf" 规格格式化数值; null/非数值显示 "--"
   var fmt = function (v, spec) {
     if (v === null || v === undefined) return "--";
     var num = Number(v);
@@ -74,6 +79,7 @@
 
   var grid = $("metrics");
 
+  // buildGrid 按 METRIC_DEFS 生成参数卡片网格
   function buildGrid() {
     grid.innerHTML = "";
     METRIC_DEFS.forEach(function (m) {
@@ -89,6 +95,7 @@
     });
   }
 
+  // setMetric 更新单个参数卡片的数值与附加说明
   function setMetric(key, val, spec, extra) {
     var c = $("m-" + key);
     if (!c) return;
@@ -100,6 +107,7 @@
 
   var lastOk = null;
 
+  // render 用一轮 /api/status 数据刷新整个页面 (参数/横幅/风扇/厂商信息)
   function render(data) {
     if (!data) {
       setBanner(false, "无法连接后端服务");
@@ -165,18 +173,21 @@
     lastOk = data;
   }
 
+  // esc HTML 转义, 防注入
   function esc(s) {
     return String(s).replace(/[&<>"']/g, function (c) {
       return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
     });
   }
 
+  // setBanner 设置状态横幅样式与文案
   function setBanner(ok, text) {
     var b = $("status-banner");
     b.className = "status-banner " + (ok ? "ok" : ok === false ? "err" : "");
     $("status-text").textContent = text;
   }
 
+  // poll 拉取一次 /api/status 并渲染
   function poll() {
     fetch("../api/crps/status")
       .then(function (r) { return r.json(); })
@@ -198,13 +209,15 @@
   var lastKnownMode = null; // 最近一次轮询确认的模式 (POST 失败回滚用)
   var modeGuardUntil = 0; // 用户刚操作模式后的保护期: 期间忽略服务器 fan_mode, 避免快照滞后把按钮拉回旧值跳动
 
-  function applyModeUI(mode) { // 直接应用, 不看保护期 (POST 成功/失败回滚走这里, 立即生效)
+  // applyModeUI 直接应用模式按钮 UI, 不看保护期 (POST 成功/失败回滚走这里, 立即生效)
+  function applyModeUI(mode) {
     modeAuto.classList.toggle("active", mode === "auto");
     modeManual.classList.toggle("active", mode === "manual");
     manualCtl.style.display = mode === "manual" ? "flex" : "none";
   }
 
-  function setModeUI(mode) { // 轮询入口: 保护期内忽略快照旧值
+  // setModeUI 轮询入口应用模式 UI: 保护期内忽略快照旧值
+  function setModeUI(mode) {
     if (Date.now() < modeGuardUntil) return;
     applyModeUI(mode);
   }
@@ -212,6 +225,7 @@
   var fanBusy = false, fanPending = null; // 连点合并: 忙时只记最新目标, 当前请求完成后补发
   var fanPollTimer = null; // 设置成功后延后拉新转速的定时器 (连点重置)
 
+  // sendFan 提交风扇设置 POST 并按结果更新 UI; 完成后补发连点期间记下的最新目标
   function sendFan(body, doneMsg) {
     fanBusy = true;
     msg.className = "";
@@ -234,6 +248,7 @@
           fanPollTimer = setTimeout(poll, 1300);
         } else {
           msg.className = "err";
+          lastSent = null; // 失败清零: 用户重选同一占空比时会重新发送
           if (lastKnownMode) applyModeUI(lastKnownMode);
           msg.textContent = "设置失败: " + (d.error || "未知错误");
         }
@@ -242,13 +257,15 @@
       .catch(function (e) {
         fanBusy = false;
         msg.className = "err";
+        lastSent = null; // 失败清零: 用户重选同一占空比时会重新发送
         if (lastKnownMode) applyModeUI(lastKnownMode);
         msg.textContent = "设置失败: " + e.message;
         if (fanPending) { var p2 = fanPending; fanPending = null; sendFan(p2.body, p2.doneMsg); }
       });
   }
 
-  function requestFan(body, doneMsg) { // 点击入口: 乐观即时切 UI; 忙时只记最新目标, 避免请求堆积变慢
+  // requestFan 点击入口: 乐观即时切 UI; 忙时只记最新目标, 避免请求堆积变慢
+  function requestFan(body, doneMsg) {
     applyModeUI(body.mode);
     if (fanBusy) {
       fanPending = { body: body, doneMsg: doneMsg };
@@ -295,13 +312,15 @@
   var gpioMsg = $("gpio-msg");
   var gpioPins = [];
 
+  // gpioMsgShow 显示 GPIO 配置区的提示消息 (ok/err 样式)
   function gpioMsgShow(ok, text) {
     if (!gpioMsg) return;
     gpioMsg.className = "gpio-msg " + (ok ? "ok" : "err");
     gpioMsg.textContent = text;
   }
 
-  function loadGpioConfig() {
+  // loadGpioConfig 拉取 GPIO 配置并重建针脚下拉 (preserveWarn 为需保留的写盘失败告警)
+  function loadGpioConfig(preserveWarn) {
     if (!sclSel || !sdaSel) return;
     fetch("../api/crps/config")
       .then(function (r) { return r.json(); })
@@ -324,7 +343,10 @@
         });
         if (d.scl_pin && gpioPins.indexOf(d.scl_pin) >= 0) sclSel.value = d.scl_pin;
         if (d.sda_pin && gpioPins.indexOf(d.sda_pin) >= 0) sdaSel.value = d.sda_pin;
-        if (d.configured === false) {
+        // 保存后刷新: 写盘失败的告警须保留, 不被连接状态覆盖
+        if (preserveWarn) {
+          gpioMsgShow(false, preserveWarn);
+        } else if (d.configured === false) {
           gpioMsgShow(false, "尚未设置 GPIO 引脚：选择 PSCL/PSDA 后点“保存并应用”开始读取");
         } else {
           gpioMsgShow(d.readable === true, d.readable === true ? "当前接线可读（已读到电源数据）" : "当前接线未检测到电源数据");
@@ -346,8 +368,10 @@
       .then(function (r) { return r.json(); })
       .then(function (d) {
         if (d && d.ok) {
-          gpioMsgShow(true, "已应用 PSCL=" + d.scl_pin + " PSDA=" + d.sda_pin + "（" + (d.msg === "ok" ? "已持久化" : d.msg) + "），连接状态见上方");
-          loadGpioConfig();   // 刷新下拉动态标注
+          // msg !== "ok" 表示已应用但写盘失败 (重启后配置丢失), 刷新下拉后仍须保留该告警
+          var saveWarn = (d.msg && d.msg !== "ok") ? d.msg : "";
+          gpioMsgShow(true, "已应用 PSCL=" + d.scl_pin + " PSDA=" + d.sda_pin + (saveWarn ? "（" + saveWarn + "）" : "（已持久化）") + "，连接状态见上方");
+          loadGpioConfig(saveWarn);   // 刷新下拉动态标注
           setTimeout(poll, 300);   // 立即刷新一次状态
         } else {
           gpioMsgShow(false, "应用失败: " + ((d && d.error) || (d && d.msg) || "未知错误"));
@@ -410,6 +434,7 @@
     var mask = $("log-mask");
     if (mask) mask.style.display = "none";
   });
+  // fallbackCopy 剪贴板 API 不可用时的 textarea 复制兜底
   function fallbackCopy(txt) {
     try {
       var ta = document.createElement("textarea");
@@ -427,6 +452,7 @@
   var enMsg = $("energy-msg");
   var enBars = []; // 柱状图命中区域 {x,y,w,h,date,wh}
 
+  // enVal Wh 转 kWh 显示字符串 (按量级取 3/2 位小数)
   function enVal(wh) {
     var kwh = wh / 1000;
     return kwh < 10 ? kwh.toFixed(3) : kwh.toFixed(2);
@@ -434,6 +460,7 @@
 
   var enLastDays = null; // 最近一次按日明细 (resize 时重绘用)
 
+  // renderEnergy 用 /api/energy 数据刷新耗电统计区 (汇总数字 + 柱状图)
   function renderEnergy(d) {
     if (!d || !d.ok) return;
     enLastDays = d.days || [];
@@ -452,6 +479,7 @@
     if (enCtx) drawEnergyChart(d.days || []);
   }
 
+  // pollEnergy 拉取一次 /api/energy 并渲染
   function pollEnergy() {
     fetch("../api/crps/energy")
       .then(function (r) { return r.json(); })
@@ -459,6 +487,7 @@
       .catch(function () { /* 静默, 下次再取 */ });
   }
 
+  // drawEnergyChart 按最近 30 天明细绘制耗电柱状图 (含网格/刻度/命中区)
   function drawEnergyChart(days) {
     var dpr = window.devicePixelRatio || 1;
     var w = enCv.clientWidth, h = enCv.clientHeight || 140; // 高度读 CSS 实际值: 手机端媒体查询会加高画布
@@ -565,10 +594,21 @@
   });
 
   // ---- 启动 ----
+  // 宿主切走标签时 iframe 被隐藏 (display:none), document.hidden 不会变化,
+  // 用 IntersectionObserver 判定可见性: 不可见时暂停轮询, 回到前台立即补一次。
+  var pageVisible = true;
+  if ("IntersectionObserver" in window) {
+    new IntersectionObserver(function (entries) {
+      var v = entries[0].isIntersecting;
+      if (pageVisible === v) return;
+      pageVisible = v;
+      if (v) { poll(); pollEnergy(); }
+    }).observe(document.documentElement);
+  }
   buildGrid();
   loadGpioConfig();
   poll();
-  setInterval(poll, 3000);
+  setInterval(function () { if (pageVisible) poll(); }, 3000);
   pollEnergy();
-  setInterval(pollEnergy, 10000);
+  setInterval(function () { if (pageVisible) pollEnergy(); }, 10000);
 })();

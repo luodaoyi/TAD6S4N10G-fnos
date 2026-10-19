@@ -914,6 +914,7 @@ function deleteGPIOScript(scriptID) {
   showGPIOScriptMessage(`脚本“${script.name}”已从本页草稿删除。`);
 }
 
+// 切换主标签页: CRPS 页首次切入时懒加载 iframe 并按内容高度自适应
 function activateTab(tabID, focus = false) {
   // CRPS 页 iframe 懒加载：首次切到该页才加载，避免常驻轮询耗电 API。
   // 加载后按内容高度自适应 iframe，页面内部不滚动，滚动交给主应用整页（滚动条直达底部）。
@@ -929,7 +930,7 @@ function activateTab(tabID, focus = false) {
             // 若撑成内容全高, 移动 WebView 会把 iframe 区域内的滑动手势
             // 消费在无滚可滚的内部文档上, 整页无法滑动。
             if (mobileMQ.matches) {
-              const top = frame.getBoundingClientRect().top;
+              const top = Math.max(0, frame.getBoundingClientRect().top);
               frame.style.height = Math.max(320, Math.round(window.innerHeight - top - 4)) + 'px';
               return;
             }

@@ -54,6 +54,7 @@ func StartStatusRefresher(bus *Bus) {
 	}()
 }
 
+// cachedStatus 优先回状态快照; 快照缺失/过期时回退实时读取
 func cachedStatus(bus *Bus) map[string]any {
 	statusMu.Lock()
 	snap, age := statusSnap, time.Since(statusTs)
@@ -66,6 +67,7 @@ func cachedStatus(bus *Bus) map[string]any {
 
 // ---------------- 参数读取 ----------------
 
+// emptyStatus 生成全空的 /api/status JSON (err 为错误码)
 func emptyStatus(err string) map[string]any {
 	return map[string]any{
 		"ok": false, "error": err,
@@ -79,6 +81,7 @@ func emptyStatus(err string) map[string]any {
 	}
 }
 
+// readAll 实时读一轮电源全部参数并组装 /api/status JSON
 func readAll(b *Bus) map[string]any {
 	if b == nil {
 		return emptyStatus("no-gpio")
@@ -152,6 +155,13 @@ func readAll(b *Bus) map[string]any {
 
 // ---------------- HTTP 服务 ----------------
 
+// AdminCheck 写操作管理员鉴权钩子, 与宿主应用同一套校验 (宿主挂载前注入其 isAdmin,
+// 校验 X-Trim-Isadmin 头)。未注入时 (独立运行) 默认放行, 保持旧行为。
+var AdminCheck = func(r *http.Request) bool { return true }
+
+// jsonBodyMaxBytes POST JSON body 上限 (对齐宿主配置接口的 LimitReader 做法)
+const jsonBodyMaxBytes = 1 << 20
+
 type AppServer struct {
 	Bus        *Bus
 	WebRoot    string
@@ -166,6 +176,7 @@ var mimeTypes = map[string]string{
 	".svg":  "image/svg+xml",
 }
 
+// stripGateway 剥掉网关前缀 (独立 serve 经网关反代时路径还原)
 func (s *AppServer) stripGateway(path string) string {
 	if strings.HasPrefix(path, GatewayPrefix) {
 		path = path[len(GatewayPrefix):]
@@ -179,6 +190,7 @@ func (s *AppServer) stripGateway(path string) string {
 	return path
 }
 
+// send 统一写响应: 字符串/字节直出, 其他按 JSON 编码
 func (s *AppServer) send(w http.ResponseWriter, code int, body any, ctype string) {
 	var data []byte
 	switch v := body.(type) {
@@ -198,6 +210,7 @@ func (s *AppServer) send(w http.ResponseWriter, code int, body any, ctype string
 	w.Write(data)
 }
 
+// serveStatic 提供 WebRoot 内静态文件 (防目录穿越)
 func (s *AppServer) serveStatic(w http.ResponseWriter, path string) {
 	if path == "/" || path == "" {
 		path = "/index.html"
@@ -224,6 +237,7 @@ func (s *AppServer) serveStatic(w http.ResponseWriter, path string) {
 	s.send(w, 200, data, ctype)
 }
 
+// doGet 分发 GET 请求到各 API 端点 (非 /api/ 路径回落静态文件)
 func (s *AppServer) doGet(w http.ResponseWriter, r *http.Request, p string) {
 	ctx := r.Context()
 	switch p {
@@ -242,21 +256,34 @@ func (s *AppServer) doGet(w http.ResponseWriter, r *http.Request, p string) {
 			s.send(w, 200, map[string]any{"ok": false, "error": "no-energy"}, "application/json")
 		}
 	case "/api/log":
-		// 下载运行日志
-		if _, err := os.Stat(LogPath); err == nil {
-			body, err := os.ReadFile(LogPath)
-			if err != nil {
-				s.send(w, 500, map[string]any{"error": err.Error()}, "application/json")
-				return
-			}
-			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-			w.Header().Set("Content-Disposition", `attachment; filename="psu-monitor.log"`)
-			w.Header().Set("Content-Length", strconv.Itoa(len(body)))
-			w.WriteHeader(200)
-			w.Write(body)
-		} else {
-			s.send(w, 200, "日志文件不存在(尚无输出)", "text/plain; charset=utf-8")
+		// 下载运行日志 (可能含硬件信息, 与写操作同级要求管理员)。
+		// O_NOFOLLOW 拒绝符号链接 (/tmp 多用户可写, 防 root 被劫持读任意文件);
+		// 完整错误只记服务端日志, 不向客户端回显原始错误文本 (防泄露服务器路径)。
+		if !AdminCheck(r) {
+			s.send(w, http.StatusForbidden, map[string]any{"error": "仅管理员可以下载日志"}, "application/json")
+			return
 		}
+		f, err := os.OpenFile(LogPath, os.O_RDONLY|openNoFollow, 0)
+		if err != nil {
+			s.send(w, 200, "日志文件不存在(尚无输出)", "text/plain; charset=utf-8")
+			return
+		}
+		defer f.Close()
+		if st, err := f.Stat(); err != nil || !st.Mode().IsRegular() {
+			s.send(w, 200, "日志文件不存在(尚无输出)", "text/plain; charset=utf-8")
+			return
+		}
+		body, err := io.ReadAll(f)
+		if err != nil {
+			Logf("读取运行日志失败: %v", err)
+			s.send(w, 500, map[string]any{"error": "read-failed"}, "application/json")
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("Content-Disposition", `attachment; filename="psu-monitor.log"`)
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		w.WriteHeader(200)
+		w.Write(body)
 	case "/api/config":
 		if s.Bus != nil {
 			scl, sda := s.Bus.pinNames()
@@ -283,15 +310,22 @@ func (s *AppServer) doGet(w http.ResponseWriter, r *http.Request, p string) {
 	}
 }
 
+// readJSONBody 读并解析 POST JSON body (限长; 解析失败返回空 map)
 func readJSONBody(r *http.Request) map[string]any {
-	data, _ := io.ReadAll(r.Body)
+	data, _ := io.ReadAll(io.LimitReader(r.Body, jsonBodyMaxBytes))
 	m := map[string]any{}
 	_ = json.Unmarshal(data, &m)
 	return m
 }
 
+// doPost 分发 POST 请求 (所有写接口先过管理员鉴权)
 func (s *AppServer) doPost(w http.ResponseWriter, r *http.Request, p string) {
 	ctx := r.Context()
+	// 所有写接口 (fan/config/detect/energy reset) 要求管理员, 与宿主同一套鉴权
+	if !AdminCheck(r) {
+		s.send(w, http.StatusForbidden, map[string]any{"error": "仅管理员可以执行此操作"}, "application/json")
+		return
+	}
 	switch p {
 	case "/api/fan":
 		if s.Bus == nil || !s.Bus.isConfigured() {
@@ -315,6 +349,9 @@ func (s *AppServer) doPost(w http.ResponseWriter, r *http.Request, p string) {
 		}
 		if pct < 10 { // 手动指定占比范围 10-100%
 			pct = 10
+		}
+		if pct > 100 {
+			pct = 100
 		}
 		ok := s.Bus.setFan(ctx, mode, pct)
 		// 异步延后刷新快照: 不在响应路径同步读 (会与后台循环/连续切换抢总线锁拖慢响应),
@@ -347,7 +384,8 @@ func (s *AppServer) doPost(w http.ResponseWriter, r *http.Request, p string) {
 			cfg := map[string]string{"scl_pin": scl, "sda_pin": sda}
 			if data, err := json.MarshalIndent(cfg, "", "  "); err == nil {
 				if err := os.WriteFile(s.ConfigPath, data, 0644); err != nil {
-					msg = "已应用, 但配置保存失败: " + err.Error()
+					Logf("GPIO 配置写盘失败 (%s): %v", s.ConfigPath, err) // 完整错误只记服务端, 不回显路径
+					msg = "已应用, 但配置保存失败"
 				}
 			}
 		}
@@ -402,6 +440,7 @@ func (s *AppServer) doPost(w http.ResponseWriter, r *http.Request, p string) {
 	}
 }
 
+// ServeHTTP 实现 http.Handler: 剥网关前缀后按方法分发
 func (s *AppServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p := s.stripGateway(r.URL.Path)
 	switch r.Method {

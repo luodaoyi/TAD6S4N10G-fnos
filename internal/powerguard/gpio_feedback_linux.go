@@ -63,6 +63,9 @@ func (m *Manager) PlayGPIOFeedback(event GPIOEvent) error {
 	}
 	gpioFeedbackMu.Lock()
 	defer gpioFeedbackMu.Unlock()
+	// LED 端口写与按键轮询/CRPS bitbang 共用同一把叶子锁
+	portIOMu.Lock()
+	defer portIOMu.Unlock()
 	return runGPIOFeedback(
 		*event.Feedback,
 		linuxGPIOToneOutput{path: m.rooted(gpioSpeakerEventPath)},
