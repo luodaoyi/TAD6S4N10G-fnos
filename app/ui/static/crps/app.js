@@ -1,4 +1,4 @@
-﻿// CRPS 电源监控 前端逻辑 (融合版: API 走 ../api/crps/)
+// CRPS 电源监控 前端逻辑 (融合版: API 走 ../api/crps/)
 (function () {
   "use strict";
 
@@ -107,12 +107,27 @@
 
   var lastOk = null;
 
+  // showNetErr 后端不可达: 已配置时保留原内容只报 banner; 初始/未配置态内容本就隐藏, banner 例外显示
+  function showNetErr(text) {
+    setBanner(false, text);
+    if (!document.body.classList.contains("cfg-ok")) {
+      $("status-banner").classList.add("net-err"); // setBanner 重置过 className, 须在其后补
+    }
+  }
+
   // render 用一轮 /api/status 数据刷新整个页面 (参数/横幅/风扇/厂商信息)
   function render(data) {
     if (!data) {
-      setBanner(false, "无法连接后端服务");
+      showNetErr("无法连接后端服务");
       return;
     }
+    // 未配置/未检测到电源(没插线): 隐藏监控/耗电/风扇/电源信息, 只留 GPIO 配置区引导接线。
+    // 判定: 带 error (=gpio-not-configured/no-gpio 降级) 或 ok==null (总线通但状态字都读不到, 实机没插线的常态)
+    var wasOk = document.body.classList.contains("cfg-ok");
+    var nowOk = !data.error && data.ok != null;
+    document.body.classList.toggle("cfg-ok", nowOk);
+    if (nowOk && !wasOk) pollEnergy(); // 刚显示: canvas 离开 display:none, 立即补拉耗电渲染, 不等 10s 轮询
+    $("status-banner").classList.remove("net-err");
     METRIC_DEFS.forEach(function (m) {
       var v = data[m.key];
       var extra = "";
@@ -193,7 +208,7 @@
       .then(function (r) { return r.json(); })
       .then(render)
       .catch(function (e) {
-        setBanner(false, "读取失败: " + e.message);
+        showNetErr("读取失败: " + e.message);
         $("header-sub").textContent = "PMBus 连接异常";
       });
   }
@@ -349,7 +364,7 @@
         } else if (d.configured === false) {
           gpioMsgShow(false, "尚未设置 GPIO 引脚：选择 PSCL/PSDA 后点“保存并应用”开始读取");
         } else {
-          gpioMsgShow(d.readable === true, d.readable === true ? "当前接线可读（已读到电源数据）" : "当前接线未检测到电源数据");
+          gpioMsgShow(d.readable === true, d.readable === true ? "当前接线可读（已读到电源数据）" : "未检测到电源：请检查 PSCL/PSDA 接线，或点「自动识别保存」重新识别");
         }
       })
       .catch(function () { gpioMsgShow(false, "无法读取 GPIO 配置"); });
@@ -380,47 +395,45 @@
       .catch(function (e) { gpioMsgShow(false, "应用失败: " + e.message); });
   });
 
-  // ---- 自动探测 PSCL/PSDA ----
+  // ---- 自动识别保存 PSCL/PSDA ----
   var gpioDetect = $("gpio-detect");
   if (gpioDetect) gpioDetect.addEventListener("click", function () {
-    gpioMsgShow(true, "正在自动探测 Pin19~22…（约几秒，请稍候）");
+    gpioMsgShow(true, "正在自动识别 Pin19-22…（约几秒，请稍候）");
     gpioDetect.disabled = true;
     fetch("../api/crps/detect", { method: "POST" })
       .then(function (r) { return r.json(); })
       .then(function (d) {
         gpioDetect.disabled = false;
         if (d && d.found) {
-          gpioMsgShow(true, "已自动探测到接线：PSCL=" + d.scl_pin + " PSDA=" + d.sda_pin + "，开始读取");
+          // 识别成功: 填入针脚并自动走保存流程 (含持久化/写盘失败告警/状态刷新)
           if (sclSel && d.scl_pin) sclSel.value = d.scl_pin;
           if (sdaSel && d.sda_pin) sdaSel.value = d.sda_pin;
-          loadGpioConfig();   // 刷新下拉动态标注
-          setTimeout(poll, 300);
+          gpioMsgShow(true, "已识别 PSCL=" + d.scl_pin + " PSDA=" + d.sda_pin + "，正在保存…");
+          gpioSave.click();
         } else {
-          gpioMsgShow(false, (d && d.msg) || "未探测到电源接线，请检查线缆后重试");
+          gpioMsgShow(false, "检测信号失败，请重新接线保证正确连接信号线。");
         }
       })
       .catch(function (e) {
         gpioDetect.disabled = false;
-        gpioMsgShow(false, "探测失败: " + e.message);
+        gpioMsgShow(false, "识别失败: " + e.message);
       });
   });
 
-  // ---- 查看日志(弹窗显示 + 复制) ----
+  // ---- 查看连线方法(点击切换接线图弹层, 点弹层外关闭) ----
   var dlLog = $("dl-log");
-  if (dlLog) dlLog.addEventListener("click", function () {
-    fetch("../api/crps/log")
-      .then(function (r) {
-        if (!r.ok) throw new Error("HTTP " + r.status); // 非管理员 403 等: 走 catch 报错, 不把错误 JSON 当日志显示
-        return r.text();
-      })
-      .then(function (t) {
-        var body = $("log-body");
-        var mask = $("log-mask");
-        if (body) body.textContent = t || "(日志为空)";
-        if (mask) mask.style.display = "flex";
-      })
-      .catch(function (e) { gpioMsgShow(false, "读取日志失败: " + e.message); });
-  });
+  var wiringPop = $("wiring-pop");
+  if (dlLog && wiringPop) {
+    dlLog.addEventListener("click", function (e) {
+      e.stopPropagation();
+      wiringPop.classList.toggle("show");
+    });
+    document.addEventListener("click", function (e) {
+      if (!wiringPop.contains(e.target)) wiringPop.classList.remove("show");
+    });
+  }
+
+  // ---- 日志弹窗 (入口已移除: "查看日志"按钮改为"查看连线方法"点击弹接线图; 日志功能保留, 可经 /api/crps/log 访问) ----
   var logCopy = $("log-copy");
   if (logCopy) logCopy.addEventListener("click", function () {
     var body = $("log-body");

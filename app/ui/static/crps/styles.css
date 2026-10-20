@@ -226,8 +226,25 @@ footer { display: flex; justify-content: space-between; margin-top: 14px; color:
   .ecard .val { font-size: 18px; }
   /* 柱状图加高, 提升窄屏可读性 (JS 读 clientHeight 适配) */
   #energy-chart-canvas { height: 180px; }
+  /* 接线图弹层: 手机端不做悬浮层, display:contents 让按钮/弹层直接成为 grid 项,
+     弹层横跨整行铺满、出现在按钮行下方, 参与文档流把后面的提示文字推开 (不遮挡) */
+  .gpio-actions .wiring-wrap { display: contents; }
+  .gpio-actions .wiring-pop { grid-column: 1 / -1; position: static; width: auto; }
 }
 
 /* 融合模式下宿主 CSP (style-src 'self') 会忽略 HTML 行内 style 属性,
    初始隐藏统一用 class; JS 动态 element.style 优先级高于类, 不受影响 */
 .hidden { display: none; }
+
+/* 未保存 GPIO 配置前只留 GPIO 配置区: 其余区块默认隐藏, JS 确认已配置后给 body 加 cfg-ok 显示。
+   banner 用 ID 选择器 (className 会被 setBanner 重置); 后端不可达时 banner 例外显示报错 */
+body:not(.cfg-ok) .needs-cfg { display: none; }
+body:not(.cfg-ok) #status-banner { display: none; }
+body:not(.cfg-ok) #status-banner.net-err { display: flex; }
+
+/* 接线示意图: 点"查看连线方法"按钮切换显示 (JS 加/去 .show), 点弹层外关闭 */
+.wiring-wrap { position: relative; display: inline-block; }
+.wiring-pop { display: none; position: absolute; left: 0; top: calc(100% + 6px); z-index: 60; width: min(560px, 86vw); background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: 0 8px 30px rgba(0,0,0,0.3); padding: 10px; }
+.wiring-pop.show { display: block; }
+.wiring-pop img { display: block; width: 100%; border-radius: 6px; background: var(--surface-muted); }
+.wiring-note { display: block; margin-top: 8px; font-size: 12px; font-weight: 400; line-height: 1.6; color: var(--text); }

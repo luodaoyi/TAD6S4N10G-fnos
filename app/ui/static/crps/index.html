@@ -18,11 +18,11 @@
     <span id="status-text">读取中…</span>
   </section>
 
-  <section class="grid" id="metrics">
+  <section class="grid needs-cfg" id="metrics">
     <!-- 参数卡片由 JS 填充 -->
   </section>
 
-  <section class="energy-panel">
+  <section class="energy-panel needs-cfg">
     <div class="curve-head">
       <h2>🔋 耗电统计</h2>
       <button id="energy-reset" class="export-btn">统计清零</button>
@@ -55,7 +55,7 @@
     <div class="export-msg" id="energy-msg"></div>
   </section>
 
-  <section class="fan-panel">
+  <section class="fan-panel needs-cfg">
     <h2>🖥 风扇控制</h2>
     <div class="fan-head">
       <div class="fan-row">
@@ -88,21 +88,27 @@
         <select id="sda-pin"></select>
       </div>
       <div class="gpio-actions">
+        <button id="gpio-detect" class="export-btn">自动识别保存</button>
         <button id="gpio-save" class="export-btn">保存并应用</button>
-        <button id="gpio-detect" class="export-btn">自动探测</button>
-        <button id="dl-log" class="export-btn">查看日志</button>
+        <span class="wiring-wrap">
+          <button id="dl-log" class="export-btn">查看连线方法</button>
+          <span class="wiring-pop" id="wiring-pop">
+            <img src="wiring.jpg" alt="硬盘背板与主板 FPANEL 接线示意图">
+            <span class="wiring-note">此功能需要连接硬盘背板 PSDA 和 PSCL 信号到主板的 FPANEL 19PIN 和 20PIN（不分方向），连接好后点击“自动识别保存”即可启用电源监管功能。</span>
+          </span>
+        </span>
       </div>
     </div>
-    <div class="gpio-tip">Pin19~22 四根 GPIO 已实测可双向。选择当前实际接到电源 PSCL / PSDA 的针脚后点“保存并应用”，后端立即切换并持久化，换线后改这里即可。自动探测会自动扫描 19~22 找到接线。</div>
+    <div class="gpio-tip">Pin19-22 四根 GPIO 已实测可双向。选择当前实际接到电源 PSCL/PSDA 的针脚后点“保存并应用”，后端立即切换并持久化，换线后改这里即可。自动探测会自动扫描 19-22 找到接线。</div>
     <div class="gpio-msg" id="gpio-msg"></div>
   </section>
 
-  <section class="mfr-panel">
+  <section class="mfr-panel needs-cfg">
     <h2>🏭 电源信息</h2>
     <div class="mfr" id="mfr-info">--</div>
   </section>
 
-  <footer>
+  <footer class="needs-cfg">
     <span id="ts">--</span>
     <span id="bus-info">--</span>
     <span id="app-ver"></span>
