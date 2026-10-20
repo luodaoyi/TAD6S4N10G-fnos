@@ -2,6 +2,7 @@ package crpsump
 
 import (
 	"context"
+	"errors"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -20,9 +21,10 @@ func TestMain(m *testing.M) {
 	if err != nil {
 		panic(err)
 	}
-	defer os.RemoveAll(dir)
 	LogPath = filepath.Join(dir, "psu-monitor-test.log")
-	os.Exit(m.Run())
+	code := m.Run()
+	_ = os.RemoveAll(dir) // os.Exit 不跑 defer, 显式清理
+	os.Exit(code)
 }
 
 // ---------------- 硬件 mock ----------------
@@ -34,6 +36,7 @@ type mockPIO struct {
 	mu       sync.Mutex
 	mem      map[int]byte
 	readMask map[int]byte
+	failOutb bool // true 时 outb 恒失败 (测试端口写错误向上传播)
 	writes   int
 }
 
@@ -48,11 +51,15 @@ func (m *mockPIO) inb(port int) byte {
 	return m.mem[port]
 }
 
-func (m *mockPIO) outb(port int, v byte) {
+func (m *mockPIO) outb(port int, v byte) error {
 	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.failOutb {
+		return errors.New("mock: 端口写失败")
+	}
 	m.mem[port] = v
 	m.writes++
-	m.mu.Unlock()
+	return nil
 }
 
 func (m *mockPIO) writeCount() int {
@@ -268,6 +275,36 @@ func TestEnergySampleAndReset(t *testing.T) {
 	}
 }
 
+// ---------------- 端口写失败传播 ----------------
+
+// 端口写失败必须向上传播: reconfigure 报失败, 读返回 nil, 风扇写返回 false,
+// 不允许静默成功 (方向缓存也不得更新)
+func TestPortWriteFailurePropagates(t *testing.T) {
+	stubPortAvailable(t, true)
+	b := NewBus("Pin19", "Pin20", false)
+	mock := newMockPIO()
+	mock.readMask[GPPins["Pin20"].Port] = 0
+	b.pio = mock
+	mock.failOutb = true
+	if ok, msg := b.reconfigure(nil, nil); ok {
+		t.Fatal("端口写失败时 reconfigure 应报失败")
+	} else if !strings.Contains(msg, "GPIO") {
+		t.Fatalf("reconfigure 失败信息应说明 GPIO 写入失败, 实际: %s", msg)
+	}
+	if b.isConfigured() {
+		t.Fatal("reconfigure 失败不得标记 configured")
+	}
+	if w := b.readWord(Cmd["READ_VIN"]); w != nil {
+		t.Fatal("端口写失败时 readWord 应返回 nil")
+	}
+	if b.setFan(context.Background(), "manual", 50) {
+		t.Fatal("端口写失败时 setFan 应返回 false")
+	}
+	if b.sclOut || b.sdaOut {
+		t.Fatal("方向写失败不得更新方向缓存")
+	}
+}
+
 // ---------------- HTTP 鉴权与 body 限长 ----------------
 
 // 替换 AdminCheck 并在测试结束后恢复
@@ -360,15 +397,56 @@ func TestFanPctClamp(t *testing.T) {
 }
 
 func TestReadJSONBodyLimit(t *testing.T) {
-	// 超限 body 被截断 -> 非法 JSON -> 空 map, 不应 panic 或读满内存
+	// 超限 body -> *http.MaxBytesError (413 语义), 调用方拒绝执行
 	big := strings.Repeat(" ", jsonBodyMaxBytes+1024)
 	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(big))
-	if m := readJSONBody(req); len(m) != 0 {
-		t.Fatalf("超限 body 应解析为空 map, 得到 %d 键", len(m))
+	if _, err := readJSONBody(httptest.NewRecorder(), req); err == nil {
+		t.Fatal("超限 body 应返回错误")
+	} else {
+		var mbe *http.MaxBytesError
+		if !errors.As(err, &mbe) {
+			t.Fatalf("超限错误应为 *http.MaxBytesError, 得到 %T: %v", err, err)
+		}
+	}
+	// 非法 JSON -> 解析错误 (400 语义)
+	req = httptest.NewRequest(http.MethodPost, "/", strings.NewReader("{oops"))
+	if _, err := readJSONBody(httptest.NewRecorder(), req); err == nil {
+		t.Fatal("非法 JSON 应返回错误")
 	}
 	// 正常小 body 照常解析
 	req = httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"action":"reset"}`))
-	if m := readJSONBody(req); m["action"] != "reset" {
-		t.Fatalf("正常 body 解析失败: %v", m)
+	m, err := readJSONBody(httptest.NewRecorder(), req)
+	if err != nil || m["action"] != "reset" {
+		t.Fatalf("正常 body 解析失败: %v err=%v", m, err)
+	}
+}
+
+// POST 带非法/超限 JSON body: 回 400/413 并停止处理, 不得以默认值执行写操作
+func TestPostRejectsBadBody(t *testing.T) {
+	stubAdmin(t, true)
+	stubPortAvailable(t, true)
+	b := NewBus("Pin19", "Pin20", false)
+	mock := newMockPIO()
+	mock.readMask[GPPins["Pin20"].Port] = 0
+	b.pio = mock
+	if ok, _ := b.reconfigure(nil, nil); !ok {
+		t.Fatal("reconfigure 失败")
+	}
+	srv := &AppServer{Bus: b}
+	h := srv.APIHandler()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/crps/fan", strings.NewReader("{oops"))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("非法 JSON 应回 400, 得到 %d", rec.Code)
+	}
+
+	big := strings.NewReader(`{"pct":50,"pad":"` + strings.Repeat("x", jsonBodyMaxBytes) + `"}`)
+	req = httptest.NewRequest(http.MethodPost, "/api/crps/fan", big)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("超限 body 应回 413, 得到 %d", rec.Code)
 	}
 }

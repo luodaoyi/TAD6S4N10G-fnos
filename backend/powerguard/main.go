@@ -437,7 +437,7 @@ func usage() {
 }
 
 // initCrps 初始化 CRPS PMBus 监控板块 (可选功能)。配置读独立文件 cfgPath
-// (scl_pin/sda_pin, 缺省 Pin19/Pin20, 有文件即视为已在界面设置过)，
+// (scl_pin/sda_pin, 缺省 Pin19/Pin20; 仅两个字段齐全才视为已在界面配置过)，
 // 耗电统计落盘 <cfgPath 同目录>/energy.json。NewBus 对非法引脚名内部回退默认值、
 // 硬件不可达在请求时降级为 no-gpio，因此本函数不返回错误，CRPS 始终挂载。
 // 日志沿用 crpsump 自有的 /tmp/psu-monitor.log (自带按大小轮转)，不并入主日志。
@@ -456,7 +456,9 @@ func initCrps(logger *log.Logger, cfgPath string) (http.Handler, func()) {
 			if cfg.Sda != "" {
 				sdaPin = cfg.Sda
 			}
-			configured = true
+			// 仅完整引脚对(界面保存/探测成功才会双双写盘)才算已配置:
+			// 空文件 {} 或缺字段不得在启动时触发 GPIO 方向初始化
+			configured = cfg.Scl != "" && cfg.Sda != ""
 		}
 	}
 	// 与宿主对齐: 写接口走宿主同一套管理员鉴权 (X-Trim-Isadmin),

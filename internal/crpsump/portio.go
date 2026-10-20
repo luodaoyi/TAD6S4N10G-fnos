@@ -10,16 +10,16 @@ import (
 // portIO 抽象 /dev/port 单字节读写, 便于单测 mock (默认 realPortIO 走真实硬件)
 type portIO interface {
 	inb(port int) byte
-	outb(port int, v byte)
+	outb(port int, v byte) error
 }
 
 type realPortIO struct{}
 
 // inb 真实硬件端口读 (转发到包级 inb)
-func (realPortIO) inb(port int) byte    { return inb(port) }
+func (realPortIO) inb(port int) byte { return inb(port) }
 
-// outb 真实硬件端口写 (转发到包级 outb)
-func (realPortIO) outb(port int, v byte) { outb(port, v) }
+// outb 真实硬件端口写 (转发到包级 outb, 返回写入错误)
+func (realPortIO) outb(port int, v byte) error { return outb(port, v) }
 
 // defaultPortIO 为 NewBus 创建的总线默认端口实现 (单测可替换为 mock)
 var defaultPortIO portIO = realPortIO{}
@@ -73,35 +73,45 @@ func inb(port int) byte {
 	return buf[0]
 }
 
-// outb 向 /dev/port 写一个字节; 常驻句柄失效时退化为临时打开
-func outb(port int, v byte) {
+// outb 向 /dev/port 写一个字节并返回写入错误; 常驻句柄失效时退化为临时打开
+func outb(port int, v byte) error {
 	f, err := portHandle()
 	if err != nil {
 		f, err = os.OpenFile("/dev/port", os.O_RDWR, 0)
 		if err != nil {
-			return
+			return err
 		}
 		defer f.Close()
 	}
-	f.WriteAt([]byte{v & 0xFF}, int64(port))
+	_, err = f.WriteAt([]byte{v & 0xFF}, int64(port))
+	return err
 }
 
 // ---------------- SuperIO LDN7 配置访问 (调用方须持 PortIOLocker) ----------------
 
-// sioEnter 进入 SuperIO 配置模式
-func sioEnter(p portIO) { p.outb(0x2E, 0x87); p.outb(0x2E, 0x01); p.outb(0x2E, 0x55); p.outb(0x2E, 0x55) }
+// sioEnter 进入 SuperIO 配置模式, 任一字节写失败即返回错误
+func sioEnter(p portIO) error {
+	for _, v := range []byte{0x87, 0x01, 0x55, 0x55} {
+		if err := p.outb(0x2E, v); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
 // sioExit 退出 SuperIO 配置模式
-func sioExit(p portIO)  { p.outb(0x2E, 0xAA) }
+func sioExit(p portIO) error { return p.outb(0x2E, 0xAA) }
 
 // sioRead 读 SuperIO 配置寄存器
 func sioRead(p portIO, reg byte) byte {
-	p.outb(0x2E, reg)
+	_ = p.outb(0x2E, reg)
 	return p.inb(0x2F)
 }
 
 // sioWrite 写 SuperIO 配置寄存器
-func sioWrite(p portIO, reg, v byte) {
-	p.outb(0x2E, reg)
-	p.outb(0x2F, v&0xFF)
+func sioWrite(p portIO, reg, v byte) error {
+	if err := p.outb(0x2E, reg); err != nil {
+		return err
+	}
+	return p.outb(0x2F, v & 0xFF)
 }

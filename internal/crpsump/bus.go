@@ -127,6 +127,7 @@ type Bus struct {
 	sclOut     bool // 方向缓存
 	sdaOut     bool
 	dirsInit   bool // 是否已写过方向寄存器 (用于切换引脚时只释放自己驱动过的旧针)
+	ioErr      error // 当前事务首个端口写失败 (mu 保护); 事务末尾检查, 失败则整个事务作废
 	mu         sync.Mutex // 总线 I/O 与引脚配置
 	stateMu    sync.Mutex // configured / fanMode / readable 缓存
 	ok         bool
@@ -170,64 +171,88 @@ func NewBus(scl, sda string, configured bool) *Bus {
 	b.ok = true
 	// 初始化: SCL=输出, SDA=输入(释放)。
 	// 仅在已配置时写方向寄存器: 未配置的机器(可能无 CRPS 硬件)启动不得触碰 GPIO 方向,
-	// 首次界面保存/探测成功(reconfigure)时才写。
+	// 首次界面保存/探测成功(reconfigure)时才写。方向写失败同样降级 no-gpio。
 	if configured {
-		b.initDirs()
+		if err := b.initDirs(); err != nil {
+			Logf("警告: GPIO 方向初始化失败: %v, 接口降级 no-gpio", err)
+			b.ok = false
+		}
 	}
 	return b
 }
 
-// setPinDir 无条件写 SIO 方向寄存器 (被带缓存的 ensure* 调用)。
+// setPinDir 无条件写 SIO 方向寄存器 (被带缓存的 ensure* 调用), 返回首个写入错误。
 // 整段 sioEnter..sioExit 在 PortIOLocker 下进行, 与宿主 GPIO 访问串行化。
-func (b *Bus) setPinDir(cfg GPPin, out bool) {
+func (b *Bus) setPinDir(cfg GPPin, out bool) error {
 	PortIOLocker.Lock()
 	defer PortIOLocker.Unlock()
-	sioEnter(b.pio)
-	sioWrite(b.pio, 0x07, 0x07) // 选 LDN7 (GPIO)
+	if err := sioEnter(b.pio); err != nil {
+		return err
+	}
+	if err := sioWrite(b.pio, 0x07, 0x07); err != nil { // 选 LDN7 (GPIO)
+		return err
+	}
 	cur := sioRead(b.pio, byte(cfg.DirReg))
 	if out {
 		cur |= 1 << uint(cfg.DirBit)
 	} else {
 		cur &^= 1 << uint(cfg.DirBit)
 	}
-	sioWrite(b.pio, byte(cfg.DirReg), cur)
-	sioExit(b.pio)
+	if err := sioWrite(b.pio, byte(cfg.DirReg), cur); err != nil {
+		return err
+	}
+	return sioExit(b.pio)
 }
 
-// ensure* 只在方向缓存与实际不符时才写 SIO (方向寄存器缓存)
-func (b *Bus) ensureSclOut() {
+// ensure* 只在方向缓存与实际不符时才写 SIO (方向寄存器缓存); 写失败不更新缓存,
+// 返回错误由调用方 (bit 操作/事务) 记录上报, 下次操作会重试写方向
+func (b *Bus) ensureSclOut() error {
 	if b.sclOut {
-		return
+		return nil
 	}
-	b.setPinDir(b.sclCfg, true)
+	if err := b.setPinDir(b.sclCfg, true); err != nil {
+		return err
+	}
 	b.sclOut = true
+	return nil
 }
 
 // ensureSdaOut 确保 SDA 引脚为输出方向 (方向缓存命中时不写 SIO)
-func (b *Bus) ensureSdaOut() {
+func (b *Bus) ensureSdaOut() error {
 	if b.sdaOut {
-		return
+		return nil
 	}
-	b.setPinDir(b.sdaCfg, true)
+	if err := b.setPinDir(b.sdaCfg, true); err != nil {
+		return err
+	}
 	b.sdaOut = true
+	return nil
 }
 
 // ensureSdaIn 确保 SDA 引脚为输入方向 (方向缓存命中时不写 SIO)
-func (b *Bus) ensureSdaIn() {
+func (b *Bus) ensureSdaIn() error {
 	if !b.sdaOut {
-		return
+		return nil
 	}
-	b.setPinDir(b.sdaCfg, false)
+	if err := b.setPinDir(b.sdaCfg, false); err != nil {
+		return err
+	}
 	b.sdaOut = false
+	return nil
 }
 
-// initDirs 初始化引脚方向: SCL=输出, SDA=输入(释放), 并标记方向已写
-func (b *Bus) initDirs() {
-	b.setPinDir(b.sclCfg, true)
+// initDirs 初始化引脚方向: SCL=输出, SDA=输入(释放), 并标记方向已写; 任一步失败返回错误
+func (b *Bus) initDirs() error {
+	if err := b.setPinDir(b.sclCfg, true); err != nil {
+		return err
+	}
 	b.sclOut = true
-	b.setPinDir(b.sdaCfg, false)
+	if err := b.setPinDir(b.sdaCfg, false); err != nil {
+		return err
+	}
 	b.sdaOut = false
 	b.dirsInit = true
+	return nil
 }
 
 // ---- 状态字段访问 (stateMu) ----
@@ -283,7 +308,9 @@ func (b *Bus) switchPin(scl, sda string) (bool, string) {
 	if b.dirsInit {
 		for _, old := range []string{b.sclName, b.sdaName} {
 			if old != scl && old != sda {
-				b.setPinDir(GPPins[old], false)
+				if err := b.setPinDir(GPPins[old], false); err != nil {
+					Logf("警告: 释放旧引脚 %s 失败: %v", old, err)
+				}
 			}
 		}
 	}
@@ -291,11 +318,14 @@ func (b *Bus) switchPin(scl, sda string) (bool, string) {
 	b.sclCfg = sc
 	b.sdaName = sda
 	b.sdaCfg = sd
-	if !portAvailable() { // 引脚已切换, 硬件暂不可达: 接口降级 no-gpio
+	if !portAvailable() { // 硬件不可达: 如实报失败, 不得标记可用后又持续 no-gpio
 		b.ok = false
-		return true, "ok"
+		return false, "无法打开 /dev/port, GPIO 不可用"
 	}
-	b.initDirs() // 重置方向缓存为新引脚
+	if err := b.initDirs(); err != nil { // 方向写失败: 如实报失败, 不假装就绪
+		b.ok = false
+		return false, "GPIO 方向写入失败: " + err.Error()
+	}
 	b.ok = true
 	return true, "ok"
 }
@@ -310,11 +340,14 @@ func (b *Bus) reconfigure(scl, sda *string) (bool, string) {
 		nd = *sda
 	}
 	ok, msg := b.switchPin(ns, nd)
-	if ok {
-		b.setConfigured(true) // 界面设置成功 => GPIO 就绪
-		b.busReset()          // 复位电源从机, 清掉之前探测可能留下的错误状态
+	if !ok {
+		return ok, msg
 	}
-	return ok, msg
+	if err := b.busReset(); err != nil { // 复位电源从机, 清掉之前探测可能留下的错误状态
+		return false, "GPIO 写入失败(总线复位): " + err.Error()
+	}
+	b.setConfigured(true) // 界面设置成功 => GPIO 就绪
+	return true, "ok"
 }
 
 // autoDetect 自动扫描候选针脚组合, 找到电源实际接的 PSCL/PSDA (默认扫 Pin19~22)。
@@ -409,6 +442,22 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 // 每处数据口的读-改-写都在 PortIOLocker 临界区内完成, 与宿主的按键轮询/LED 反馈
 // (同处 0xA0x GPIO 块) 串行化; 锁粒度为单次 RMW, bitbang 位间可被宿主轮询插入,
 // 不影响 I2C 时序正确性 (Delay 为软件定时)。
+// 端口写失败不逐位返回 (避免时序函数签名爆炸), 统一记入 ioErr, 由事务层
+// (readWord/readBlock/writeWordCmd/busReset) 末尾检查并使整个事务失败。
+
+// setIOErr 记录本次事务首个端口写失败 (调用方须持 mu); nil 入参为空操作
+func (b *Bus) setIOErr(err error) {
+	if err != nil && b.ioErr == nil {
+		b.ioErr = err
+	}
+}
+
+// takeIOErr 取出并清零事务错误 (调用方须持 mu)
+func (b *Bus) takeIOErr() error {
+	err := b.ioErr
+	b.ioErr = nil
+	return err
+}
 
 // scl 写 SCL 电平 (v!=0 为高, 0 为低)
 func (b *Bus) scl(v int) {
@@ -419,13 +468,16 @@ func (b *Bus) scl(v int) {
 	} else {
 		cur &^= 1 << uint(b.sclCfg.Bit)
 	}
-	b.pio.outb(b.sclCfg.Port, cur)
+	b.setIOErr(b.pio.outb(b.sclCfg.Port, cur))
 	PortIOLocker.Unlock()
 }
 
-// sdaWrite 写 SDA 电平 (自动确保 SDA 为输出方向)
+// sdaWrite 写 SDA 电平 (自动确保 SDA 为输出方向); 方向或数据写失败记入 ioErr
 func (b *Bus) sdaWrite(v int) {
-	b.ensureSdaOut()
+	if err := b.ensureSdaOut(); err != nil {
+		b.setIOErr(err)
+		return
+	}
 	PortIOLocker.Lock()
 	cur := b.pio.inb(b.sdaCfg.Port)
 	if v != 0 {
@@ -433,13 +485,16 @@ func (b *Bus) sdaWrite(v int) {
 	} else {
 		cur &^= 1 << uint(b.sdaCfg.Bit)
 	}
-	b.pio.outb(b.sdaCfg.Port, cur)
+	b.setIOErr(b.pio.outb(b.sdaCfg.Port, cur))
 	PortIOLocker.Unlock()
 }
 
-// sdaRead 读 SDA 电平 (自动确保 SDA 为输入方向)
+// sdaRead 读 SDA 电平 (自动确保 SDA 为输入方向); 方向写失败记入 ioErr 并按高电平返回
 func (b *Bus) sdaRead() int {
-	b.ensureSdaIn()
+	if err := b.ensureSdaIn(); err != nil {
+		b.setIOErr(err)
+		return 1
+	}
 	PortIOLocker.Lock()
 	v := int((b.pio.inb(b.sdaCfg.Port) >> uint(b.sdaCfg.Bit)) & 1)
 	PortIOLocker.Unlock()
@@ -447,13 +502,13 @@ func (b *Bus) sdaRead() int {
 }
 
 // sdaRelease 释放 SDA (切为输入, 由外部上拉拉高)
-func (b *Bus) sdaRelease() { b.ensureSdaIn() }
+func (b *Bus) sdaRelease() { b.setIOErr(b.ensureSdaIn()) }
 
 // ---- I2C 时序 (调用方须持 mu) ----
 
 // i2cStart 产生 I2C START 时序
 func (b *Bus) i2cStart() {
-	b.ensureSclOut()
+	b.setIOErr(b.ensureSclOut())
 	b.sdaWrite(1)
 	b.scl(1)
 	time.Sleep(Delay)
@@ -473,12 +528,13 @@ func (b *Bus) i2cStop() {
 }
 
 // busReset SMBus 总线复位: 在当前 SCL 上发 >=9 个时钟脉冲, SDA 释放为高, 结束发 STOP。
-// 持 mu 执行, 避免与并发事务的时钟交错产生总线垃圾时序。
-func (b *Bus) busReset() {
+// 持 mu 执行, 避免与并发事务的时钟交错产生总线垃圾时序。返回端口写错误 (nil 为成功)。
+func (b *Bus) busReset() error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.ensureSclOut()
-	b.ensureSdaIn()
+	b.ioErr = nil
+	b.setIOErr(b.ensureSclOut())
+	b.setIOErr(b.ensureSdaIn())
 	for i := 0; i < 9; i++ {
 		b.scl(0)
 		time.Sleep(Delay)
@@ -491,6 +547,7 @@ func (b *Bus) busReset() {
 	b.sdaRelease()
 	time.Sleep(Delay)
 	time.Sleep(50 * time.Millisecond)
+	return b.takeIOErr()
 }
 
 // i2cWriteByte 写一个字节并读 ACK, 返回是否被从机应答
@@ -539,52 +596,64 @@ func (b *Bus) i2cReadByte(ack bool) int {
 
 // ---- 事务 (自带加锁) ----
 
-// readWord 读一个 word (从设备先发低字节), 返回 nil 表示失败
+// readWord 读一个 word (从设备先发低字节), 返回 nil 表示失败 (含端口写失败)
 func (b *Bus) readWord(cmd byte) *uint16 {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.ioErr = nil
 	b.i2cStart()
 	if !b.i2cWriteByte(b.addr << 1) {
 		b.i2cStop()
+		b.takeIOErr()
 		return nil
 	}
 	if !b.i2cWriteByte(cmd) {
 		b.i2cStop()
+		b.takeIOErr()
 		return nil
 	}
 	b.i2cStart()
 	if !b.i2cWriteByte((b.addr << 1) | 1) {
 		b.i2cStop()
+		b.takeIOErr()
 		return nil
 	}
 	lsb := b.i2cReadByte(true)
 	msb := b.i2cReadByte(false)
 	b.i2cStop()
+	if b.takeIOErr() != nil {
+		return nil
+	}
 	v := uint16(msb<<8 | lsb)
 	return &v
 }
 
-// readBlock block read (厂商信息), 返回 nil 表示失败
+// readBlock block read (厂商信息), 返回 nil 表示失败 (含端口写失败)
 func (b *Bus) readBlock(cmd byte) []byte {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.ioErr = nil
 	b.i2cStart()
 	if !b.i2cWriteByte(b.addr << 1) {
 		b.i2cStop()
+		b.takeIOErr()
 		return nil
 	}
 	if !b.i2cWriteByte(cmd) {
 		b.i2cStop()
+		b.takeIOErr()
 		return nil
 	}
 	b.i2cStart()
 	if !b.i2cWriteByte((b.addr << 1) | 1) {
 		b.i2cStop()
+		b.takeIOErr()
 		return nil
 	}
 	n := b.i2cReadByte(true) // 长度字节 (SMBus block read: 长度须 ACK)
 	if n > 32 {
 		b.i2cStop()
+		b.takeIOErr()
 		return nil
 	}
 	data := make([]byte, 0, n)
@@ -592,6 +661,9 @@ func (b *Bus) readBlock(cmd byte) []byte {
 		data = append(data, byte(b.i2cReadByte(i < n-1)))
 	}
 	b.i2cStop()
+	if b.takeIOErr() != nil {
+		return nil
+	}
 	return data
 }
 
@@ -640,10 +712,12 @@ func (b *Bus) writeWordCmd(cmd, lsb, msb byte) bool {
 	pec := crc8(b.addr<<1, []byte{cmd, lsb, msb})
 	for t := 0; t < 3; t++ {
 		b.mu.Lock()
+		b.ioErr = nil
 		ok := true
 		b.i2cStart()
 		if !b.i2cWriteByte(b.addr << 1) {
 			b.i2cStop()
+			b.takeIOErr()
 			b.mu.Unlock()
 			time.Sleep(50 * time.Millisecond)
 			continue
@@ -655,6 +729,9 @@ func (b *Bus) writeWordCmd(cmd, lsb, msb byte) bool {
 			}
 		}
 		b.i2cStop()
+		if b.takeIOErr() != nil { // 端口写失败: 本次作废, 重试
+			ok = false
+		}
 		b.mu.Unlock()
 		if ok {
 			return true

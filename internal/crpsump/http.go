@@ -2,6 +2,7 @@ package crpsump
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -310,12 +311,35 @@ func (s *AppServer) doGet(w http.ResponseWriter, r *http.Request, p string) {
 	}
 }
 
-// readJSONBody 读并解析 POST JSON body (限长; 解析失败返回空 map)
-func readJSONBody(r *http.Request) map[string]any {
-	data, _ := io.ReadAll(io.LimitReader(r.Body, jsonBodyMaxBytes))
+// readJSONBody 读并解析 POST JSON body: 超过 jsonBodyMaxBytes 返回 *http.MaxBytesError,
+// 非法 JSON 返回解析错误。调用方必须拒绝出错请求, 不得以默认值继续执行写操作
+// (静默截断可能把超限/残缺 body 解析成"合法"默认值而误写硬件)。
+func readJSONBody(w http.ResponseWriter, r *http.Request) (map[string]any, error) {
+	data, err := io.ReadAll(http.MaxBytesReader(w, r.Body, jsonBodyMaxBytes))
+	if err != nil {
+		return nil, err
+	}
 	m := map[string]any{}
-	_ = json.Unmarshal(data, &m)
-	return m
+	if err := json.Unmarshal(data, &m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+// jsonBodyOrReject 读取并校验 POST JSON body; 非法 JSON 回 400 / 超限回 413 并返回 nil
+// (调用方须立即 return 停止处理)
+func (s *AppServer) jsonBodyOrReject(w http.ResponseWriter, r *http.Request) map[string]any {
+	m, err := readJSONBody(w, r)
+	if err == nil {
+		return m
+	}
+	var mbe *http.MaxBytesError
+	if errors.As(err, &mbe) {
+		s.send(w, http.StatusRequestEntityTooLarge, map[string]any{"ok": false, "error": "请求体超过 1MB 上限"}, "application/json")
+	} else {
+		s.send(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "非法 JSON 请求体"}, "application/json")
+	}
+	return nil
 }
 
 // doPost 分发 POST 请求 (所有写接口先过管理员鉴权)
@@ -336,7 +360,10 @@ func (s *AppServer) doPost(w http.ResponseWriter, r *http.Request, p string) {
 			s.send(w, 200, map[string]any{"ok": false, "error": "no-gpio"}, "application/json")
 			return
 		}
-		body := readJSONBody(r)
+		body := s.jsonBodyOrReject(w, r)
+		if body == nil {
+			return // 非法/超限 body 已回 400/413
+		}
 		mode := "manual"
 		if m, ok := body["mode"].(string); ok {
 			mode = m
@@ -370,7 +397,10 @@ func (s *AppServer) doPost(w http.ResponseWriter, r *http.Request, p string) {
 			s.send(w, 200, map[string]any{"ok": false, "error": "no-gpio"}, "application/json")
 			return
 		}
-		body := readJSONBody(r)
+		body := s.jsonBodyOrReject(w, r)
+		if body == nil {
+			return // 非法/超限 body 已回 400/413
+		}
 		var sclPtr, sdaPtr *string
 		if v, ok := body["scl_pin"].(string); ok {
 			sclPtr = &v
@@ -427,7 +457,10 @@ func (s *AppServer) doPost(w http.ResponseWriter, r *http.Request, p string) {
 			s.send(w, 200, map[string]any{"ok": false, "error": "no-energy"}, "application/json")
 			return
 		}
-		body := readJSONBody(r)
+		body := s.jsonBodyOrReject(w, r)
+		if body == nil {
+			return // 非法/超限 body 已回 400/413
+		}
 		action, _ := body["action"].(string)
 		if action == "reset" {
 			energyStats.Reset()
