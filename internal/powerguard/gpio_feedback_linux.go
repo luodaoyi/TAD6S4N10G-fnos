@@ -63,9 +63,9 @@ func (m *Manager) PlayGPIOFeedback(event GPIOEvent) error {
 	}
 	gpioFeedbackMu.Lock()
 	defer gpioFeedbackMu.Unlock()
-	// LED 端口写与按键轮询/CRPS bitbang 共用同一把叶子锁
-	portIOMu.Lock()
-	defer portIOMu.Unlock()
+	// portIOMu 不在这里整段持有: 蜂鸣走 /dev/input、闪烁间隔是 200ms sleep,
+	// 全程持锁会让按键轮询与 CRPS bitbang 停顿 ~1s; 锁收敛到 flashGPIOLED 内
+	// 每次对 0xA00 的单字节读/写上 (LED 独占 0xA00, 与 CRPS 0xA01/0xA05 不同字节)。
 	return runGPIOFeedback(
 		*event.Feedback,
 		linuxGPIOToneOutput{path: m.rooted(gpioSpeakerEventPath)},
@@ -126,20 +126,32 @@ func flashGPIOLED(port gpioPortReadWriter, count int, sleep func(time.Duration))
 	if count <= 0 {
 		return nil
 	}
+	// portIOMu 只包裹每次单字节端口访问, sleep 期间释放, 不阻塞按键轮询/CRPS。
 	var original [1]byte
-	if _, err = port.ReadAt(original[:], gpioLEDPort); err != nil {
+	portIOMu.Lock()
+	_, err = port.ReadAt(original[:], gpioLEDPort)
+	portIOMu.Unlock()
+	if err != nil {
 		return err
 	}
 	defer func() {
+		portIOMu.Lock()
 		restoreErr := writeGPIOPortByte(port, gpioLEDPort, original[0])
+		portIOMu.Unlock()
 		err = errors.Join(err, restoreErr)
 	}()
 	for i := 0; i < count; i++ {
-		if err = writeGPIOPortByte(port, gpioLEDPort, original[0]|(1<<gpioLEDBit)); err != nil {
+		portIOMu.Lock()
+		err = writeGPIOPortByte(port, gpioLEDPort, original[0]|(1<<gpioLEDBit))
+		portIOMu.Unlock()
+		if err != nil {
 			return err
 		}
 		sleep(gpioFlashDuration)
-		if err = writeGPIOPortByte(port, gpioLEDPort, original[0]&^(1<<gpioLEDBit)); err != nil {
+		portIOMu.Lock()
+		err = writeGPIOPortByte(port, gpioLEDPort, original[0]&^(1<<gpioLEDBit))
+		portIOMu.Unlock()
+		if err != nil {
 			return err
 		}
 		if i+1 < count {
