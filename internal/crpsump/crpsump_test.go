@@ -36,23 +36,37 @@ type mockPIO struct {
 	mu             sync.Mutex
 	mem            map[int]byte
 	readMask       map[int]byte
-	failOutb       bool // true 时 outb 恒失败 (测试端口写错误向上传播)
-	failOutbOnPort int  // 非负时仅该端口 outb 失败 (测试局部写失败, 如 sioWrite 数据口)
-	sioExits       int  // 记录 sioExit (outb 0x2E=0xAA) 执行次数
+	failOutb       bool            // true 时 outb 恒失败 (测试端口写错误向上传播)
+	failOutbOnPort int             // 非负时仅该端口 outb 失败 (测试局部写失败, 如 sioWrite 数据口)
+	failInb        bool            // true 时 inb 恒失败 (测试端口读错误向上传播)
+	failWhen       map[int64]bool  // 定点故障注入: key=port<<8|v, 命中一次 outb(port,v) 失败后自动清除
+	sioExits       int             // 记录 sioExit (outb 0x2E=0xAA) 执行次数
 	writes         int
 }
 
 func newMockPIO() *mockPIO {
-	return &mockPIO{mem: map[int]byte{}, readMask: map[int]byte{}, failOutbOnPort: -1}
+	return &mockPIO{mem: map[int]byte{}, readMask: map[int]byte{}, failOutbOnPort: -1,
+		failWhen: map[int64]bool{}}
 }
 
-func (m *mockPIO) inb(port int) byte {
+// injectOutbFail 定点注入: 仅下一次 outb(port, v) 失败 (测试"仅方向寄存器索引
+// 选择失败一次"等精确故障路径, 不影响同端口其他值的写入)
+func (m *mockPIO) injectOutbFail(port int, v byte) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if v, ok := m.readMask[port]; ok {
-		return v
+	m.failWhen[int64(port)<<8|int64(v)] = true
+}
+
+func (m *mockPIO) inb(port int) (byte, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.failInb {
+		return 0, errors.New("mock: 端口读失败")
 	}
-	return m.mem[port]
+	if v, ok := m.readMask[port]; ok {
+		return v, nil
+	}
+	return m.mem[port], nil
 }
 
 func (m *mockPIO) outb(port int, v byte) error {
@@ -60,6 +74,11 @@ func (m *mockPIO) outb(port int, v byte) error {
 	defer m.mu.Unlock()
 	if m.failOutb || port == m.failOutbOnPort {
 		return errors.New("mock: 端口写失败")
+	}
+	key := int64(port)<<8 | int64(v)
+	if m.failWhen[key] {
+		delete(m.failWhen, key) // 一次性: 命中后自动恢复, 后续同参数写入正常
+		return errors.New("mock: 定点写失败")
 	}
 	if port == 0x2E && v == 0xAA {
 		m.sioExits++
@@ -324,11 +343,177 @@ func TestSetPinDirExitsSioOnWriteError(t *testing.T) {
 	mock.failOutbOnPort = 0x2F // sioWrite 数据口写全部失败
 	b := NewBus("Pin19", "Pin20", false)
 	b.pio = mock
-	if err := b.setPinDir(b.sclCfg, true); err == nil {
+	if err := b.setPinDir("Pin19", b.sclCfg, true); err == nil {
 		t.Fatal("sioWrite 失败应返回错误")
 	}
 	if mock.sioExitCount() == 0 {
 		t.Fatal("写失败时也必须 sioExit, 否则 SuperIO 滞留配置模式")
+	}
+}
+
+// 方向寄存器索引选择 (outb 0x2E=DirReg) 单次失败: setPinDir 必须报错且禁止写回。
+// 失败后数据口 0x2F 残留的是上一步 LDN 选择的旧值 0x07, 若忽略错误继续 inb 并
+// 写回, 就会把 0x07 当方向值污染 0xC9——这正是要防的同组针脚方向破坏路径
+func TestSioReadIndexSelectErrorNoWriteback(t *testing.T) {
+	b := NewBus("Pin19", "Pin20", false)
+	mock := newMockPIO()
+	b.pio = mock
+	mock.injectOutbFail(0x2E, byte(GPPins["Pin19"].DirReg)) // 仅索引选择失败一次
+	if err := b.setPinDir("Pin19", b.sclCfg, true); err == nil {
+		t.Fatal("索引选择失败必须返回错误")
+	}
+	if v := mock.mem[0x2F]; v != 0x07 {
+		t.Fatalf("方向数据不得写回数据口, mem[0x2F]=%#x (期望仅 LDN 选择残留值 0x07)", v)
+	}
+	if mock.mem[GPPins["Pin19"].DirReg] != 0 {
+		t.Fatalf("方向寄存器 0x%02X 不得被写入, 实际 %#x", GPPins["Pin19"].DirReg, mock.mem[GPPins["Pin19"].DirReg])
+	}
+	if b.isDriven("Pin19") {
+		t.Fatal("读失败不得更新 driven 追踪")
+	}
+}
+
+// 方向寄存器数据口读取 (inb 0x2F) 失败: setPinDir 必须报错, 禁止写回方向寄存器、
+// 禁止更新方向缓存与 driven 追踪
+func TestSioReadInbErrorNoWriteback(t *testing.T) {
+	b := NewBus("Pin19", "Pin20", false)
+	mock := newMockPIO()
+	mock.failInb = true
+	b.pio = mock
+	if err := b.setPinDir("Pin19", b.sclCfg, true); err == nil {
+		t.Fatal("方向寄存器读取失败必须返回错误")
+	}
+	if v := mock.mem[0x2F]; v != 0x07 {
+		t.Fatalf("读失败时方向数据不得写回, mem[0x2F]=%#x (期望仅 LDN 选择值 0x07)", v)
+	}
+	if b.isDriven("Pin19") {
+		t.Fatal("读失败不得更新 driven 追踪")
+	}
+	if b.sclOut {
+		t.Fatal("读失败不得更新方向缓存")
+	}
+	if mock.sioExitCount() == 0 {
+		t.Fatal("读失败时也必须 sioExit, 否则 SuperIO 滞留配置模式")
+	}
+}
+
+// 切针时释放旧引脚失败: 必须报失败且不覆盖引脚配置, 旧脚保持 driven 追踪
+// (下次切换重试释放), 绝不报成功却把旧脚遗忘在输出状态
+func TestSwitchPinReleaseFailureNoSuccess(t *testing.T) {
+	stubPortAvailable(t, true)
+	b := NewBus("Pin19", "Pin20", false)
+	mock := newMockPIO()
+	mock.readMask[GPPins["Pin20"].Port] = 0
+	b.pio = mock
+	if ok, _ := b.reconfigure(nil, nil); !ok { // Pin19/Pin20, driven={Pin19}
+		t.Fatal("reconfigure 失败")
+	}
+	mock.injectOutbFail(0x2E, byte(GPPins["Pin19"].DirReg)) // 释放 Pin19 的索引选择失败
+	ok, msg := b.switchPin("Pin21", "Pin22")
+	if ok {
+		t.Fatal("释放旧引脚失败时 switchPin 不得报成功")
+	}
+	if !strings.Contains(msg, "释放旧引脚 Pin19") {
+		t.Fatalf("错误信息应指明释放失败的旧引脚, 实际: %s", msg)
+	}
+	if scl, sda := b.pinNames(); scl != "Pin19" || sda != "Pin20" {
+		t.Fatalf("释放失败不得覆盖引脚配置, 得到 SCL=%s SDA=%s", scl, sda)
+	}
+	if !b.isDriven("Pin19") {
+		t.Fatal("旧脚必须保持 driven 追踪, 待下次切换重试释放")
+	}
+}
+
+// initDirs 第二步 (SDA 释放) 失败: 必须回滚第一步已设为输出的 SCL, 不遗留
+// 半初始化输出脚; 回滚也失败时 SCL 保持 driven 追踪待重试 (可重试清理状态)
+func TestInitDirsPartialFailureRollback(t *testing.T) {
+	// 回滚成功路径: SCL 释放回输入, driven 清空, 方向缓存同步回退
+	b := NewBus("Pin19", "Pin20", false)
+	mock := newMockPIO()
+	b.pio = mock
+	mock.injectOutbFail(0x2E, byte(GPPins["Pin20"].DirReg)) // SDA 方向寄存器索引选择失败
+	if err := b.initDirs(); err == nil {
+		t.Fatal("SDA 方向设置失败时 initDirs 应返回错误")
+	}
+	if b.isDriven("Pin19") {
+		t.Fatal("initDirs 失败应回滚 SCL (driven 不再含 Pin19)")
+	}
+	if b.sclOut {
+		t.Fatal("initDirs 失败应回滚 SCL 方向缓存")
+	}
+	if mock.mem[0x2F] != 0x03 {
+		t.Fatalf("SCL 方向寄存器应已释放 bit2 (0x07&^0x04=0x03), 实际 %#x (mock 数据口 0x2F)",
+			mock.mem[0x2F])
+	}
+
+	// 回滚失败路径: SCL 保持 driven 追踪, 后续 switchPin 会重试释放, 不丢失清理状态
+	b2 := NewBus("Pin19", "Pin20", false)
+	mock2 := newMockPIO()
+	b2.pio = mock2
+	mock2.injectOutbFail(0x2E, byte(GPPins["Pin20"].DirReg)) // SDA 失败 -> 触发回滚
+	mock2.injectOutbFail(0x2F, 0x03)                         // 回滚写回值 (0x07&^0x04=0x03) 失败
+	if err := b2.initDirs(); err == nil {
+		t.Fatal("initDirs 应返回错误")
+	}
+	if !b2.isDriven("Pin19") {
+		t.Fatal("回滚失败时 SCL 应保持 driven 追踪待重试释放")
+	}
+}
+
+// detect 接口: 找到接线但 reconfigure 失败时必须回 ok:false + apply-failed,
+// 不得无视应用失败无条件报成功
+func TestDetectApplyFailure(t *testing.T) {
+	stubAdmin(t, true)
+	stubPortAvailable(t, true)
+	b := NewBus("Pin19", "Pin20", false)
+	mock := newMockPIO()
+	mock.failOutb = true // 方向写全失败: 应用必败
+	b.pio = mock
+	srv := &AppServer{Bus: b, DetectFn: func(context.Context) (string, string) { return "Pin19", "Pin20" }}
+	req := httptest.NewRequest(http.MethodPost, "/api/crps/detect", nil)
+	rec := httptest.NewRecorder()
+	srv.APIHandler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("应 200, 得到 %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `"found":true`) || !strings.Contains(body, `"ok":false`) {
+		t.Fatalf("应 found=true 且 ok=false, 得到 %s", body)
+	}
+	if !strings.Contains(body, "apply-failed") {
+		t.Fatalf("应含 apply-failed 错误码, 得到 %s", body)
+	}
+	if b.isConfigured() {
+		t.Fatal("应用失败不得标记 configured")
+	}
+}
+
+// detect 接口: 应用成功但配置写盘失败时必须回 saved:false 并附告警,
+// 不能只记服务端日志让界面误以为已持久化
+func TestDetectSaveFailure(t *testing.T) {
+	stubAdmin(t, true)
+	stubPortAvailable(t, true)
+	b := NewBus("Pin19", "Pin20", false)
+	mock := newMockPIO()
+	mock.readMask[GPPins["Pin20"].Port] = 0
+	b.pio = mock
+	srv := &AppServer{
+		Bus:        b,
+		ConfigPath: filepath.Join(t.TempDir(), "no-such-dir", "crps.json"), // 目录不存在: 写盘必败
+		DetectFn:   func(context.Context) (string, string) { return "Pin19", "Pin20" },
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/crps/detect", nil)
+	rec := httptest.NewRecorder()
+	srv.APIHandler().ServeHTTP(rec, req)
+	body := rec.Body.String()
+	if !strings.Contains(body, `"ok":true`) || !strings.Contains(body, `"saved":false`) {
+		t.Fatalf("应 ok=true 且 saved=false, 得到 %s", body)
+	}
+	if !strings.Contains(body, "保存失败") {
+		t.Fatalf("应把保存失败明确返回给界面, 得到 %s", body)
+	}
+	if !b.isConfigured() {
+		t.Fatal("应用成功应标记 configured")
 	}
 }
 
@@ -340,8 +525,8 @@ func TestNewBusInvalidPinsStayUnconfigured(t *testing.T) {
 		if b.isConfigured() {
 			t.Fatalf("非法配置 %v 应保持未配置", tc)
 		}
-		if b.dirsInit {
-			t.Fatalf("非法配置 %v 不得写方向寄存器", tc)
+		if len(b.drivenPins()) != 0 {
+			t.Fatalf("非法配置 %v 不得写方向寄存器 (driven 追踪应为空)", tc)
 		}
 	}
 }

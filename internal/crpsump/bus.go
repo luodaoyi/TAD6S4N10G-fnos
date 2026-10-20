@@ -47,6 +47,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -126,7 +127,7 @@ type Bus struct {
 	pio        portIO // 端口实现 (默认真实硬件, 单测可 mock)
 	sclOut     bool // 方向缓存
 	sdaOut     bool
-	dirsInit   bool // 是否已写过方向寄存器 (用于切换引脚时只释放自己驱动过的旧针)
+	driven     map[string]bool // 实际驱动为输出的针脚名 (stateMu 保护): 切针时逐一释放, 释放失败不丢失追踪
 	ioErr      error // 当前事务首个端口写失败 (mu 保护); 事务末尾检查, 失败则整个事务作废
 	mu         sync.Mutex // 总线 I/O 与引脚配置
 	stateMu    sync.Mutex // configured / fanMode / readable 缓存
@@ -165,6 +166,7 @@ func NewBus(scl, sda string, configured bool) *Bus {
 		sclCfg:     GPPins[scl],
 		sdaCfg:     GPPins[sda],
 		pio:        defaultPortIO,
+		driven:     map[string]bool{},
 		configured: configuredPins,
 		fanMode:    "auto",
 	}
@@ -187,11 +189,14 @@ func NewBus(scl, sda string, configured bool) *Bus {
 	return b
 }
 
-// setPinDir 无条件写 SIO 方向寄存器 (被带缓存的 ensure* 调用), 返回首个写入错误。
-// 整段 sioEnter..sioExit 在 PortIOLocker 下进行, 与宿主 GPIO 访问串行化。
-// sioExit 用 defer 保证: 中途 sioWrite 失败也必须退出 SuperIO 配置模式,
-// 否则后续(本包或其他 SuperIO 使用方)会在配置模式残留下工作。
-func (b *Bus) setPinDir(cfg GPPin, out bool) (err error) {
+// setPinDir 写 SIO 方向寄存器 (被带缓存的 ensure* 调用), name 为针脚名 (driven 追踪用)。
+// 流程为读-改-写: 选 LDN7 -> 读方向寄存器当前值 -> 改目标位 -> 写回。
+// 索引写入与数据读取任一失败都向上传递且禁止写回: 读失败时拿到的字节不可信
+// (可能是旧索引残留值), 写回会把同组其他针脚的方向一起改错。读失败也不更新
+// driven 追踪与方向缓存, 下次操作会重试。整段 sioEnter..sioExit 在 PortIOLocker
+// 下进行, 与宿主 GPIO 访问串行化; sioExit 用 defer 保证中途失败也退出配置模式。
+// 调用方须持 b.mu (NewBus 构造期除外); driven 由 stateMu 保护, 本函数自行加锁。
+func (b *Bus) setPinDir(name string, cfg GPPin, out bool) (err error) {
 	PortIOLocker.Lock()
 	defer PortIOLocker.Unlock()
 	if err = sioEnter(b.pio); err != nil {
@@ -205,14 +210,27 @@ func (b *Bus) setPinDir(cfg GPPin, out bool) (err error) {
 	if err = sioWrite(b.pio, 0x07, 0x07); err != nil { // 选 LDN7 (GPIO)
 		return err
 	}
-	cur := sioRead(b.pio, byte(cfg.DirReg))
+	cur, err := sioRead(b.pio, byte(cfg.DirReg))
+	if err != nil { // 读失败: 禁止写回方向寄存器, 禁止更新缓存/追踪
+		return err
+	}
 	if out {
 		cur |= 1 << uint(cfg.DirBit)
 	} else {
 		cur &^= 1 << uint(cfg.DirBit)
 	}
-	err = sioWrite(b.pio, byte(cfg.DirReg), cur)
-	return err
+	if err = sioWrite(b.pio, byte(cfg.DirReg), cur); err != nil {
+		return err
+	}
+	// 方向写回成功才更新追踪: out=true 记录为已驱动, 释放(out=false)后移除
+	b.stateMu.Lock()
+	if out {
+		b.driven[name] = true
+	} else {
+		delete(b.driven, name)
+	}
+	b.stateMu.Unlock()
+	return nil
 }
 
 // ensure* 只在方向缓存与实际不符时才写 SIO (方向寄存器缓存); 写失败不更新缓存,
@@ -221,7 +239,7 @@ func (b *Bus) ensureSclOut() error {
 	if b.sclOut {
 		return nil
 	}
-	if err := b.setPinDir(b.sclCfg, true); err != nil {
+	if err := b.setPinDir(b.sclName, b.sclCfg, true); err != nil {
 		return err
 	}
 	b.sclOut = true
@@ -233,7 +251,7 @@ func (b *Bus) ensureSdaOut() error {
 	if b.sdaOut {
 		return nil
 	}
-	if err := b.setPinDir(b.sdaCfg, true); err != nil {
+	if err := b.setPinDir(b.sdaName, b.sdaCfg, true); err != nil {
 		return err
 	}
 	b.sdaOut = true
@@ -245,24 +263,50 @@ func (b *Bus) ensureSdaIn() error {
 	if !b.sdaOut {
 		return nil
 	}
-	if err := b.setPinDir(b.sdaCfg, false); err != nil {
+	if err := b.setPinDir(b.sdaName, b.sdaCfg, false); err != nil {
 		return err
 	}
 	b.sdaOut = false
 	return nil
 }
 
-// initDirs 初始化引脚方向: SCL=输出, SDA=输入(释放), 并标记方向已写; 任一步失败返回错误
+// drivenPins 快照当前已驱动为输出的针脚名 (stateMu 保护), 排序保证遍历顺序稳定
+func (b *Bus) drivenPins() []string {
+	b.stateMu.Lock()
+	defer b.stateMu.Unlock()
+	names := make([]string, 0, len(b.driven))
+	for n := range b.driven {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// isDriven 查询某针脚是否在已驱动追踪中 (stateMu 保护)
+func (b *Bus) isDriven(name string) bool {
+	b.stateMu.Lock()
+	defer b.stateMu.Unlock()
+	return b.driven[name]
+}
+
+// initDirs 初始化引脚方向: SCL=输出, SDA=输入(释放); 任一步失败返回错误。
+// SDA 设置失败时安全回滚: 把已设为输出的 SCL 释放回输入, 不遗留半初始化输出脚;
+// 回滚也失败时 SCL 仍留在 driven 追踪中 (setPinDir 失败不动追踪), 后续
+// switchPin 会重试释放, 不会丢失清理状态。
 func (b *Bus) initDirs() error {
-	if err := b.setPinDir(b.sclCfg, true); err != nil {
+	if err := b.setPinDir(b.sclName, b.sclCfg, true); err != nil {
 		return err
 	}
 	b.sclOut = true
-	if err := b.setPinDir(b.sdaCfg, false); err != nil {
+	if err := b.setPinDir(b.sdaName, b.sdaCfg, false); err != nil {
+		if rbErr := b.setPinDir(b.sclName, b.sclCfg, false); rbErr != nil {
+			Logf("警告: initDirs 回滚 SCL 失败: %v (原错误: %v), 针脚保持追踪待重试释放", rbErr, err)
+		} else {
+			b.sclOut = false
+		}
 		return err
 	}
 	b.sdaOut = false
-	b.dirsInit = true
 	return nil
 }
 
@@ -300,6 +344,8 @@ func (b *Bus) pinNames() (string, string) {
 
 // switchPin 切换 SCL/SDA 引脚并初始化方向, 不改变 configured 状态。
 // 引脚配置字段在持锁状态下改写, 避免与进行中的 readWord 位操作产生数据竞争。
+// 释放旧引脚失败时如实报失败: 不覆盖 sclName/sdaName (旧配置原样保留), 旧脚
+// 仍留在 driven 追踪中, 下次切换会重试释放——绝不报成功却遗留输出脚。
 func (b *Bus) switchPin(scl, sda string) (bool, string) {
 	sc, okS := GPPins[scl]
 	sd, okD := GPPins[sda]
@@ -315,13 +361,12 @@ func (b *Bus) switchPin(scl, sda string) (bool, string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	// 释放不再使用的旧引脚为输入, 避免 F_PANEL 针脚残留推挽输出与外部线路冲突。
-	// 只释放本总线驱动过的针 (dirsInit): 从未初始化过方向时不触碰任何 GPIO。
-	if b.dirsInit {
-		for _, old := range []string{b.sclName, b.sdaName} {
-			if old != scl && old != sda {
-				if err := b.setPinDir(GPPins[old], false); err != nil {
-					Logf("警告: 释放旧引脚 %s 失败: %v", old, err)
-				}
+	// 只释放本总线实际驱动过的针 (driven 追踪): 从未驱动过的引脚不触碰任何 GPIO。
+	// 任一释放失败都中止切换并上报, 避免覆盖引脚字段后把旧脚遗忘在输出状态。
+	for _, old := range b.drivenPins() {
+		if old != scl && old != sda {
+			if err := b.setPinDir(old, GPPins[old], false); err != nil {
+				return false, "释放旧引脚 " + old + " 失败: " + err.Error()
 			}
 		}
 	}
@@ -470,10 +515,16 @@ func (b *Bus) takeIOErr() error {
 	return err
 }
 
-// scl 写 SCL 电平 (v!=0 为高, 0 为低)
+// scl 写 SCL 电平 (v!=0 为高, 0 为低)。数据口读失败时中止: 读-改-写回会把
+// 不可信字节写回数据口, 破坏同组其他 GPIO 的电平
 func (b *Bus) scl(v int) {
 	PortIOLocker.Lock()
-	cur := b.pio.inb(b.sclCfg.Port)
+	cur, err := b.pio.inb(b.sclCfg.Port)
+	if err != nil {
+		b.setIOErr(err)
+		PortIOLocker.Unlock()
+		return
+	}
 	if v != 0 {
 		cur |= 1 << uint(b.sclCfg.Bit)
 	} else {
@@ -483,14 +534,19 @@ func (b *Bus) scl(v int) {
 	PortIOLocker.Unlock()
 }
 
-// sdaWrite 写 SDA 电平 (自动确保 SDA 为输出方向); 方向或数据写失败记入 ioErr
+// sdaWrite 写 SDA 电平 (自动确保 SDA 为输出方向); 方向或数据口读/写失败记入 ioErr
 func (b *Bus) sdaWrite(v int) {
 	if err := b.ensureSdaOut(); err != nil {
 		b.setIOErr(err)
 		return
 	}
 	PortIOLocker.Lock()
-	cur := b.pio.inb(b.sdaCfg.Port)
+	cur, err := b.pio.inb(b.sdaCfg.Port)
+	if err != nil {
+		b.setIOErr(err)
+		PortIOLocker.Unlock()
+		return
+	}
 	if v != 0 {
 		cur |= 1 << uint(b.sdaCfg.Bit)
 	} else {
@@ -500,16 +556,21 @@ func (b *Bus) sdaWrite(v int) {
 	PortIOLocker.Unlock()
 }
 
-// sdaRead 读 SDA 电平 (自动确保 SDA 为输入方向); 方向写失败记入 ioErr 并按高电平返回
+// sdaRead 读 SDA 电平 (自动确保 SDA 为输入方向); 方向或数据口读失败记入 ioErr
+// 并按高电平返回 (失败读到的电平不可信, 按释放态处理)
 func (b *Bus) sdaRead() int {
 	if err := b.ensureSdaIn(); err != nil {
 		b.setIOErr(err)
 		return 1
 	}
 	PortIOLocker.Lock()
-	v := int((b.pio.inb(b.sdaCfg.Port) >> uint(b.sdaCfg.Bit)) & 1)
+	v, err := b.pio.inb(b.sdaCfg.Port)
 	PortIOLocker.Unlock()
-	return v
+	if err != nil {
+		b.setIOErr(err)
+		return 1
+	}
+	return int((v >> uint(b.sdaCfg.Bit)) & 1)
 }
 
 // sdaRelease 释放 SDA (切为输入, 由外部上拉拉高)

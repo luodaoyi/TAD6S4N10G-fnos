@@ -127,6 +127,7 @@
     var nowOk = !data.error && data.ok != null;
     document.body.classList.toggle("cfg-ok", nowOk);
     if (nowOk && !wasOk) pollEnergy(); // 刚显示: canvas 离开 display:none, 立即补拉耗电渲染, 不等 10s 轮询
+    if (!nowOk) tryAutoDetect(); // 未识别状态: 周期性自动重新识别 (换线位置后无需手动操作)
     $("status-banner").classList.remove("net-err");
     METRIC_DEFS.forEach(function (m) {
       var v = data[m.key];
@@ -397,19 +398,49 @@
 
   // ---- 自动识别保存 PSCL/PSDA ----
   var gpioDetect = $("gpio-detect");
+  var lastAutoDetect = 0; // 上次自动识别尝试时间 (60s 退避, 避免未插线时高频扫描 GPIO)
+  var AUTO_DETECT_INTERVAL = 60 * 1000;
+
+  // tryAutoDetect 未识别状态下的后台自动重新识别: 换线/首次插线无需手动操作。
+  // 后端 detect 已自动完成应用+保存 (found/applied/saved 分离), 成功后无需再走保存;
+  // 失败静默等下个周期。
+  function tryAutoDetect() {
+    var now = Date.now();
+    if (now - lastAutoDetect < AUTO_DETECT_INTERVAL) return;
+    lastAutoDetect = now;
+    fetch("../api/crps/detect", { method: "POST" })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (d && d.found && d.ok) {
+          if (sclSel && d.scl_pin) sclSel.value = d.scl_pin;
+          if (sdaSel && d.sda_pin) sdaSel.value = d.sda_pin;
+          gpioMsgShow(!!d.saved, d.msg || ("已自动识别 PSCL=" + d.scl_pin + " PSDA=" + d.sda_pin));
+          loadGpioConfig(d.saved ? "" : d.msg); // 写盘失败告警在刷新后保留
+          setTimeout(poll, 300);
+        } else if (d && d.found) {
+          gpioMsgShow(false, (d && d.msg) || "已找到接线但应用失败"); // 后端明确报错
+        }
+      })
+      .catch(function () { /* 静默: 下个周期重试 */ });
+  }
+
   if (gpioDetect) gpioDetect.addEventListener("click", function () {
+    lastAutoDetect = Date.now(); // 手动识别后重置自动周期, 避免重复紧邻扫描
     gpioMsgShow(true, "正在自动识别 Pin19-22…（约几秒，请稍候）");
     gpioDetect.disabled = true;
     fetch("../api/crps/detect", { method: "POST" })
       .then(function (r) { return r.json(); })
       .then(function (d) {
         gpioDetect.disabled = false;
-        if (d && d.found) {
-          // 识别成功: 填入针脚并自动走保存流程 (含持久化/写盘失败告警/状态刷新)
+        if (d && d.found && d.ok) {
+          // 后端已自动应用+保存: found/applied/saved 分离, 直接展示结果
           if (sclSel && d.scl_pin) sclSel.value = d.scl_pin;
           if (sdaSel && d.sda_pin) sdaSel.value = d.sda_pin;
-          gpioMsgShow(true, "已识别 PSCL=" + d.scl_pin + " PSDA=" + d.sda_pin + "，正在保存…");
-          gpioSave.click();
+          gpioMsgShow(!!d.saved, d.msg || ("已识别 PSCL=" + d.scl_pin + " PSDA=" + d.sda_pin + "，已应用"));
+          loadGpioConfig(d.saved ? "" : d.msg); // 写盘失败告警在刷新后保留
+          setTimeout(poll, 300);
+        } else if (d && d.found) {
+          gpioMsgShow(false, (d && d.msg) || "已找到接线但应用失败，请重试。");
         } else {
           gpioMsgShow(false, "检测信号失败，请重新接线保证正确连接信号线。");
         }

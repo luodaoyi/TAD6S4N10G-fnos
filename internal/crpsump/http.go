@@ -1,6 +1,7 @@
 package crpsump
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -167,6 +168,9 @@ type AppServer struct {
 	Bus        *Bus
 	WebRoot    string
 	ConfigPath string
+	// DetectFn 可注入的自动探测函数 (单测失败路径用, 绕过真实 bitbang 扫描);
+	// nil 时使用 Bus.autoDetect
+	DetectFn func(ctx context.Context) (string, string)
 }
 
 var mimeTypes = map[string]string{
@@ -432,29 +436,49 @@ func (s *AppServer) doPost(w http.ResponseWriter, r *http.Request, p string) {
 			s.send(w, 200, map[string]any{"ok": false, "error": "no-gpio"}, "application/json")
 			return
 		}
-		scl, sda := s.Bus.autoDetect(ctx)
-		if scl != "" {
-			ok, _ := s.Bus.reconfigure(&scl, &sda)
-			if ok && s.ConfigPath != "" {
-				cs, cd := s.Bus.pinNames()
-				cfg := map[string]string{"scl_pin": cs, "sda_pin": cd}
-				if data, err := json.MarshalIndent(cfg, "", "  "); err == nil {
-					if err := os.WriteFile(s.ConfigPath, data, 0644); err != nil {
-						Logf("已探测到, 但配置保存失败: %v", err)
-					}
-				}
-			}
-			s.send(w, 200, map[string]any{
-				"ok": true, "found": true,
-				"scl_pin": scl, "sda_pin": sda,
-				"msg": "自动探测到接线 PSCL=" + scl + " PSDA=" + sda,
-			}, "application/json")
-		} else {
+		detect := s.Bus.autoDetect
+		if s.DetectFn != nil {
+			detect = s.DetectFn // 单测注入, 绕过真实 bitbang 扫描
+		}
+		scl, sda := detect(ctx)
+		if scl == "" {
 			s.send(w, 200, map[string]any{
 				"ok": false, "found": false,
 				"msg": "未探测到电源接线, 请检查线缆后重试",
 			}, "application/json")
+			return
 		}
+		// 找到接线 ≠ 已应用: reconfigure (方向写+总线复位) 失败必须如实上报,
+		// 不得无条件回 ok:true 让界面误以为已就绪
+		ok, msg := s.Bus.reconfigure(&scl, &sda)
+		if !ok {
+			Logf("探测到接线 PSCL=%s PSDA=%s 但应用失败: %s", scl, sda, msg)
+			s.send(w, 200, map[string]any{
+				"ok": false, "found": true, "applied": false, "saved": false,
+				"scl_pin": scl, "sda_pin": sda,
+				"error": "apply-failed",
+				"msg":   "已找到接线 PSCL=" + scl + " PSDA=" + sda + "，但应用失败: " + msg,
+			}, "application/json")
+			return
+		}
+		// 已应用 ≠ 已保存: 写盘失败要明确返回给界面 (重启后配置会丢), 不能只记日志
+		saved := true
+		resultMsg := "自动探测到接线 PSCL=" + scl + " PSDA=" + sda + "，已应用并保存"
+		if s.ConfigPath != "" {
+			cs, cd := s.Bus.pinNames()
+			cfg := map[string]string{"scl_pin": cs, "sda_pin": cd}
+			if data, err := json.MarshalIndent(cfg, "", "  "); err == nil {
+				if err := os.WriteFile(s.ConfigPath, data, 0644); err != nil {
+					Logf("已探测到, 但配置保存失败 (%s): %v", s.ConfigPath, err) // 完整错误只记服务端
+					saved = false
+					resultMsg = "已应用 PSCL=" + scl + " PSDA=" + sda + "，但配置保存失败，重启后会丢失"
+				}
+			}
+		}
+		s.send(w, 200, map[string]any{
+			"ok": true, "found": true, "applied": true, "saved": saved,
+			"scl_pin": scl, "sda_pin": sda, "msg": resultMsg,
+		}, "application/json")
 	case "/api/energy":
 		if energyStats == nil {
 			s.send(w, 200, map[string]any{"ok": false, "error": "no-energy"}, "application/json")
