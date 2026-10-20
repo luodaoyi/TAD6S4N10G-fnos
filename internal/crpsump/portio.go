@@ -120,5 +120,5 @@ func sioWrite(p portIO, reg, v byte) error {
 	if err := p.outb(0x2E, reg); err != nil {
 		return err
 	}
-	return p.outb(0x2F, v & 0xFF)
+	return p.outb(0x2F, v&0xFF)
 }

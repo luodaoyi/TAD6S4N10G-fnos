@@ -56,7 +56,7 @@ import (
 // ---------------- 常量 ----------------
 
 const (
-	DefaultAddr   = 0x5b // 光宝 PS-2551-5L PMBus 从机地址
+	DefaultAddr   = 0x5b                   // 光宝 PS-2551-5L PMBus 从机地址
 	LogMaxSize    = 1 << 20                // 日志单文件上限 1MB, 超出轮转
 	Delay         = 100 * time.Microsecond // bitbang 半周期
 	AppVersion    = "1.0.49"
@@ -125,12 +125,12 @@ type Bus struct {
 	sclCfg     GPPin
 	sdaCfg     GPPin
 	pio        portIO // 端口实现 (默认真实硬件, 单测可 mock)
-	sclOut     bool // 方向缓存
+	sclOut     bool   // 方向缓存
 	sdaOut     bool
 	driven     map[string]bool // 实际驱动为输出的针脚名 (stateMu 保护): 切针时逐一释放, 释放失败不丢失追踪
-	ioErr      error // 当前事务首个端口写失败 (mu 保护); 事务末尾检查, 失败则整个事务作废
-	mu         sync.Mutex // 总线 I/O 与引脚配置
-	stateMu    sync.Mutex // configured / fanMode / readable 缓存
+	ioErr      error           // 当前事务首个端口写失败 (mu 保护); 事务末尾检查, 失败则整个事务作废
+	mu         sync.Mutex      // 总线 I/O 与引脚配置
+	stateMu    sync.Mutex      // configured / fanMode / readable 缓存
 	ok         bool
 	configured bool // 是否已在界面设置好 PSCL/PSDA
 	fanMode    string

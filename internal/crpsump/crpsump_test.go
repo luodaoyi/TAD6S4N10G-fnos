@@ -36,11 +36,11 @@ type mockPIO struct {
 	mu             sync.Mutex
 	mem            map[int]byte
 	readMask       map[int]byte
-	failOutb       bool            // true 时 outb 恒失败 (测试端口写错误向上传播)
-	failOutbOnPort int             // 非负时仅该端口 outb 失败 (测试局部写失败, 如 sioWrite 数据口)
-	failInb        bool            // true 时 inb 恒失败 (测试端口读错误向上传播)
-	failWhen       map[int64]bool  // 定点故障注入: key=port<<8|v, 命中一次 outb(port,v) 失败后自动清除
-	sioExits       int             // 记录 sioExit (outb 0x2E=0xAA) 执行次数
+	failOutb       bool           // true 时 outb 恒失败 (测试端口写错误向上传播)
+	failOutbOnPort int            // 非负时仅该端口 outb 失败 (测试局部写失败, 如 sioWrite 数据口)
+	failInb        bool           // true 时 inb 恒失败 (测试端口读错误向上传播)
+	failWhen       map[int64]bool // 定点故障注入: key=port<<8|v, 命中一次 outb(port,v) 失败后自动清除
+	sioExits       int            // 记录 sioExit (outb 0x2E=0xAA) 执行次数
 	writes         int
 }
 
