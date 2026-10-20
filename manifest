@@ -1,5 +1,5 @@
 appname=tad-module
-version=0.10.20
+version=0.10.21
 display_name=TAD6S4N模块
 desc=面向 TAD6S4N10G 的温度、功耗、三曲线风扇、硬盘面板、GPIO 按键与脱敏调试报告模块。
 source=thirdparty
@@ -14,4 +14,4 @@ desktop_applaunchname=tad-module.Application
 checkport=false
 disable_authorization_path=false
 micro_app=true
-changelog=v0.10.20：#29 历史温度/风扇调试/USB 温度；#27 历史传感器与图表修复；#28 CI 测试容差；#31 风扇调试切换单位换算已接管目标值。
+changelog=v0.10.21：#34 新增 CRPS 电源监控、PMBus 读数、风扇控制与耗电统计；GPIO 探测仅手动触发，补充管理员鉴权、端口访问串行化与故障处理。

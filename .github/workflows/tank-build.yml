@@ -6,17 +6,11 @@ on:
     paths: ["debian-tui/**"]
   pull_request:
     paths: ["debian-tui/**"]
-  # Release builds must NOT be gated by paths (tag refs often mismatch the
-  # paths filter and the attach-to-release step silently never runs).
-  # Note: release:created does NOT fire when another Actions job creates the
-  # Release with GITHUB_TOKEN. Tag releases attach tank from build-release.yml;
-  # keep this listener for manually/UI-created Releases.
-  release:
-    types: [created]
+  # Tag releases publish all assets atomically from build-release.yml.
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   tank:
@@ -41,8 +35,3 @@ jobs:
           name: tank-linux-amd64
           path: tank-linux-amd64
 
-      - name: Attach binary to Release
-        if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v2
-        with:
-          files: tank-linux-amd64

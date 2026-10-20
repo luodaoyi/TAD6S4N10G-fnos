@@ -89,7 +89,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" \
-            tad-module.fpk tad-module.fpk.sha256 tank-linux-amd64 \
-            --title "TAD6S4N模块 ${GITHUB_REF_NAME}" \
-            --generate-notes
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            # Preserve an existing prerelease until its assets have been verified.
+            # Never replace existing assets silently.
+            gh release upload "${GITHUB_REF_NAME}" \
+              tad-module.fpk tad-module.fpk.sha256 tank-linux-amd64
+          else
+            gh release create "${GITHUB_REF_NAME}" \
+              tad-module.fpk tad-module.fpk.sha256 tank-linux-amd64 \
+              --title "TAD6S4N模块 ${GITHUB_REF_NAME}" \
+              --generate-notes
+          fi
