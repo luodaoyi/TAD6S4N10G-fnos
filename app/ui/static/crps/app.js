@@ -183,8 +183,6 @@
         '<br><span class="k">型号</span> ' + esc(data.mfr_model || "--");
     }
     $("ts").textContent = "更新于 " + (new Date(data.ts * 1000).toLocaleTimeString());
-    $("bus-info").textContent = "总线 " + (data.bus === "gpio" ? "GPIO bitbang" : "i2c-" + data.bus) + " · 地址 " + data.addr;
-    $("app-ver").textContent = "电源监控 v" + (data.app_version || "");
     lastOk = data;
   }
 
