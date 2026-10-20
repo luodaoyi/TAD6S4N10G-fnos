@@ -323,6 +323,9 @@ func readJSONBody(w http.ResponseWriter, r *http.Request) (map[string]any, error
 	if err := json.Unmarshal(data, &m); err != nil {
 		return nil, err
 	}
+	if m == nil { // JSON "null": Unmarshal 不报错但置 nil, 按非法 body 拒绝 (否则调用方空响应 200)
+		return nil, errors.New("body 必须是 JSON 对象")
+	}
 	return m, nil
 }
 

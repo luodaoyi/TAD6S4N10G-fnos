@@ -449,4 +449,15 @@ func TestPostRejectsBadBody(t *testing.T) {
 	if rec.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("超限 body 应回 413, 得到 %d", rec.Code)
 	}
+
+	// JSON null: Unmarshal 不报错但 m 为 nil, 须回 400 而非空响应 200
+	req = httptest.NewRequest(http.MethodPost, "/api/crps/fan", strings.NewReader("null"))
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("null body 应回 400, 得到 %d", rec.Code)
+	}
+	if rec.Body.Len() == 0 {
+		t.Fatal("null body 不应得到空响应")
+	}
 }
