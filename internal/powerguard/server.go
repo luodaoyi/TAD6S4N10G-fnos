@@ -26,7 +26,7 @@ type Server struct {
 	SocketGroup string
 	Logger      *log.Logger
 	History     *HistoryStore
-	LogPath     string        // 守护进程文本日志路径；空 = stderr 模式，日志端点降级
+	LogPath     string       // 守护进程文本日志路径；空 = stderr 模式，日志端点降级
 	Crps        http.Handler // 可选: CRPS PMBus 监控板块 API (nil = 不挂载); 直接挂在 /api/crps/, handler 自行改写为 /api/<ep>
 }
 
