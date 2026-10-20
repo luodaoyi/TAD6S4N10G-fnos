@@ -409,7 +409,10 @@
   var dlLog = $("dl-log");
   if (dlLog) dlLog.addEventListener("click", function () {
     fetch("../api/crps/log")
-      .then(function (r) { return r.text(); })
+      .then(function (r) {
+        if (!r.ok) throw new Error("HTTP " + r.status); // 非管理员 403 等: 走 catch 报错, 不把错误 JSON 当日志显示
+        return r.text();
+      })
       .then(function (t) {
         var body = $("log-body");
         var mask = $("log-mask");

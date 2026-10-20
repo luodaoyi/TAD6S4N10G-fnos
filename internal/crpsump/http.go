@@ -466,7 +466,10 @@ func (s *AppServer) doPost(w http.ResponseWriter, r *http.Request, p string) {
 		}
 		action, _ := body["action"].(string)
 		if action == "reset" {
-			energyStats.Reset()
+			if err := energyStats.Reset(); err != nil { // 内存已清但落盘失败: 如实报错, 避免重启后旧统计复活
+				s.send(w, 500, map[string]any{"ok": false, "error": "energy-save-failed"}, "application/json")
+				return
+			}
 			s.send(w, 200, map[string]any{"ok": true, "msg": "耗电统计已清零"}, "application/json")
 		} else {
 			s.send(w, 200, map[string]any{"ok": false, "error": "unknown-action"}, "application/json")

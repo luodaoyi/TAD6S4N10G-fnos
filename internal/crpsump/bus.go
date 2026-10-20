@@ -137,18 +137,24 @@ type Bus struct {
 	lastTs     int64
 }
 
-// NewBus 创建 GPIO bitbang PMBus 总线: 校验引脚名, configured 时初始化方向寄存器
+// NewBus 创建 GPIO bitbang PMBus 总线: 校验引脚名, configured 时初始化方向寄存器。
+// 原始引脚名非法或两针相同时按未配置处理 (configured=false): 垃圾 crps.json 不得
+// 导致启动时向(回退后的)引脚写 GPIO 方向。
 func NewBus(scl, sda string, configured bool) *Bus {
+	configuredPins := configured
 	// 校验引脚名: 非法名会令 GPPins 返回零值 GPPin{0,0,0,0}, 导致向 port 0x000(DMA 区) 写入
 	if _, ok := GPPins[scl]; !ok {
+		configuredPins = false
 		Logf("警告: 非法 SCL 引脚 '%s', 回退默认 %s", scl, DefaultSCL)
 		scl = DefaultSCL
 	}
 	if _, ok := GPPins[sda]; !ok {
+		configuredPins = false
 		Logf("警告: 非法 SDA 引脚 '%s', 回退默认 %s", sda, DefaultSDA)
 		sda = DefaultSDA
 	}
 	if scl == sda {
+		configuredPins = false
 		Logf("警告: SCL/SDA 不能同一根针, SDA 回退默认 %s", DefaultSDA)
 		sda = DefaultSDA
 	}
@@ -159,7 +165,7 @@ func NewBus(scl, sda string, configured bool) *Bus {
 		sclCfg:     GPPins[scl],
 		sdaCfg:     GPPins[sda],
 		pio:        defaultPortIO,
-		configured: configured,
+		configured: configuredPins,
 		fanMode:    "auto",
 	}
 	// /dev/port 不可达 (无 root/非 Linux/容器限制): ok=false, 接口降级 no-gpio,
@@ -172,7 +178,7 @@ func NewBus(scl, sda string, configured bool) *Bus {
 	// 初始化: SCL=输出, SDA=输入(释放)。
 	// 仅在已配置时写方向寄存器: 未配置的机器(可能无 CRPS 硬件)启动不得触碰 GPIO 方向,
 	// 首次界面保存/探测成功(reconfigure)时才写。方向写失败同样降级 no-gpio。
-	if configured {
+	if configuredPins {
 		if err := b.initDirs(); err != nil {
 			Logf("警告: GPIO 方向初始化失败: %v, 接口降级 no-gpio", err)
 			b.ok = false
@@ -183,13 +189,20 @@ func NewBus(scl, sda string, configured bool) *Bus {
 
 // setPinDir 无条件写 SIO 方向寄存器 (被带缓存的 ensure* 调用), 返回首个写入错误。
 // 整段 sioEnter..sioExit 在 PortIOLocker 下进行, 与宿主 GPIO 访问串行化。
-func (b *Bus) setPinDir(cfg GPPin, out bool) error {
+// sioExit 用 defer 保证: 中途 sioWrite 失败也必须退出 SuperIO 配置模式,
+// 否则后续(本包或其他 SuperIO 使用方)会在配置模式残留下工作。
+func (b *Bus) setPinDir(cfg GPPin, out bool) (err error) {
 	PortIOLocker.Lock()
 	defer PortIOLocker.Unlock()
-	if err := sioEnter(b.pio); err != nil {
+	if err = sioEnter(b.pio); err != nil {
 		return err
 	}
-	if err := sioWrite(b.pio, 0x07, 0x07); err != nil { // 选 LDN7 (GPIO)
+	defer func() { // 保留首个写错误; 无错时采用 sioExit 的错误
+		if exitErr := sioExit(b.pio); err == nil {
+			err = exitErr
+		}
+	}()
+	if err = sioWrite(b.pio, 0x07, 0x07); err != nil { // 选 LDN7 (GPIO)
 		return err
 	}
 	cur := sioRead(b.pio, byte(cfg.DirReg))
@@ -198,10 +211,8 @@ func (b *Bus) setPinDir(cfg GPPin, out bool) error {
 	} else {
 		cur &^= 1 << uint(cfg.DirBit)
 	}
-	if err := sioWrite(b.pio, byte(cfg.DirReg), cur); err != nil {
-		return err
-	}
-	return sioExit(b.pio)
+	err = sioWrite(b.pio, byte(cfg.DirReg), cur)
+	return err
 }
 
 // ensure* 只在方向缓存与实际不符时才写 SIO (方向寄存器缓存); 写失败不更新缓存,

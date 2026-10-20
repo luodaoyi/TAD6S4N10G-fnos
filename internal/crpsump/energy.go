@@ -34,6 +34,9 @@ type EnergyStats struct {
 	days      map[string]float64 // "2006-01-02" -> Wh
 	months    map[string]float64 // "2006-01"    -> Wh
 	dirty     bool
+	// resetPending: Reset 后首个 Sample 只重建时间基准不积分——采样器的 dt 跨越
+	// 清零时刻, 直接积分会把清零前的时段补记进新统计
+	resetPending bool
 }
 
 var energyStats *EnergyStats // 全局单例, main 里初始化; readAll 里刷新 lastPin
@@ -127,6 +130,12 @@ func (e *EnergyStats) Sample(pin float64, dt time.Duration) {
 	defer e.mu.Unlock()
 	e.lastPin = pin
 	e.hasPin = true
+	if e.resetPending { // 清零后首个采样: dt 跨越清零时刻, 只建基准不积分
+		e.resetPending = false
+		e.updatedTs = now.Unix()
+		e.dirty = true
+		return
+	}
 	if dt > 0 && dt <= EnergyMaxGap {
 		e.addWh(pin*dt.Hours(), now)
 	} else {
@@ -178,8 +187,9 @@ func (e *EnergyStats) Snapshot() map[string]any {
 	}
 }
 
-// Reset 统计清零 (总量/本次运行/按日/按月全部归零)
-func (e *EnergyStats) Reset() {
+// Reset 统计清零 (总量/本次运行/按日/按月全部归零) 并立即落盘;
+// 落盘失败返回错误 (内存已清零, 但调用方须告知用户持久化未成功, 避免重启后旧统计复活)
+func (e *EnergyStats) Reset() error {
 	e.mu.Lock()
 	e.totalWh, e.sessionWh = 0, 0
 	e.firstTs, e.updatedTs = 0, 0
@@ -187,17 +197,26 @@ func (e *EnergyStats) Reset() {
 	e.days = map[string]float64{}
 	e.months = map[string]float64{}
 	e.dirty = true
+	e.resetPending = true
 	e.mu.Unlock()
-	e.Save()
+	if err := e.save(); err != nil {
+		return err
+	}
 	Logf("耗电统计已清零")
+	return nil
 }
 
-// Save 落盘: 临时文件 + rename 原子替换, 防写一半损坏
+// Save 落盘 (忽略错误: 退出回调与后台周期保存用)
 func (e *EnergyStats) Save() {
+	_ = e.save()
+}
+
+// save 落盘: 临时文件 + rename 原子替换, 防写一半损坏; 返回错误供 Reset 上报
+func (e *EnergyStats) save() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if !e.dirty {
-		return
+		return nil
 	}
 	f := energyFile{
 		TotalWh: e.totalWh, FirstTs: e.firstTs, UpdatedTs: e.updatedTs,
@@ -206,18 +225,19 @@ func (e *EnergyStats) Save() {
 	}
 	data, err := json.MarshalIndent(f, "", "  ")
 	if err != nil {
-		return
+		return err
 	}
 	tmp := e.path + ".tmp"
 	if err := os.WriteFile(tmp, data, 0644); err != nil {
 		Logf("耗电统计保存失败: %v", err)
-		return
+		return err
 	}
 	if err := os.Rename(tmp, e.path); err != nil {
 		Logf("耗电统计保存失败: %v", err)
-		return
+		return err
 	}
 	e.dirty = false
+	return nil
 }
 
 // energySampler 后台采样循环: 每 EnergySampleInterval 读一次 PIN 并积分, 周期落盘。

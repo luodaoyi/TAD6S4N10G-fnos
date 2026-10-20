@@ -33,14 +33,18 @@ func TestMain(m *testing.M) {
 // readMask 模拟输入方向时由外部线路 (上拉/从机) 驱动的电平: 设置后 inb 恒返回该值,
 // 否则读回的是主控最后写出的电平, 无法模拟从机 ACK。
 type mockPIO struct {
-	mu       sync.Mutex
-	mem      map[int]byte
-	readMask map[int]byte
-	failOutb bool // true 时 outb 恒失败 (测试端口写错误向上传播)
-	writes   int
+	mu             sync.Mutex
+	mem            map[int]byte
+	readMask       map[int]byte
+	failOutb       bool // true 时 outb 恒失败 (测试端口写错误向上传播)
+	failOutbOnPort int  // 非负时仅该端口 outb 失败 (测试局部写失败, 如 sioWrite 数据口)
+	sioExits       int  // 记录 sioExit (outb 0x2E=0xAA) 执行次数
+	writes         int
 }
 
-func newMockPIO() *mockPIO { return &mockPIO{mem: map[int]byte{}, readMask: map[int]byte{}} }
+func newMockPIO() *mockPIO {
+	return &mockPIO{mem: map[int]byte{}, readMask: map[int]byte{}, failOutbOnPort: -1}
+}
 
 func (m *mockPIO) inb(port int) byte {
 	m.mu.Lock()
@@ -54,8 +58,11 @@ func (m *mockPIO) inb(port int) byte {
 func (m *mockPIO) outb(port int, v byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.failOutb {
+	if m.failOutb || port == m.failOutbOnPort {
 		return errors.New("mock: 端口写失败")
+	}
+	if port == 0x2E && v == 0xAA {
+		m.sioExits++
 	}
 	m.mem[port] = v
 	m.writes++
@@ -66,6 +73,12 @@ func (m *mockPIO) writeCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.writes
+}
+
+func (m *mockPIO) sioExitCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.sioExits
 }
 
 // stubPortAvailable 替换 /dev/port 可用性探测 (Windows/无 root 环境下恒失败)
@@ -302,6 +315,59 @@ func TestPortWriteFailurePropagates(t *testing.T) {
 	}
 	if b.sclOut || b.sdaOut {
 		t.Fatal("方向写失败不得更新方向缓存")
+	}
+}
+
+// setPinDir 中途 sioWrite 失败也必须执行 sioExit 退出 SuperIO 配置模式
+func TestSetPinDirExitsSioOnWriteError(t *testing.T) {
+	mock := newMockPIO()
+	mock.failOutbOnPort = 0x2F // sioWrite 数据口写全部失败
+	b := NewBus("Pin19", "Pin20", false)
+	b.pio = mock
+	if err := b.setPinDir(b.sclCfg, true); err == nil {
+		t.Fatal("sioWrite 失败应返回错误")
+	}
+	if mock.sioExitCount() == 0 {
+		t.Fatal("写失败时也必须 sioExit, 否则 SuperIO 滞留配置模式")
+	}
+}
+
+// 非法引脚配置即使 configured=true 也不得初始化方向 (垃圾 crps.json 安全要求)
+func TestNewBusInvalidPinsStayUnconfigured(t *testing.T) {
+	stubPortAvailable(t, true)
+	for _, tc := range [][2]string{{"Bogus", "Pin20"}, {"Pin19", "Bogus"}, {"Pin21", "Pin21"}} {
+		b := NewBus(tc[0], tc[1], true)
+		if b.isConfigured() {
+			t.Fatalf("非法配置 %v 应保持未配置", tc)
+		}
+		if b.dirsInit {
+			t.Fatalf("非法配置 %v 不得写方向寄存器", tc)
+		}
+	}
+}
+
+// Reset 后首个 Sample 只建时间基准不积分 (采样器 dt 跨越清零时刻)
+func TestEnergyResetSkipsFirstSample(t *testing.T) {
+	e := NewEnergy(filepath.Join(t.TempDir(), "energy.json"))
+	e.Sample(500, 15*time.Second) // 先有累计
+	if err := e.Reset(); err != nil {
+		t.Fatalf("Reset: %v", err)
+	}
+	e.Sample(500, 15*time.Second) // 清零后首个采样: 不积分
+	if total, _ := e.Snapshot()["total_wh"].(float64); total != 0 {
+		t.Fatalf("清零后首个采样不应积分, total_wh=%v", total)
+	}
+	e.Sample(500, 15*time.Second) // 第二个采样: 正常积分
+	if total, _ := e.Snapshot()["total_wh"].(float64); total <= 0 {
+		t.Fatal("清零后第二个采样应正常积分")
+	}
+}
+
+// 目录不可写时 Reset 返回错误 (HTTP 层据此回 500, 不谎报成功)
+func TestEnergyResetSaveError(t *testing.T) {
+	e := NewEnergy(filepath.Join(t.TempDir(), "no-such-dir", "energy.json"))
+	if err := e.Reset(); err == nil {
+		t.Fatal("目录不存在时 Reset 应返回保存错误")
 	}
 }
 
