@@ -1,0 +1,21 @@
+[
+  {
+    "stepTitle": "卸载 TAD6S4N模块",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "卸载会停止模块并自动恢复安装前捕获的功耗限制与 BIOS 风扇模式；IT87 内核模块不会被卸载。历史数据默认保留，重新安装后历史图表可以继续查看。"
+      },
+      {
+        "type": "radio",
+        "field": "wizard_delete_data",
+        "label": "历史数据（30 天温度/风扇采样）",
+        "initValue": "false",
+        "options": [
+          { "label": "保留（推荐，重装后历史图表延续）", "value": "false" },
+          { "label": "彻底删除，不可恢复", "value": "true" }
+        ]
+      }
+    ]
+  }
+]

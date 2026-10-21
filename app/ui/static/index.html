@@ -1,0 +1,562 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f3f4f6">
+  <title>TAD6S4N模块</title>
+  <script>
+    // 首帧引导：与 app.js currentThemeMode() 同口径归一化存储值（非法值归
+    // auto），跟随档优先读 fnOS 父窗口 body[theme-mode]（同源内嵌时），
+    // 不可读再退 prefers-color-scheme，避免首帧闪错色。
+    // theme-color 与 styles.css 的 --bg 同值：手机浏览器地址栏等宿主外壳
+    // 取该色，跟随明暗同步，深色页面下不再顶条闪白。
+    (function () {
+      function parentThemeMode() {
+        try {
+          var parent = window.parent;
+          if (parent === window || !parent.document || !parent.document.body) return '';
+          var mode = (parent.document.body.getAttribute('theme-mode') || '').trim().toLowerCase();
+          return mode === 'dark' || mode === 'light' ? mode : '';
+        } catch (error) { return ''; /* 父窗口跨域不可读 */ }
+      }
+      try {
+        var mode = localStorage.getItem('tad-theme');
+        if (mode !== 'dark' && mode !== 'light' && mode !== 'auto') mode = 'auto';
+        var theme = mode;
+        if (mode === 'auto') {
+          theme = parentThemeMode() || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+        }
+        document.documentElement.dataset.theme = theme;
+        var themeColor = document.querySelector('meta[name="theme-color"]');
+        if (themeColor) themeColor.setAttribute('content', theme === 'dark' ? '#141519' : '#f3f4f6');
+      } catch (error) { /* localStorage 不可用时跟随系统 */ }
+    })();
+  </script>
+  <link rel="stylesheet" href="styles.css?v=0.10.19-t5-t5">
+  <script>
+    // 样式自愈：升级包后浏览器可能仍持有带长缓存的远古样式表（无 CSS 变量，
+    // 表现为图表坐标线消失、文字变黑、主题切换无反应）。绕过缓存拉取服务端
+    // 现行 styles.css，缺少主题变量标记则把引用换成一次性地址强制刷新。
+    (function () {
+      if (!window.fetch) return;
+      var link = document.querySelector('link[rel="stylesheet"][href*="styles.css"]');
+      if (!link) return;
+      fetch(link.href, { cache: 'reload' }).then(function (res) { return res.text(); }).then(function (text) {
+        if (text.indexOf('chart-grid-line') !== -1 || link.dataset.healed === '1') return;
+        link.dataset.healed = '1';
+        link.href = link.href.replace(/([?&])v=[^&]*/, '$1v=' + Date.now());
+      }).catch(function () { /* 网络失败时保持现状 */ });
+    })();
+  </script>
+</head>
+<body>
+  <main class="shell">
+    <div class="app-layout">
+      <aside class="app-sidebar">
+        <button id="theme-toggle" type="button" class="theme-toggle" aria-label="切换主题">🌗</button>
+        <nav class="app-tabs" role="tablist" aria-label="插件功能">
+          <button id="tab-temperature" type="button" role="tab" aria-selected="true" aria-controls="panel-temperature" tabindex="0"><img src="images/panel/监控面板图标.svg" alt="">监控面板</button>
+          <button id="tab-fan" type="button" role="tab" aria-selected="false" aria-controls="panel-fan" tabindex="-1"><img src="images/panel/风扇控制图标.svg" alt="">风扇控制</button>
+          <button id="tab-gpio" type="button" role="tab" aria-selected="false" aria-controls="panel-gpio" tabindex="-1"><img src="images/panel/按键映射图标.svg" alt="">按键映射</button>
+          <button id="tab-power" type="button" role="tab" aria-selected="false" aria-controls="panel-power" tabindex="-1"><img src="images/panel/功耗设置图标.svg" alt="">功耗设置</button>
+          <button id="tab-crps" type="button" role="tab" aria-selected="false" aria-controls="panel-crps" tabindex="-1"><img src="images/panel/CRPS图标.svg" alt="">电源</button>
+          <button id="tab-debug" type="button" role="tab" aria-selected="false" aria-controls="panel-debug" tabindex="-1"><span class="debug-tab-icon" aria-hidden="true">&lt;/&gt;</span>调试</button>
+          <button id="tab-about" type="button" role="tab" aria-selected="false" aria-controls="panel-about" tabindex="-1"><img src="images/panel/关于我们图标.svg" alt="">关于</button>
+        </nav>
+        <section class="sidebar-meta" aria-label="插件信息">
+          <span id="app-version" class="app-version">v—</span>
+          <div class="health-summary">
+            <span id="health" class="badge pending" tabindex="0" aria-describedby="health-tooltip">读取中</span>
+            <div id="health-tooltip" class="health-tooltip" role="tooltip">正在读取模块状态…</div>
+          </div>
+        </section>
+      </aside>
+
+      <form id="config-form" class="tab-form">
+        <section id="panel-temperature" class="tab-panel" role="tabpanel" aria-labelledby="tab-temperature">
+          <section class="overview-grid" aria-label="设备状态">
+            <article class="card device-identity">
+              <div class="device-copy">
+                <span>设备名称</span>
+                <strong id="device-name">—</strong>
+                <span>系统版本</span>
+                <b id="os-version">—</b>
+              </div>
+              <img src="images/panel/设备外观图.svg" alt="TAD6S4N 设备外观">
+            </article>
+            <article class="card device-stats">
+              <div class="processor-overview">
+                <div>
+                  <span>处理器</span>
+                  <strong id="cpu-model">—</strong>
+                </div>
+                <div class="temperature-pair">
+                  <p><span id="cpu-display-label">CPU 核心最高</span><b id="cpu-display-temperature">—</b></p>
+                  <p><span>Package 温度</span><b id="package-temperature">—</b></p>
+                </div>
+              </div>
+              <div class="fan-overview">
+                <span>机箱风扇</span>
+                <div id="fan-rpm-list" class="fan-rpm-list"><strong id="fan-rpm">—</strong></div>
+              </div>
+            </article>
+          </section>
+
+          <section class="card storage-panel" aria-labelledby="storage-heading">
+            <div class="panel-heading">
+              <div>
+                <h2 id="storage-heading">硬盘面板</h2>
+                <p>实时显示盘位、温度、活动状态和健康信息。</p>
+              </div>
+              <span id="storage-updated" class="table-meta">等待刷新</span>
+            </div>
+            <div id="storage-visual" class="storage-visual" aria-label="硬盘机箱槽位图"></div>
+            <div class="table-scroll">
+              <table class="status-table storage-table">
+                <thead><tr><th class="storage-col-slot">仓位</th><th class="storage-col-state">状态</th><th class="storage-col-activity">活动</th><th class="storage-col-util">繁忙度</th><th class="storage-col-device"><span class="storage-head-device">设备</span><span class="storage-head-model">型号</span></th><th class="storage-col-purpose">用途</th><th class="storage-col-health">健康</th><th class="storage-col-temp">温度</th></tr></thead>
+                <tbody id="storage-body"></tbody>
+              </table>
+            </div>
+            <p id="storage-error" class="inline-status"></p>
+          </section>
+
+          <section class="card details">
+            <h2>诊断信息</h2>
+            <dl class="diagnostic-grid">
+              <div class="diagnostic-card"><dt>识别配置</dt><dd id="profile">—</dd></div>
+              <div class="diagnostic-card"><dt>温度显示来源</dt><dd id="temperature-source">—</dd></div>
+              <div class="diagnostic-card"><dt>最近应用</dt><dd id="last-apply">—</dd></div>
+              <div class="diagnostic-card"><dt>状态</dt><dd id="last-error">—</dd></div>
+              <div class="diagnostic-card diagnostic-wide"><dt>风扇控制</dt><dd id="fan-control" class="diagnostic-chips">—</dd></div>
+              <div class="diagnostic-card diagnostic-wide"><dt>GPU 运行状态</dt><dd id="gpu-runtime" class="diagnostic-chips">—</dd></div>
+              <div class="diagnostic-card diagnostic-wide"><dt>原始 coretemp</dt><dd id="temperature-sensors" class="diagnostic-chips sensor-chips">—</dd></div>
+            </dl>
+            <p class="notice temperature-notice">插件仿照 RR CPUinfo，只用标签为 Core N 的传感器最大值作为 CPU 显示温度；Package 热点原值单独保留。插件不会修改飞牛内置资源监控，因此飞牛桌面的原有温度和告警颜色不会改变。</p>
+            <p class="notice">降低功耗可能减少极限性能。风扇曲线依赖 IT87 驱动（安装/启动时由本插件尝试内置 DKMS 安装，已有独立驱动则跳过）；停止或卸载时会恢复首次捕获的功耗限制与 BIOS 风扇模式，但不会卸载 it87 内核模块。</p>
+          </section>
+        </section>
+
+        <section id="panel-fan" class="tab-panel" role="tabpanel" aria-labelledby="tab-fan" hidden>
+          <div id="fan-driver-warning" class="fan-driver-warning" role="alert" hidden>
+            <span class="warning-icon" aria-hidden="true">!</span>
+            <div>
+              <strong id="fan-warning-title">未检测到或未加载 IT87 风扇驱动</strong>
+              <p><span id="fan-warning-description">风扇转速和 PWM 控制暂不可用。请确认已安装 dkms、gcc、make 与当前内核的 linux-headers，然后重启本模块。</span> <a id="fan-warning-driver-link" href="https://github.com/IamAyang233/fnos-it87-kmod" target="_blank" rel="noopener noreferrer">仍可用独立 IT87 驱动包（可选）</a></p>
+            </div>
+          </div>
+          <section class="card fan-editor" aria-labelledby="fan-heading">
+            <div class="panel-heading fan-heading">
+              <div>
+                <h2 id="fan-heading">CPU、HDD 与 NVMe 三温控曲线</h2>
+                <p>三条曲线分别计算目标转速，始终采用较高值；传感器异常或达到紧急温度时自动满速。</p>
+              </div>
+              <label class="toggle"><input id="fan-enabled" type="checkbox"><span></span>启用风扇曲线</label>
+            </div>
+
+            <select id="fan-device" hidden aria-hidden="true"></select>
+            <div class="field-grid fan-settings">
+              <label class="field">
+                <span>最低转速</span>
+                <div class="input-wrap"><input id="fan-min" type="number" min="30" max="100" step="1" required><b>%</b></div>
+                <small>为防止停转，最低允许 30%</small>
+              </label>
+              <label class="field">
+                <span>紧急满速温度</span>
+                <div class="input-wrap"><input id="fan-emergency" type="number" min="70" max="100" step="1" required><b>°C</b></div>
+                <small>达到此温度立即强制 100%</small>
+              </label>
+              <label class="field">
+                <span>采样间隔</span>
+                <div class="input-wrap"><input id="fan-poll" type="number" min="1" max="10" step="1" required><b>秒</b></div>
+                <small>建议保持 2 秒</small>
+              </label>
+            </div>
+
+            <div class="curve-tabs" role="tablist" aria-label="温控曲线编辑器切换">
+              <button id="curve-tab-cpu" type="button" class="curve-tab" role="tab" aria-selected="true" aria-controls="cpu-curve-editor">CPU</button>
+              <button id="curve-tab-hdd" type="button" class="curve-tab" role="tab" aria-selected="false" aria-controls="disk-curve-editor">HDD/SATA</button>
+              <button id="curve-tab-nvme" type="button" class="curve-tab" role="tab" aria-selected="false" aria-controls="nvme-curve-editor">NVMe</button>
+            </div>
+
+            <div class="curve-editors">
+              <section id="cpu-curve-editor" class="curve-editor" role="tabpanel" aria-labelledby="cpu-curve-heading" data-curve-kind="cpu">
+                <div class="curve-editor-heading">
+                  <h3 id="cpu-curve-heading">CPU 温度曲线</h3>
+                  <span>读取 coretemp 最高值</span>
+                </div>
+                <svg id="fan-curve-chart" class="curve-chart" viewBox="0 0 640 260" role="application" tabindex="0" aria-label="可拖拽的 CPU 温控曲线" aria-describedby="curve-help"></svg>
+                <div class="curve-toolbar">
+                  <div class="curve-actions">
+                    <button id="curve-add" type="button">+ 增加节点</button>
+                    <button id="curve-remove" type="button">删除选中节点</button>
+                  </div>
+                  <strong id="curve-selected">—</strong>
+                </div>
+                <fieldset class="curve-fan-selector"><legend>CPU 曲线控制的风扇</legend><div id="cpu-fan-options" class="curve-fan-options"></div></fieldset>
+                <p id="curve-help">拖动圆点调整 CPU 温度和转速；支持 2–8 个节点，也可使用方向键微调。</p>
+              </section>
+              <section id="disk-curve-editor" class="curve-editor" role="tabpanel" aria-labelledby="disk-curve-heading" data-curve-kind="hdd" hidden>
+                <div class="curve-editor-heading">
+                  <h3 id="disk-curve-heading">HDD/SATA 温度曲线</h3>
+                  <span>取已勾选前置仓的最高温度</span>
+                </div>
+                <svg id="disk-curve-chart" class="curve-chart" viewBox="0 0 640 260" role="application" tabindex="0" aria-label="可拖拽的 HDD 温控曲线" aria-describedby="disk-curve-help"></svg>
+                <div class="curve-toolbar">
+                  <div class="curve-actions">
+                    <button id="disk-curve-add" type="button">+ 增加节点</button>
+                    <button id="disk-curve-remove" type="button">删除选中节点</button>
+                  </div>
+                  <strong id="disk-curve-selected">—</strong>
+                </div>
+                <fieldset class="curve-fan-selector"><legend>HDD/SATA 曲线控制的风扇</legend><div id="hdd-fan-options" class="curve-fan-options"></div></fieldset>
+                <fieldset class="curve-slot-selector">
+                  <legend>参与 HDD/SATA 温控的槽位</legend>
+                  <p>取消勾选后，该槽位温度不再影响风扇；温度缓存约每 60 秒更新。</p>
+                  <div id="hdd-slot-options" class="curve-slot-options"></div>
+                </fieldset>
+                <p id="disk-curve-help">默认 25°C 使用最低转速、35°C 使用 85%、50°C 使用 100%；温度来自前置 SATA 仓。</p>
+              </section>
+              <section id="nvme-curve-editor" class="curve-editor" role="tabpanel" aria-labelledby="nvme-curve-heading" data-curve-kind="nvme" hidden>
+                <div class="curve-editor-heading">
+                  <h3 id="nvme-curve-heading">NVMe 温度曲线</h3>
+                  <span>取已勾选 M.2 槽的最高温度</span>
+                </div>
+                <svg id="nvme-curve-chart" class="curve-chart" viewBox="0 0 640 260" role="application" tabindex="0" aria-label="可拖拽的 NVMe 温控曲线" aria-describedby="nvme-curve-help"></svg>
+                <div class="curve-toolbar">
+                  <div class="curve-actions">
+                    <button id="nvme-curve-add" type="button">+ 增加节点</button>
+                    <button id="nvme-curve-remove" type="button">删除选中节点</button>
+                  </div>
+                  <strong id="nvme-curve-selected">—</strong>
+                </div>
+                <fieldset class="curve-fan-selector"><legend>NVMe 曲线控制的风扇</legend><div id="nvme-fan-options" class="curve-fan-options"></div></fieldset>
+                <fieldset class="curve-slot-selector">
+                  <legend>参与 NVMe/SSD 温控的槽位</legend>
+                  <p>取消勾选后，该槽位温度不再影响风扇；全部取消则停用 NVMe 温控曲线。</p>
+                  <div id="nvme-slot-options" class="curve-slot-options"></div>
+                </fieldset>
+                <p id="nvme-curve-help">默认沿用硬盘温控阈值，可独立拖拽调整；温度来自四个 M.2 槽位。</p>
+              </section>
+            </div>
+            <p class="notice curve-notice">最终转速 = CPU、HDD/SATA 与 NVMe 三条曲线目标的最高值；某类盘温暂不可用时，该曲线不参与控制。</p>
+          </section>
+          <div class="actions app-actions">
+            <button id="save-fan" type="button" class="primary">保存风扇控制</button>
+          </div>
+          <p id="message-fan" class="message" role="status" aria-live="polite"></p>
+
+          <section class="card history-card" aria-labelledby="history-heading">
+            <div class="panel-heading">
+              <div>
+                <h2 id="history-heading">历史温度</h2>
+                <p>温度（左轴，°C）与风扇转速（右轴，占满量程百分比）随时间的变化；采样开关、保存天数等更多设置在“&lt;/&gt; 调试”页的“历史温度与风扇控制”。</p>
+              </div>
+              <div class="history-range" role="group" aria-label="时间范围">
+                <div class="history-range-slider">
+                  <output id="history-range-value" class="history-range-value" for="history-range-slider">30 分钟</output>
+                  <input id="history-range-slider" class="history-range-input" type="range" min="0" max="1000" step="1" value="0" aria-label="历史时间范围：30 分钟到 2 小时无极调节（1 分钟粒度），之后为 6 小时、12 小时、24 小时、7 天、30 天固定挡位，7 天与 30 天按保存天数显隐">
+                  <div class="history-range-ticks layout-7" aria-hidden="true">
+                    <span class="history-range-tick" data-tick="cont-min">30分</span>
+                    <span class="history-range-tick" data-tick="cont-max">2时</span>
+                    <span class="history-range-tick" data-tick="6h">6时</span>
+                    <span class="history-range-tick" data-tick="12h">12时</span>
+                    <span class="history-range-tick" data-tick="24h">24时</span>
+                    <span class="history-range-tick" data-tick="7d">7天</span>
+                    <span class="history-range-tick" data-tick="30d">30天</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div id="history-legend" class="history-legend"></div>
+            <svg id="history-chart" class="curve-chart history-chart" viewBox="0 0 640 260" role="img" aria-label="温度与风扇转速历史曲线"></svg>
+            <div id="history-scrub-bar" class="history-scrub-bar" hidden>
+              <span id="history-scrub-range" class="history-scrub-range"></span>
+              <button id="history-scrub-live" class="history-scrub-live" type="button" hidden>回到最新</button>
+            </div>
+            <div id="history-tooltip" class="history-tooltip" role="status" hidden></div>
+            <p id="history-status" class="inline-status"></p>
+            <p class="notice">数据由插件后台每分钟采样一次并写入本地数据库，按设置的保存天数保留；采样开关、大小上限与保存天数在“&lt;/&gt; 调试”页的“历史温度与风扇控制”中。插件停止运行期间不采集，重启后曲线会出现断口；长时间范围下服务端会自动按峰值聚合，温度曲线展示区间内的最高温；30 分钟至 24 小时各档支持在图上左右拖动，回看约 8 倍于所选跨度的历史记录。</p>
+          </section>
+          <section class="card debug-panel" id="fan-debug-card" aria-labelledby="fan-debug-heading" hidden>
+            <div class="panel-heading">
+              <div>
+                <h2 id="fan-debug-heading">风扇调试</h2>
+                <p>逐风扇手动设定转速与独立的自动递增测试。勾选接管的风扇脱离温控曲线、仅受行内调试值控制（CPU 超过紧急温度时仍强制全速兜底）；未接管的风扇照常受曲线控制，可与调试中的风扇并存。</p>
+              </div>
+            </div>
+            <div class="table-scroll">
+              <table class="status-table fan-debug-table">
+                <thead><tr><th>接管</th><th>风扇</th><th>通道</th><th>当前转速</th><th>当前 PWM</th><th>模式</th><th>调试转速</th><th>每次递增</th><th>递增间隔</th><th>自动测试</th></tr></thead>
+                <tbody id="fan-debug-body"></tbody>
+              </table>
+            </div>
+            <p class="notice">勾选“接管”后该风扇脱离温控曲线，仅受行内调试转速控制；取消勾选立即恢复曲线并结束该风扇的自动测试。调试值支持三种单位：转速 RPM（闭环控制——设定目标转速后按反馈实测自动微调 PWM，实测与目标差 ≤3% 即保持；目标初值来自自动学习的 PWM→转速特性表，全速运转时满转基准也会自动标定并随特性表在重启后保留，表随风扇被驱动过的工况自动充实；等不及自然学习可点行内“标定”主动全速数秒一次学到位；实际转速仍以“当前转速”读数为准）、百分比 %（0–100）、PWM（0–255 原始占空比，不带符号），切换单位时数值自动换算并同步。行内“自动测试”滑动开关按风扇独立启停：开启后从当前调试转速起，按该行的递增值与间隔推进，到所选单位上限自动完成并保持；再次开启会从 0 重跑。一个风扇递增期间，其他风扇可照常手动调试。</p>
+            <p id="fan-debug-status" class="message" role="status" aria-live="polite"></p>
+          </section>
+
+        </section>
+
+        <section id="panel-gpio" class="tab-panel" role="tabpanel" aria-labelledby="tab-gpio" hidden>
+          <section class="card gpio-editor" aria-labelledby="gpio-heading">
+            <div class="panel-heading gpio-heading">
+              <div>
+                <h2 id="gpio-heading">机箱按键映射</h2>
+                <p>固定读取主板 GPIO：复制键 0xA04/bit6、网络键 0xA00/bit3、后置重置键 0xA03/bit6；长按 3/9/15 秒可独立绑定内置动作或自定义 Bash 脚本。</p>
+              </div>
+              <label class="toggle"><input id="gpio-enabled" type="checkbox"><span></span>启用按键映射</label>
+            </div>
+            <div class="table-scroll">
+              <table class="status-table gpio-table">
+                <thead><tr><th>按键</th><th>长按 3 秒</th><th>长按 9 秒</th><th>长按 15 秒</th></tr></thead>
+                <tbody>
+                  <tr data-button="copy"><th data-label="按键"><span class="button-name"><img src="images/panel/复制按键.svg" alt="">复制按键</span></th><td data-label="长按 3 秒"><select class="gpio-action" data-stage="hold_3s"></select></td><td data-label="长按 9 秒"><select class="gpio-action" data-stage="hold_9s"></select></td><td data-label="长按 15 秒"><select class="gpio-action" data-stage="hold_15s"></select></td></tr>
+                  <tr data-button="network"><th data-label="按键"><span class="button-name"><img src="images/panel/网络按键.svg" alt="">网络按键</span></th><td data-label="长按 3 秒"><select class="gpio-action" data-stage="hold_3s"></select></td><td data-label="长按 9 秒"><select class="gpio-action" data-stage="hold_9s"></select></td><td data-label="长按 15 秒"><select class="gpio-action" data-stage="hold_15s"></select></td></tr>
+                  <tr data-button="rear_reset"><th data-label="按键"><span class="button-name"><img src="images/panel/RESET按键.svg" alt="">后置重置按键</span></th><td data-label="长按 3 秒"><select class="gpio-action" data-stage="hold_3s"></select></td><td data-label="长按 9 秒"><select class="gpio-action" data-stage="hold_9s"></select></td><td data-label="长按 15 秒"><select class="gpio-action" data-stage="hold_15s"></select></td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p id="gpio-status" class="inline-status">按键映射默认关闭。</p>
+            <p class="notice">短按不会触发动作；达到长按阈值时会尝试蜂鸣并闪灯确认，松开后执行对应动作。自定义脚本由插件服务以 root 运行，单次最长 30 秒并限制日志输出。请只保存你完全信任的脚本。</p>
+          </section>
+          <section class="card gpio-scripts-panel" aria-labelledby="gpio-scripts-heading">
+            <div class="panel-heading">
+              <div>
+                <h2 id="gpio-scripts-heading">Shell 脚本管理</h2>
+                <p>新增或编辑 Bash 脚本后，再到上方长按下拉框选择对应脚本；最后点击“保存按钮控制”统一持久化。</p>
+              </div>
+              <button id="gpio-script-add" type="button" class="primary">+ 新增脚本</button>
+            </div>
+            <div id="gpio-script-list" class="gpio-script-list"></div>
+            <div id="gpio-script-editor" class="gpio-script-editor" hidden>
+              <input id="gpio-script-id" type="hidden">
+              <label class="field script-name-field">
+                <span>脚本名称</span>
+                <input id="gpio-script-name" class="text-input" type="text" maxlength="64" placeholder="例如：重启 Docker 服务" autocomplete="off">
+              </label>
+              <label class="script-body-label" for="gpio-script-body">Bash 脚本内容</label>
+              <div class="bash-editor">
+                <pre id="gpio-script-highlight" aria-hidden="true"><code></code></pre>
+                <textarea id="gpio-script-body" aria-label="Bash 脚本内容" spellcheck="false" autocapitalize="off" autocomplete="off" wrap="off" placeholder="#!/usr/bin/env bash&#10;set -euo pipefail&#10;&#10;# 在这里编写脚本"></textarea>
+              </div>
+              <div class="script-editor-footer">
+                <span id="gpio-script-size">0 / 65536 字节</span>
+                <div class="actions">
+                  <button id="gpio-script-cancel" type="button">取消</button>
+                  <button id="gpio-script-commit" type="button" class="primary">应用脚本修改</button>
+                </div>
+              </div>
+            </div>
+            <p id="gpio-script-message" class="inline-status" role="status" aria-live="polite"></p>
+            <p class="notice script-risk-notice">高风险功能：脚本拥有 root 权限，可以修改或删除系统数据。插件只负责固定使用 Bash、限制执行时间和输出大小，不会分析脚本是否安全。</p>
+          </section>
+          <div class="actions app-actions">
+            <button id="save-gpio" type="button" class="primary">保存按钮控制</button>
+          </div>
+          <p id="message-gpio" class="message" role="status" aria-live="polite"></p>
+        </section>
+
+        <section id="panel-power" class="tab-panel" role="tabpanel" aria-labelledby="tab-power" hidden>
+          <section class="card power-panel" aria-labelledby="power-heading">
+            <div class="panel-heading">
+              <div>
+                <h2 id="power-heading">功耗模式</h2>
+                <p>根据处理器自动提供节能、标准和性能配置，也可切换到自定义功耗。</p>
+              </div>
+              <label class="toggle"><input id="enabled" type="checkbox"><span></span>启用限制</label>
+            </div>
+            <div id="power-modes" class="power-modes" role="radiogroup" aria-label="功耗模式">
+              <label><input type="radio" name="power-mode" value="saving"><span>节能</span></label>
+              <label><input type="radio" name="power-mode" value="standard"><span>标准</span></label>
+              <label><input type="radio" name="power-mode" value="performance"><span>性能</span></label>
+              <label><input type="radio" name="power-mode" value="custom"><span>自定义</span></label>
+            </div>
+            <div class="power-current"><span>当前 PL1 <b id="current-pl1">—</b></span><span>当前 PL2 <b id="current-pl2">—</b></span></div>
+            <div id="power-custom-fields" class="field-grid power-settings">
+              <label class="field"><span>PL1 持续功耗</span><div class="input-wrap"><input id="pl1" type="number" step="1" required><b>W</b></div><small id="pl1-range">—</small></label>
+              <label class="field"><span>PL2 短时功耗</span><div class="input-wrap"><input id="pl2" type="number" step="1" required><b>W</b></div><small id="pl2-range">—</small></label>
+              <label class="field"><span>自动校验间隔</span><div class="input-wrap"><input id="interval" type="number" min="5" max="300" step="1" required><b>秒</b></div><small>系统或休眠恢复覆盖限制后自动重应用</small></label>
+            </div>
+            <p class="notice">预设值始终受当前处理器与 RAPL 硬件上限约束；性能模式不会越过插件识别的安全范围。</p>
+          </section>
+          <div class="actions app-actions">
+            <button id="save-global" type="button" class="primary">保存功耗设置</button>
+            <button id="apply-now" type="button">立即重应用</button>
+            <button id="restore" type="button" class="danger">恢复安装前配置</button>
+          </div>
+          <p id="message-global" class="message" role="status" aria-live="polite"></p>
+        </section>
+
+        <section id="panel-crps" class="tab-panel crps-panel" role="tabpanel" aria-labelledby="tab-crps" hidden>
+          <iframe id="crps-frame" data-src="crps/" title="CRPS 电源监控"></iframe>
+        </section>
+
+        <section id="panel-debug" class="tab-panel" role="tabpanel" aria-labelledby="tab-debug" hidden>
+          <section class="card debug-panel" aria-labelledby="debug-heading">
+            <div class="panel-heading">
+              <div>
+                <h2 id="debug-heading">调试报告</h2>
+                <p>生成可供排查问题使用的模块诊断报告。报告主体来自调试接口，另附宿主窗口结构信息（标签/类名/背景色，不含文本与地址）用于定位窗口外观问题。</p>
+              </div>
+            </div>
+            <div class="actions debug-actions">
+              <button id="debug-generate-report" type="button" class="primary">生成调试报告</button>
+              <button id="debug-copy-report" type="button" disabled>复制报告</button>
+              <button id="debug-download-report" type="button" disabled>下载报告</button>
+              <button id="debug-open-issue" type="button" disabled>打开 GitHub Issue</button>
+            </div>
+            <p id="debug-report-meta" class="debug-report-meta">尚未生成报告</p>
+            <textarea id="debug-report" class="debug-report" readonly spellcheck="false" aria-label="调试报告内容" placeholder="点击“生成调试报告”获取报告"></textarea>
+            <p id="debug-status" class="message" role="status" aria-live="polite">可以生成一份新的调试报告。</p>
+          </section>
+
+          <section class="card debug-panel" aria-labelledby="history-settings-heading">
+            <div class="panel-heading">
+              <div>
+                <h2 id="history-settings-heading">历史温度与风扇控制</h2>
+                <p>采样开关、数据库大小上限与保存天数，以及历史数据的导出与清空；曲线与时间范围在“风扇控制”页的历史温度卡片。风扇调试控制在“风扇控制”页，用下方开关启用。</p>
+              </div>
+              <label class="toggle"><input id="fan-debug-visible" type="checkbox"><span></span>启用风扇调试</label>
+            </div>
+            <label class="toggle history-toggle"><input id="history-enabled" type="checkbox"><span></span>启用历史记录</label>
+            <div id="history-disabled-notice" class="inline-status history-disabled-notice" hidden>历史记录已停用：后台不再写入新采样，已保存的数据仍会按保留期与大小上限继续清理。</div>
+            <div class="field-grid history-settings">
+              <label class="field">
+                <span>数据库大小上限</span>
+                <div class="input-wrap"><input id="history-max-size" type="number" min="8" max="1024" step="8" value="64" inputmode="numeric"><b>MB</b></div>
+                <small>超限后同步清理运行日志</small>
+              </label>
+              <label class="field">
+                <span>保存天数</span>
+                <div class="input-wrap"><input id="history-retention-days" type="number" min="1" step="1" value="30" inputmode="numeric"><b>天</b></div>
+                <small>默认 30 天；可设大实现接近不限期，磁盘由大小上限兜底</small>
+              </label>
+            </div>
+            <div class="history-archive">
+              <label class="toggle history-archive-toggle"><input id="history-archive-enabled" type="checkbox"><span></span>启用长期记录</label>
+              <div class="field history-archive-dir">
+                <span>长期记录保存位置</span>
+                <div class="history-archive-row">
+                  <input id="history-archive-dir" class="text-input" type="text" placeholder="/vol1/1000/长期记录" autocomplete="off" spellcheck="false">
+                  <button id="history-archive-browse" type="button">浏览</button>
+                </div>
+                <small>开启后数据先在系统盘缓存，按月归档写入到保存位置，HDD 仅在归档时单次写入，文件数量不限制</small>
+              </div>
+            </div>
+            <div class="actions history-actions">
+              <button id="save-history" type="button" class="primary">保存历史设置</button>
+              <div class="history-export-wrap" title="导出后台采样的温度、风扇与传感器历史（SQLite 数据库，按保存天数保留）；sql 为数据库快照，csv 为可用 Excel 打开的宽表">
+                <button id="history-export-toggle" type="button" aria-haspopup="true" aria-expanded="false">导出历史温度数据 ▾</button>
+                <div id="history-export-menu" class="history-export-menu" hidden>
+                  <button id="history-export-sql" type="button">下载sql</button>
+                  <button id="history-export-csv" type="button">下载为csv</button>
+                </div>
+              </div>
+              <button id="history-clear" type="button" class="danger">清空数据库</button>
+            </div>
+            <p id="message-history" class="message" role="status" aria-live="polite"></p>
+            <p class="notice history-limit-notice">满配设备（4 风扇 + 6 盘位 + 12 传感器）每分钟采样约 0.7 KB，30 天约 30–45 MB；数据库同时受 保留天数与大小上限约束，超限后从最旧的一天开始删除。</p>
+          </section>
+
+          <section class="card debug-panel" aria-labelledby="runlog-heading">
+            <div class="panel-heading">
+              <div>
+                <h2 id="runlog-heading">运行日志</h2>
+                <p>守护进程的文本诊断日志（/var/log/tank/tad-module.log），正常情况下近乎空白；超过大小上限会自动截断并保留一代备份。</p>
+              </div>
+            </div>
+            <div class="field-grid history-settings">
+              <label class="field">
+                <span>日志大小上限</span>
+                <div class="input-wrap"><input id="runlog-max-size" type="number" min="1" max="256" step="1" value="16" inputmode="numeric"><b>MB</b></div>
+                <small>范围 1–256 MB，默认 16 MB；与历史数据库大小上限相互独立</small>
+              </label>
+            </div>
+            <div class="actions history-actions">
+              <button id="save-runlog" type="button" class="primary">保存日志设置</button>
+              <button id="runlog-export" type="button">导出日志</button>
+              <button id="runlog-clear" type="button" class="danger">清空日志</button>
+            </div>
+            <p id="runlog-status" class="message" role="status" aria-live="polite"></p>
+          </section>
+
+          <section class="card debug-panel" aria-labelledby="sensor-names-heading">
+            <div class="panel-heading">
+              <div>
+                <h2 id="sensor-names-heading">传感器显示名</h2>
+                <p>为温度传感器设置便于辨认的显示名（如多个 temp1），并可选择其归属父类（默认按驱动自动归类）；历史温度与悬浮提示会使用该名称，配置保存在本机，所有设备生效。</p>
+              </div>
+            </div>
+            <div id="sensor-names-list" class="sensor-names-list"></div>
+            <div class="actions debug-actions">
+              <button id="sensor-names-save" type="button" class="primary">保存显示名</button>
+            </div>
+            <p id="sensor-names-status" class="message" role="status" aria-live="polite">切换到历史温度页一次即可列出全部传感器。</p>
+          </section>
+
+          <section class="card debug-panel" aria-labelledby="serial-sensor-heading">
+            <div class="panel-heading">
+              <div>
+                <h2 id="serial-sensor-heading">USB 串口温度传感器</h2>
+                <p>经 USB 转串口模块（CH340、CP210x、FTDI 等）接入的温度计：固件逐行输出含温度数字的文本（如 25.6、+25.6、temp:25.6），行内第一个合理温度按摄氏度入库，可同时接多个。读取为间歇轮询（每 5 秒开口读一次），其余时间串口空闲、可被其他程序读取。读数出现在历史温度「其它」分组（键 usb:tty: 开头），可在上方「传感器显示名」改名。设备优先选 by-id 路径（插拔编号不漂移）；两个一模一样的适配器 by-id 会撞名，用 by-path 按物理插口区分。</p>
+              </div>
+            </div>
+            <div id="serial-sensor-rows" class="serial-sensor-rows"></div>
+            <div class="actions debug-actions">
+              <button id="serial-sensor-add" type="button">添加传感器</button>
+              <button id="serial-sensor-save" type="button" class="primary">保存串口传感器</button>
+            </div>
+            <p id="serial-sensor-status" class="message" role="status" aria-live="polite">插入 USB 转串口设备后，下拉框会自动列出候选串口。</p>
+          </section>
+        </section>
+
+        <section id="panel-about" class="tab-panel" role="tabpanel" aria-labelledby="tab-about" hidden>
+          <section class="card about-panel">
+            <div class="about-heading">
+              <img src="images/panel/设备外观图.svg" alt="TAD6S4N">
+              <div>
+                <h2>TAD6S4N模块</h2>
+                <p>为 TANK TAD6S4N 机型定制，其它硬件目前未做完整适配。</p>
+                <p class="about-version-line">当前版本 <strong id="about-version">v—</strong></p>
+                <div class="about-health-line">
+                  <span>运行状态</span>
+                  <span id="about-health" class="badge pending">读取中</span>
+                </div>
+                <p id="about-health-detail" class="about-health-detail">正在读取模块状态…</p>
+              </div>
+            </div>
+            <div class="about-features">
+              <article><h3>监控面板</h3><p>显示主机名称、系统版本、CPU 型号温度、风扇转速，以及硬盘位置、温度、活动和健康状态。</p></article>
+              <article><h3>风扇控制</h3><p>通过 CPU、HDD 和 NVMe 三条温度曲线智能调度散热，并支持按风扇独立选择温度来源。</p></article>
+              <article><h3>按键映射</h3><p>适配前置复制、网络按键和后置 RESET 孔，每个按键支持四种触发时长与自定义 Bash 脚本。</p></article>
+              <article><h3>功耗设置</h3><p>提供节能、标准、性能和自定义功耗模式，直观限制 PL1 与 PL2 功耗墙。</p></article>
+            </div>
+            <section class="about-project" aria-label="项目与更新">
+              <div>
+                <h3>项目与更新</h3>
+                <p>可前往 GitHub 查看源码，或手动检查是否有新版本。进入插件时不会自动联网检查。</p>
+              </div>
+              <div class="about-actions">
+                <a class="about-action" href="https://github.com/luodaoyi/TAD6S4N10G-fnos" target="_blank" rel="noopener noreferrer">GitHub 仓库</a>
+                <button id="check-updates" type="button" class="primary">检查更新</button>
+                <a id="update-release-link" class="about-action about-update-link" href="https://github.com/luodaoyi/TAD6S4N10G-fnos/releases" target="_blank" rel="noopener noreferrer" hidden>前往更新</a>
+              </div>
+              <p id="update-status" class="update-status" role="status" aria-live="polite">点击检查是否有新版本</p>
+            </section>
+            <p class="notice">风扇功能依赖 IT87 驱动（本插件安装时会尝试内置 DKMS）。插件开发：<a href="https://mi-d.cn" target="_blank" rel="noopener noreferrer">mi-d.cn</a> · <a href="https://tank-g.taobao.com/" target="_blank" rel="noopener noreferrer">TANK</a></p>
+          </section>
+        </section>
+      </form>
+    </div>
+  </main>
+  <div id="app-modal" class="app-modal" hidden>
+    <div class="app-modal-backdrop" data-modal-close></div>
+    <div class="app-modal-dialog" role="dialog" aria-modal="true" aria-labelledby="app-modal-title">
+      <h3 id="app-modal-title">详细信息</h3>
+      <p id="app-modal-body"></p>
+      <button id="app-modal-close" type="button" class="primary" data-modal-close>关闭</button>
+    </div>
+  </div>
+  <script src="app.js?v=0.10.19-t5-t5" defer></script>
+</body>
+</html>

@@ -1,0 +1,14 @@
+{
+  ".url": {
+    "tad-module.Application": {
+      "title": "TAD6S4N模块",
+      "icon": "images/icon_{0}.png",
+      "type": "iframe",
+      "protocol": "",
+      "gatewayPrefix": "/app/tad-module",
+      "gatewaySocket": "tad-module.sock",
+      "url": "/app/tad-module/",
+      "allUsers": false
+    }
+  }
+}

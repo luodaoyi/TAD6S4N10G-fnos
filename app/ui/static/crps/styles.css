@@ -1,0 +1,250 @@
+/* CRPS 电源监控 — 融合版样式
+ * 设计令牌与主应用 (app/ui/static/styles.css) 完全对齐: 同一套 CSS 变量、
+ * 同一暗色主题块 ([data-theme="dark"]), 主题由 index.html 首帧引导同步。
+ * 布局类名保持 CRPS 页面自有结构, 仅视觉风格统一。 */
+
+:root {
+  color-scheme: light;
+  --bg: #f3f4f6;
+  --surface: #ffffff;
+  --line: #e6e8ed;
+  --line-strong: #d5d9e0;
+  --primary: #3478f6;
+  --primary-hover: #2b6ae8;
+  --primary-soft: #eaf2ff;
+  --text: #1f2329;
+  --muted: #8a919c;
+  --success: #2ba471;
+  --warning: #d8922a;
+  --danger: #e24c4c;
+  --surface-soft: #f8f9fb;
+  --surface-muted: #f3f5f7;
+  --chart-grid: rgba(72, 82, 102, .12);
+  --radius: 10px;
+  --radius-sm: 6px;
+}
+
+[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #141519;
+  --surface: #1f2126;
+  --line: #2e3138;
+  --line-strong: #3a3e47;
+  --primary: #5b93ff;
+  --primary-hover: #77a5ff;
+  --primary-soft: #22304a;
+  --text: #e8eaee;
+  --muted: #9aa2ad;
+  --success: #45c48d;
+  --warning: #e6a53c;
+  --danger: #f16a6a;
+  --surface-soft: #22252b;
+  --surface-muted: #262931;
+  --chart-grid: rgba(255, 255, 255, .25);
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: "PingFang SC", "Microsoft YaHei UI", "Microsoft YaHei", system-ui, sans-serif;
+  background: var(--surface); /* 白底融入主应用内容区, 消除 iframe 灰色底框观感 */
+  color: var(--text);
+}
+.app { padding: 16px 20px; } /* 全宽铺满, 与主应用其他页面一致 */
+header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+header h1 { font-size: 18px; font-weight: 700; margin: 0; color: var(--text); }
+.sub { color: var(--muted); font-size: 13px; }
+
+.status-banner {
+  display: flex; align-items: center; gap: 8px;
+  padding: 10px 14px; border-radius: var(--radius);
+  background: var(--surface); border: 1px solid var(--line);
+  margin: 14px 0; font-size: 14px;
+}
+.status-banner .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--muted); }
+.status-banner.ok .dot { background: var(--success); }
+.status-banner.err .dot { background: var(--danger); }
+
+/* 参数卡: 固定单行 10 列紧凑排布 (与主应用参数区一致的一排观感), 窄屏才回退换行 */
+.grid {
+  display: grid; grid-template-columns: repeat(10, minmax(0, 1fr));
+  gap: 8px;
+}
+.card {
+  background: var(--surface); border: 1px solid var(--line);
+  border-radius: var(--radius); padding: 10px 12px;
+  min-width: 0;
+}
+.card .label { font-size: 11px; color: var(--muted); margin-bottom: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.card .value { font-size: 18px; font-weight: 700; font-variant-numeric: tabular-nums; color: var(--text); white-space: nowrap; }
+.card .unit { font-size: 11px; color: var(--muted); margin-left: 2px; font-weight: 400; }
+.card .extra { font-size: 10px; color: var(--muted); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pf-bar { height: 5px; background: var(--surface-muted); border-radius: 3px; margin-top: 6px; overflow: hidden; }
+.pf-fill { height: 100%; width: 0%; border-radius: 3px; background: var(--success); transition: width .5s ease, background .5s ease; }
+.card.warn .value { color: var(--danger); }
+
+@media (max-width: 1100px) {
+  .grid { grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); }
+  .card .value { font-size: 22px; }
+  .card .label { font-size: 12px; }
+}
+
+.fan-panel, .mfr-panel, .gpio-panel {
+  background: var(--surface); border: 1px solid var(--line);
+  border-radius: var(--radius); padding: 16px; margin-top: 14px;
+}
+.fan-panel h2, .mfr-panel h2, .gpio-panel h2 { font-size: 15px; font-weight: 700; margin: 0 0 12px; color: var(--text); }
+/* 模式切换: 分段控件风格 (参考 iOS/macOS Auto/Manual 切换), 一个圆角容器内两段;
+   转速与控件紧凑靠左排, 不做两端分散 */
+.fan-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 18px; }
+.fan-row { display: flex; align-items: baseline; gap: 8px; }
+.fan-label { color: var(--muted); font-size: 14px; }
+.fan-val { font-size: 24px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.fan-unit { color: var(--muted); font-size: 13px; }
+.fan-mode-row {
+  display: flex; padding: 3px; border-radius: 8px;
+  background: var(--surface-muted);
+}
+.mode-btn {
+  flex: 0 0 auto; padding: 6px 18px; border: 0;
+  background: transparent; color: var(--muted); border-radius: 6px;
+  font-size: 13px; cursor: pointer; transition: all .18s;
+}
+.mode-btn:hover { color: var(--text); }
+.mode-btn.active {
+  background: var(--primary); color: #fff; font-weight: 600;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, .14);
+}
+.slider-row { display: flex; align-items: center; gap: 12px; margin-top: 12px; }
+.slider-row input[type=range] { flex: 1; accent-color: var(--primary); height: 32px; }
+@media (min-width: 641px) {
+  /* 桌面端滑条限宽, 不再拉满整行 */
+  .slider-row { max-width: 420px; }
+}
+.pct { font-size: 16px; font-weight: 600; min-width: 44px; text-align: right; }
+.fan-tip { font-size: 12px; color: var(--muted); margin-top: 10px; }
+.fan-msg { font-size: 13px; margin-top: 8px; min-height: 18px; }
+.fan-msg.ok { color: var(--success); }
+.fan-msg.err { color: var(--danger); }
+
+.mfr { font-size: 14px; line-height: 1.7; color: var(--text); word-break: break-all; }
+.mfr .k { color: var(--muted); }
+
+/* GPIO 配置: 手机端两列针脚字段 + 一排按钮; 桌面端单排紧凑 (字段与按钮同一行靠左) */
+.gpio-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.gpio-field { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.gpio-field label { font-size: 12px; color: var(--muted); }
+.gpio-field select {
+  width: 100%; padding: 9px 10px; font-size: 14px; border: 1px solid var(--line);
+  border-radius: var(--radius-sm); background: var(--surface); color: var(--text); cursor: pointer;
+}
+.gpio-actions { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+.gpio-actions .export-btn { width: 100%; padding: 9px 0; text-align: center; }
+@media (min-width: 641px) {
+  .gpio-grid { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 18px; }
+  .gpio-field { flex-direction: row; align-items: center; gap: 8px; }
+  .gpio-field label { font-size: 13px; white-space: nowrap; }
+  .gpio-field select { width: auto; min-width: 96px; padding: 7px 10px; }
+  .gpio-actions { display: flex; justify-content: flex-start; gap: 8px; margin: 0 0 0 6px; }
+  .gpio-actions .export-btn { width: auto; padding: 8px 16px; }
+}
+.gpio-tip { font-size: 12px; color: var(--muted); margin-top: 10px; line-height: 1.6; }
+.gpio-msg { font-size: 13px; margin-top: 8px; min-height: 18px; }
+.gpio-msg.ok { color: var(--success); }
+.gpio-msg.err { color: var(--danger); }
+
+.curve-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+.export-btn {
+  padding: 6px 14px; font-size: 13px; border: 1px solid var(--line);
+  background: transparent; color: var(--primary); border-radius: var(--radius-sm); cursor: pointer;
+}
+.export-btn:active { background: var(--primary); color: #fff; }
+.curve-tooltip {
+  position: absolute; display: none; pointer-events: none; z-index: 5;
+  background: rgba(17, 24, 39, 0.92); color: #fff; font-size: 12px;
+  padding: 5px 9px; border-radius: var(--radius-sm); white-space: nowrap;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.25);
+}
+.curve-tip { font-size: 12px; color: var(--muted); margin-top: 4px; }
+.export-msg { font-size: 12px; margin-top: 6px; min-height: 16px; }
+.export-msg.ok { color: var(--success); }
+.export-msg.err { color: var(--danger); }
+
+/* ---- 耗电统计 ---- */
+.energy-panel {
+  background: var(--surface); border: 1px solid var(--line);
+  border-radius: var(--radius); padding: 16px; margin-top: 14px; position: relative;
+}
+.energy-panel h2 { font-size: 15px; font-weight: 700; margin: 0; color: var(--text); }
+.energy-cards {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 12px; margin-bottom: 12px;
+}
+.ecard { background: var(--surface-soft); border: 1px solid var(--line); border-radius: var(--radius); padding: 10px 12px; }
+.ecard .label { font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+.ecard .val { font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.ecard .unit { font-size: 12px; color: var(--muted); margin-left: 3px; font-weight: 400; }
+.ecard .extra { font-size: 11px; color: var(--muted); margin-top: 2px; }
+#energy-chart-canvas { width: 100%; height: 140px; display: block; }
+
+footer { display: flex; justify-content: space-between; margin-top: 14px; color: var(--muted); font-size: 12px; flex-wrap: wrap; gap: 6px; }
+
+/* ---- 日志弹窗 ---- */
+.log-mask {
+  position: fixed; inset: 0; z-index: 50;
+  background: rgba(0,0,0,0.5);
+  display: flex; align-items: center; justify-content: center;
+  padding: 16px;
+}
+.log-modal {
+  background: var(--surface); border-radius: var(--radius); width: 100%; max-width: 640px;
+  max-height: 80vh; display: flex; flex-direction: column;
+  box-shadow: 0 8px 30px rgba(0,0,0,0.3); overflow: hidden;
+}
+.log-head {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 10px 14px; border-bottom: 1px solid var(--line);
+  font-size: 14px; font-weight: 600; color: var(--text);
+}
+.log-actions { display: flex; gap: 8px; }
+.log-body {
+  flex: 1; overflow: auto; margin: 0; padding: 12px 14px;
+  font-size: 12px; line-height: 1.5; white-space: pre-wrap;
+  word-break: break-all; background: var(--surface-soft);
+  color: var(--text-body, var(--text)); font-family: Menlo, Consolas, monospace;
+}
+
+/* ---- 手机端 (竖屏) ---- */
+@media (max-width: 640px) {
+  .app { padding: 12px 12px; }
+  /* 风扇控制手机端回退堆叠: 转速一行, 分段控件等宽铺满 */
+  .fan-head { flex-direction: column; align-items: stretch; }
+  .fan-mode-row { margin-top: 4px; }
+  .mode-btn { flex: 1; padding: 7px 0; }
+  /* 耗电统计 4 卡固定 2x2, 避免窄屏 auto-fill 退化成一竖排 */
+  .energy-cards { grid-template-columns: repeat(2, 1fr); gap: 10px; }
+  .ecard .val { font-size: 18px; }
+  /* 柱状图加高, 提升窄屏可读性 (JS 读 clientHeight 适配) */
+  #energy-chart-canvas { height: 180px; }
+  /* 接线图弹层: 手机端不做悬浮层, display:contents 让按钮/弹层直接成为 grid 项,
+     弹层横跨整行铺满、出现在按钮行下方, 参与文档流把后面的提示文字推开 (不遮挡) */
+  .gpio-actions .wiring-wrap { display: contents; }
+  .gpio-actions .wiring-pop { grid-column: 1 / -1; position: static; width: auto; }
+}
+
+/* 融合模式下宿主 CSP (style-src 'self') 会忽略 HTML 行内 style 属性,
+   初始隐藏统一用 class; JS 动态 element.style 优先级高于类, 不受影响 */
+.hidden { display: none; }
+
+/* 未保存 GPIO 配置前只留 GPIO 配置区: 其余区块默认隐藏, JS 确认已配置后给 body 加 cfg-ok 显示。
+   banner 用 ID 选择器 (className 会被 setBanner 重置); 后端不可达时 banner 例外显示报错 */
+body:not(.cfg-ok) .needs-cfg { display: none; }
+body:not(.cfg-ok) #status-banner { display: none; }
+body:not(.cfg-ok) #status-banner.net-err { display: flex; }
+
+/* 接线示意图: 点"查看连线方法"按钮切换显示 (JS 加/去 .show), 点弹层外关闭 */
+.wiring-wrap { position: relative; display: inline-block; }
+.wiring-pop { display: none; position: absolute; left: 0; top: calc(100% + 6px); z-index: 60; width: min(560px, 86vw); background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: 0 8px 30px rgba(0,0,0,0.3); padding: 10px; }
+.wiring-pop.show { display: block; }
+.wiring-pop img { display: block; width: 100%; border-radius: 6px; background: var(--surface-muted); }
+.wiring-note { display: block; margin-top: 8px; font-size: 12px; font-weight: 400; line-height: 1.6; color: var(--text); }

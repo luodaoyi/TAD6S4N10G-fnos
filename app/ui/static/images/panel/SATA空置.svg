@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/DTD/svg11.dtd">
+<!-- 空置托盘：几何与 SATA灰-休眠未使用.svg 完全一致（984x3469，圆角矩形），
+     填充采用机箱底图空槽色 #6B7280，保证空仓与在位仓托盘同高同形。 -->
+<svg xmlns="http://www.w3.org/2000/svg" xml:space="preserve" width="9.9779mm" height="35.1663mm" version="1.1" style="shape-rendering:geometricPrecision; text-rendering:geometricPrecision; image-rendering:optimizeQuality; fill-rule:evenodd; clip-rule:evenodd"
+viewBox="-13.17 -13.17 1010.34 3495.34"
+ xmlns:xlink="http://www.w3.org/1999/xlink">
+ <defs>
+  <style type="text/css">
+   <![CDATA[
+    .str0 {stroke:#77808F;stroke-width:39.4538}
+    .fil0 {fill:#6B7280;fill-rule:nonzero}
+  ]]>
+  </style>
+ </defs>
+ <g id="图层_x0020_1">
+  <metadata id="CorelCorpID_0Corel-Layer"/>
+  <rect class="fil0 str0" x="20" y="20" width="945" height="3429" rx="89" ry="89"/>
+ </g>
+</svg>

@@ -1,0 +1,11 @@
+#!/bin/sh
+set -u
+
+"${TRIM_APPDEST}/bin/tad-module" restore \
+  --config "${TRIM_PKGETC}/config.json" \
+  --state "${TRIM_PKGVAR}/original-state.json" || {
+    echo "恢复安装前功耗限制失败；请在卸载后手动检查 Intel RAPL。" >"${TRIM_TEMP_LOGFILE:-/dev/stderr}"
+    exit 1
+  }
+
+exit 0

@@ -1,0 +1,4 @@
+# prebuilt binaries are built by CI (tank-build.yml) / taken from official
+# Release; do not vendor them into git.
+go编译单文件/tank
+go编译单文件/tad-module

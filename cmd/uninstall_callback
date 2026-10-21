@@ -1,0 +1,19 @@
+#!/bin/sh
+set -u
+
+# 不 rmmod it87；仅清理本插件可识别的 DKMS/conf（若当初由我们托管）
+# shellcheck source=it87_dkms.sh
+. "$(CDPATH= cd -- "$(dirname "$0")" && pwd)/it87_dkms.sh"
+it87_cleanup_ours || true
+
+# 卸载向导（wizard/uninstall）的 radio 选择以环境变量注入本脚本；fnOS
+# 卸载流程本身保留 var，仅当用户显式选择"彻底删除"（"true"）才清空应用
+# 数据目录（history.db、原始功耗快照、日志）。功耗恢复在 uninstall_init
+# 已完成，此处删除 state 文件不影响恢复。
+if [ "${wizard_delete_data:-}" = "true" ] && [ -d "${TRIM_PKGVAR}" ]; then
+  if ! find "${TRIM_PKGVAR}" -mindepth 1 -delete; then
+    echo "清理历史数据失败；可手动删除 ${TRIM_PKGVAR}" >"${TRIM_TEMP_LOGFILE:-/dev/stderr}"
+  fi
+fi
+
+exit 0

@@ -1,0 +1,95 @@
+name: Build TAD6S4N模块 plugin
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+          cache: true
+
+      - name: Validate version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version=//p' manifest | head -1 | tr -d '"')"
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" && "${GITHUB_REF_NAME}" != "v${version}" ]]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match manifest version ${version}" >&2
+            exit 1
+          fi
+
+      - name: Test
+        run: |
+          go test ./...
+          go vet ./...
+          node --check app/ui/static/app.js
+          node --test app/ui/static/app.test.js
+          bash -n cmd/* scripts/build.sh
+
+      - name: Download official fnpack
+        run: |
+          mkdir -p tools
+          curl --fail --location --silent --show-error \
+            --output tools/fnpack \
+            https://static2.fnnas.com/fnpack/fnpack-1.2.3-linux-amd64
+          chmod 0755 tools/fnpack scripts/build.sh cmd/*
+          tools/fnpack --help | head -5
+
+      - name: Build FPK
+        run: FNPACK="${PWD}/tools/fnpack" bash scripts/build.sh
+
+      - name: Verify package
+        run: |
+          test -s tad-module.fpk
+          tar -tf tad-module.fpk | grep -Fx manifest
+          tar -tf tad-module.fpk | grep -Fx app.tgz
+          tar -tf tad-module.fpk | grep -Fx cmd/main
+          tar -tf tad-module.fpk | grep -Fx cmd/it87_dkms.sh
+          tar -xOf tad-module.fpk app.tgz | tar -tz | grep -E '(^|/)it87-src/dkms\.conf$'
+          tar -xOf tad-module.fpk app.tgz | tar -tz | grep -E '(^|/)it87-src/it87\.c$'
+          sha256sum tad-module.fpk > tad-module.fpk.sha256
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tad-module-${{ github.run_id }}
+          path: |
+            tad-module.fpk
+            tad-module.fpk.sha256
+          if-no-files-found: error
+
+      # GITHUB_TOKEN-created releases do not chain workflow_run/release
+      # listeners, so attach tank here atomically instead of relying on
+      # tank-build.yml's release:created trigger.
+      - name: Build tank (linux/amd64, static)
+        if: github.ref_type == 'tag'
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+            go build -trimpath -ldflags "-s -w" -o tank-linux-amd64 ./debian-tui/tank.go
+          test -s tank-linux-amd64
+
+      - name: Publish GitHub Release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            tad-module.fpk tad-module.fpk.sha256 tank-linux-amd64 \
+            --title "TAD6S4N模块 ${GITHUB_REF_NAME}" \
+            --generate-notes

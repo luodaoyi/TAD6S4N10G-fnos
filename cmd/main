@@ -1,0 +1,88 @@
+#!/bin/sh
+set -eu
+
+APP_DEST="${TRIM_APPDEST:-/var/apps/tad-module/target}"
+PKG_ETC="${TRIM_PKGETC:-/var/apps/tad-module/etc}"
+PKG_VAR="${TRIM_PKGVAR:-/var/apps/tad-module/var}"
+BIN="${APP_DEST}/bin/tad-module"
+PID_FILE="${PKG_VAR}/tad-module.pid"
+SOCKET="${APP_DEST}/tad-module.sock"
+LOG_FILE="${PKG_VAR}/tad-module.log"
+
+# shellcheck source=it87_dkms.sh
+. "$(CDPATH= cd -- "$(dirname "$0")" && pwd)/it87_dkms.sh"
+
+is_running() {
+  [ -f "${PID_FILE}" ] || return 1
+  pid="$(cat "${PID_FILE}" 2>/dev/null || true)"
+  [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null
+}
+
+ensure_it87_soft() {
+  # 启动路径：内核升级自愈；失败不阻断 tad-module 服务
+  it87_ensure || true
+}
+
+start_service() {
+  mkdir -p "${PKG_ETC}" "${PKG_VAR}"
+  ensure_it87_soft
+  if is_running; then
+    exit 0
+  fi
+  rm -f "${PID_FILE}"
+  if [ -S "${SOCKET}" ]; then
+    rm -f "${SOCKET}"
+  elif [ -e "${SOCKET}" ]; then
+    echo "Refusing to remove non-socket path ${SOCKET}" >&2
+    exit 1
+  fi
+  nohup "${BIN}" serve \
+    --config "${PKG_ETC}/config.json" \
+    --state "${PKG_VAR}/original-state.json" \
+    --socket "${SOCKET}" \
+    --web-root "${APP_DEST}/ui/static" \
+    --log "${LOG_FILE}" \
+    >>"${LOG_FILE}" 2>&1 &
+  pid="$!"
+  printf '%s\n' "${pid}" >"${PID_FILE}"
+  count=0
+  while [ "${count}" -lt 50 ]; do
+    if ! kill -0 "${pid}" 2>/dev/null; then
+      rm -f "${PID_FILE}"
+      tail -n 20 "${LOG_FILE}" >&2 || true
+      exit 1
+    fi
+    [ -S "${SOCKET}" ] && exit 0
+    count=$((count + 1))
+    sleep 0.1
+  done
+  echo "tad-module did not create its socket in time" >&2
+  exit 1
+}
+
+stop_service() {
+  # 明确不 rmmod it87（风扇驱动可继续供系统或其他组件使用）
+  if ! is_running; then
+    rm -f "${PID_FILE}"
+    exit 0
+  fi
+  pid="$(cat "${PID_FILE}")"
+  kill -TERM "${pid}" 2>/dev/null || true
+  count=0
+  while kill -0 "${pid}" 2>/dev/null && [ "${count}" -lt 100 ]; do
+    count=$((count + 1))
+    sleep 0.1
+  done
+  if kill -0 "${pid}" 2>/dev/null; then
+    kill -KILL "${pid}" 2>/dev/null || true
+  fi
+  rm -f "${PID_FILE}"
+}
+
+case "${1:-}" in
+  start) start_service ;;
+  stop) stop_service ;;
+  status) is_running && exit 0 || exit 3 ;;
+  restart) stop_service; start_service ;;
+  *) echo "Usage: $0 {start|stop|status|restart}" >&2; exit 1 ;;
+esac

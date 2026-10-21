@@ -1,0 +1,131 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>电源监控 - CRPS PMBus</title>
+<link rel="stylesheet" href="styles.css?v=202610210930">
+</head>
+<body>
+<div class="app">
+  <header>
+    <h1>电源监控</h1>
+    <div class="sub" id="header-sub">PMBus 正在连接…</div>
+  </header>
+
+  <section class="status-banner" id="status-banner">
+    <span class="dot"></span>
+    <span id="status-text">读取中…</span>
+  </section>
+
+  <section class="grid needs-cfg" id="metrics">
+    <!-- 参数卡片由 JS 填充 -->
+  </section>
+
+  <section class="energy-panel needs-cfg">
+    <div class="curve-head">
+      <h2>🔋 耗电统计</h2>
+      <button id="energy-reset" class="export-btn">统计清零</button>
+    </div>
+    <div class="energy-cards">
+      <div class="ecard">
+        <div class="label">累计耗电</div>
+        <div class="val"><span id="en-total">--</span><span class="unit">kWh</span></div>
+        <div class="extra" id="en-since"></div>
+      </div>
+      <div class="ecard">
+        <div class="label">今日耗电</div>
+        <div class="val"><span id="en-today">--</span><span class="unit">kWh</span></div>
+        <div class="extra" id="en-session"></div>
+      </div>
+      <div class="ecard">
+        <div class="label">本月耗电</div>
+        <div class="val"><span id="en-month">--</span><span class="unit">kWh</span></div>
+        <div class="extra">自然月累计</div>
+      </div>
+      <div class="ecard">
+        <div class="label">实时功率</div>
+        <div class="val"><span id="en-power">--</span><span class="unit">W</span></div>
+        <div class="extra">输入侧 PIN</div>
+      </div>
+    </div>
+    <canvas id="energy-chart-canvas"></canvas>
+    <div class="curve-tooltip" id="energy-tooltip"></div>
+    <div class="curve-tip">近 30 天每日耗电（kWh）· 每 15 秒采样一次输入功率积分累计，重启不丢</div>
+    <div class="export-msg" id="energy-msg"></div>
+  </section>
+
+  <section class="fan-panel needs-cfg">
+    <h2>🖥 风扇控制</h2>
+    <div class="fan-head">
+      <div class="fan-row">
+        <span class="fan-label">转速</span>
+        <span class="fan-val" id="fan-rpm">--</span>
+        <span class="fan-unit">RPM</span>
+      </div>
+      <div class="fan-mode-row">
+        <button id="mode-auto" class="mode-btn active">电源自动</button>
+        <button id="mode-manual" class="mode-btn">手动控制</button>
+      </div>
+    </div>
+    <div class="slider-row hidden" id="manual-ctl">
+      <input type="range" id="fan-slider" min="10" max="100" step="1" value="10" aria-label="电源风扇手动占空比">
+      <span class="pct" id="fan-pct">10%</span>
+    </div>
+    <div class="fan-tip">自动模式由电源按温度调速，手动模式拖动滑杆调节转速。</div>
+    <div class="fan-msg" id="fan-msg"></div>
+  </section>
+
+  <section class="gpio-panel">
+    <h2>🔌 GPIO 引脚配置</h2>
+    <div class="gpio-grid">
+      <div class="gpio-field">
+        <label for="scl-pin">PSCL 针脚</label>
+        <select id="scl-pin"></select>
+      </div>
+      <div class="gpio-field">
+        <label for="sda-pin">PSDA 针脚</label>
+        <select id="sda-pin"></select>
+      </div>
+      <div class="gpio-actions">
+        <button id="gpio-detect" class="export-btn">自动识别保存</button>
+        <button id="gpio-save" class="export-btn">保存并应用</button>
+        <span class="wiring-wrap">
+          <button id="dl-log" class="export-btn">查看连线方法</button>
+          <span class="wiring-pop" id="wiring-pop">
+            <img src="wiring.jpg" alt="硬盘背板与主板 FPANEL 接线示意图">
+            <span class="wiring-note">此功能需要连接硬盘背板 PSDA 和 PSCL 信号到主板的 FPANEL 19PIN 和 20PIN（不分方向），连接好后点击“自动识别保存”即可启用电源监管功能。</span>
+          </span>
+        </span>
+      </div>
+    </div>
+    <div class="gpio-tip">Pin19-22 四根 GPIO 已实测可双向。选择当前实际接到电源 PSCL/PSDA 的针脚后点“保存并应用”，后端立即切换并持久化，换线后改这里即可。自动探测会自动扫描 19-22 找到接线。</div>
+    <div class="gpio-msg" id="gpio-msg"></div>
+  </section>
+
+  <section class="mfr-panel needs-cfg">
+    <h2>🏭 电源信息</h2>
+    <div class="mfr" id="mfr-info">--</div>
+  </section>
+
+  <footer class="needs-cfg">
+    <span id="ts">--</span>
+  </footer>
+</div>
+
+<div class="log-mask hidden" id="log-mask">
+  <div class="log-modal">
+    <div class="log-head">
+      <span>运行日志 (CRPS 电源监控)</span>
+      <span class="log-actions">
+        <button id="log-copy" class="export-btn">复制</button>
+        <button id="log-close" class="export-btn">关闭</button>
+      </span>
+    </div>
+    <pre id="log-body" class="log-body"></pre>
+  </div>
+</div>
+
+<script src="app.js?v=202610211130"></script>
+</body>
+</html>

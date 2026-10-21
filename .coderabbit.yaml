@@ -1,0 +1,42 @@
+language: zh-CN
+early_access: false
+reviews:
+  profile: assertive
+  request_changes_workflow: true
+  high_level_summary: true
+  poem: false
+  review_status: true
+  collapse_walkthrough: false
+  auto_review:
+    enabled: true
+    drafts: true
+    base_branches:
+      - main
+  path_filters:
+    - "!**/bin/**"
+    - "!**/*.{exe,dll,so,dylib,o,a}"
+    - "!**/.cache/**"
+    - "!**/dist/**"
+  path_instructions:
+    - path: "internal/powerguard/**"
+      instructions: |
+        fnOS 电源/存储守护。核对 SMART 与待机（standby）提示文案须符合 0.10.1 约定，不要改语义或 invent 新状态码。
+        CPU 温度、功耗、风扇和 GPIO 路径要与现有硬件映射一致，不要臆造寄存器、引脚或阈值。
+    - path: "backend/**"
+      instructions: |
+        入口与平台差异（unix/windows）不得破坏 GPIO/风扇/功耗采集。不要把密钥或调试转储默认对外暴露。
+    - path: "app/**"
+      instructions: |
+        面板 UI 的磁盘/待机/告警状态应与 backend 的 SMART/standby（0.10.1）语义一致，不要编造健康等级或数值。
+    - path: "manifest"
+      instructions: |
+        清单字段须与模块真实能力一致，不要添加未实现权限或版本号。
+    - path: ".github/workflows/**"
+      instructions: |
+        检查构建/发布权限最小化，不要把构建产物或调试报告中的主机信息当密钥外传。
+    - path: "README.md"
+      instructions: |
+        不要编造 README 中的数字（版本、温度、功耗、风扇转速、SMART 阈值等）；只核对已有表述与代码是否一致。
+        SMART/待机文案应对齐 0.10.1。
+chat:
+  auto_reply: true
