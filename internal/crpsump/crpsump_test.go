@@ -531,6 +531,132 @@ func TestNewBusInvalidPinsStayUnconfigured(t *testing.T) {
 	}
 }
 
+// ---------------- autoDetect 收尾 restore ----------------
+
+// 未配置总线探测收尾: 只释放扫描期间驱动过的针脚, 不得驱动任何引脚 (含原 SCL)。
+// 旧实现 restore 无条件 switchPin(orig)+busReset, 会把未配置机器的默认 SCL
+// 驱动为输出, 违反"未配置不碰 GPIO 方向"的安全前提 (探测取消/无匹配同样适用)。
+func TestAutoDetectRestoreUnconfiguredReleasesAllDriven(t *testing.T) {
+	stubPortAvailable(t, true)
+	b := NewBus("Pin19", "Pin20", false)
+	b.pio = newMockPIO()
+
+	// 模拟扫描中途状态: Pin19/Pin21 已被驱动为输出 (driven 追踪在案)
+	b.mu.Lock()
+	if err := b.setPinDir("Pin19", GPPins["Pin19"], true); err != nil {
+		t.Fatalf("预置驱动 Pin19 失败: %v", err)
+	}
+	if err := b.setPinDir("Pin21", GPPins["Pin21"], true); err != nil {
+		t.Fatalf("预置驱动 Pin21 失败: %v", err)
+	}
+	b.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // 立即取消: 第一轮 sleepCtx 即失败, 直接走 restore
+	scl, sda := b.autoDetect(ctx)
+	if scl != "" || sda != "" {
+		t.Fatalf("已取消的探测不应命中接线, 得到 %s/%s", scl, sda)
+	}
+	if pins := b.drivenPins(); len(pins) != 0 {
+		t.Fatalf("未配置收尾应释放全部已驱动针脚, 仍残留 %v", pins)
+	}
+	if b.isConfigured() {
+		t.Fatal("探测收尾不得改变 configured 状态")
+	}
+}
+
+// 未配置收尾释放失败必须如实保留 driven 追踪 (可重试), 不得假报已恢复;
+// 故障清除后重试应全部释放。
+func TestAutoDetectRestoreUnconfiguredFailureKeepsTracking(t *testing.T) {
+	stubPortAvailable(t, true)
+	b := NewBus("Pin19", "Pin20", false)
+	mock := newMockPIO()
+	b.pio = mock
+
+	b.mu.Lock()
+	if err := b.setPinDir("Pin21", GPPins["Pin21"], true); err != nil {
+		t.Fatalf("预置驱动 Pin21 失败: %v", err)
+	}
+	b.mu.Unlock()
+
+	// 数据口 0x2F 写全失败: 释放必败, driven 追踪应保留
+	mock.failOutbOnPort = 0x2F
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	b.autoDetect(ctx)
+	if pins := b.drivenPins(); len(pins) == 0 {
+		t.Fatal("释放失败时不得清空 driven 追踪 (假报已恢复)")
+	}
+
+	// 故障清除后重试: 全部释放
+	mock.failOutbOnPort = -1
+	b.autoDetect(ctx)
+	if pins := b.drivenPins(); len(pins) != 0 {
+		t.Fatalf("故障清除后重试应释放全部针脚, 仍残留 %v", pins)
+	}
+}
+
+// 已配置总线探测收尾: 恢复原引脚并保持 SCL 驱动, 扫描残留针脚全部释放,
+// configured 状态保持不变。
+func TestAutoDetectRestoreConfiguredRestoresOriginalPins(t *testing.T) {
+	stubPortAvailable(t, true)
+	b := NewBus("Pin19", "Pin20", false)
+	b.pio = newMockPIO()
+	if ok, msg := b.reconfigure(nil, nil); !ok {
+		t.Fatalf("reconfigure 应成功: %s", msg)
+	}
+	// 模拟扫描残留: Pin21 已被驱动
+	b.mu.Lock()
+	if err := b.setPinDir("Pin21", GPPins["Pin21"], true); err != nil {
+		t.Fatalf("预置驱动 Pin21 失败: %v", err)
+	}
+	b.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	b.autoDetect(ctx)
+
+	if scl, sda := b.pinNames(); scl != "Pin19" || sda != "Pin20" {
+		t.Fatalf("已配置收尾应恢复原引脚, 得到 %s/%s", scl, sda)
+	}
+	pins := b.drivenPins()
+	if len(pins) != 1 || pins[0] != "Pin19" {
+		t.Fatalf("收尾后应仅剩原 SCL (Pin19) 保持驱动, 实际 %v", pins)
+	}
+	if !b.isConfigured() {
+		t.Fatal("已配置收尾不得清除 configured 状态")
+	}
+}
+
+// 恢复收尾与后台读总线并发: 方向写入经 b.mu 串行 (switchPin/busReset 自取锁,
+// 未配置分支持 b.mu 调 setPinDir), 不得死锁; -race 下同时验证无数据竞争。
+func TestAutoDetectRestoreConcurrentWithReads(t *testing.T) {
+	stubPortAvailable(t, true)
+	b := NewBus("Pin19", "Pin20", false)
+	b.pio = newMockPIO()
+	if ok, msg := b.reconfigure(nil, nil); !ok {
+		t.Fatalf("reconfigure 应成功: %s", msg)
+	}
+	done := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		defer close(done)
+		b.autoDetect(ctx) // 50ms 后取消, 收尾走已配置 restore 路径
+	}()
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	deadline := time.Now().Add(300 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		_ = b.readWord(Cmd["READ_VIN"]) // 与 restore 并发的总线读
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("autoDetect 与并发读总线发生死锁")
+	}
+}
+
 // Reset 后首个 Sample 只建时间基准不积分 (采样器 dt 跨越清零时刻)
 func TestEnergyResetSkipsFirstSample(t *testing.T) {
 	e := NewEnergy(filepath.Join(t.TempDir(), "energy.json"))
