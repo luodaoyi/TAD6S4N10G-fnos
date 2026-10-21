@@ -469,7 +469,7 @@ func TestDetectApplyFailure(t *testing.T) {
 	mock := newMockPIO()
 	mock.failOutb = true // 方向写全失败: 应用必败
 	b.pio = mock
-	srv := &AppServer{Bus: b, DetectFn: func(context.Context) (string, string) { return "Pin19", "Pin20" }}
+	srv := &AppServer{Bus: b, DetectFn: func(context.Context) (string, string, error) { return "Pin19", "Pin20", nil }}
 	req := httptest.NewRequest(http.MethodPost, "/api/crps/detect", nil)
 	rec := httptest.NewRecorder()
 	srv.APIHandler().ServeHTTP(rec, req)
@@ -500,7 +500,7 @@ func TestDetectSaveFailure(t *testing.T) {
 	srv := &AppServer{
 		Bus:        b,
 		ConfigPath: filepath.Join(t.TempDir(), "no-such-dir", "crps.json"), // 目录不存在: 写盘必败
-		DetectFn:   func(context.Context) (string, string) { return "Pin19", "Pin20" },
+		DetectFn:   func(context.Context) (string, string, error) { return "Pin19", "Pin20", nil },
 	}
 	req := httptest.NewRequest(http.MethodPost, "/api/crps/detect", nil)
 	rec := httptest.NewRecorder()
@@ -553,9 +553,12 @@ func TestAutoDetectRestoreUnconfiguredReleasesAllDriven(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // 立即取消: 第一轮 sleepCtx 即失败, 直接走 restore
-	scl, sda := b.autoDetect(ctx)
+	scl, sda, err := b.autoDetect(ctx)
 	if scl != "" || sda != "" {
 		t.Fatalf("已取消的探测不应命中接线, 得到 %s/%s", scl, sda)
+	}
+	if err != nil {
+		t.Fatalf("清理成功时错误应为 nil, 得到 %v", err)
 	}
 	if pins := b.drivenPins(); len(pins) != 0 {
 		t.Fatalf("未配置收尾应释放全部已驱动针脚, 仍残留 %v", pins)
@@ -579,18 +582,26 @@ func TestAutoDetectRestoreUnconfiguredFailureKeepsTracking(t *testing.T) {
 	}
 	b.mu.Unlock()
 
-	// 数据口 0x2F 写全失败: 释放必败, driven 追踪应保留
+	// 数据口 0x2F 写全失败: 释放必败, driven 追踪应保留, 清理错误如实返回
 	mock.failOutbOnPort = 0x2F
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	b.autoDetect(ctx)
+	_, _, err := b.autoDetect(ctx)
+	if err == nil {
+		t.Fatal("释放失败时必须返回清理错误, 不得静默吞掉")
+	}
+	if !strings.Contains(err.Error(), "Pin21") {
+		t.Fatalf("清理错误应点名失败针脚 Pin21, 得到 %v", err)
+	}
 	if pins := b.drivenPins(); len(pins) == 0 {
 		t.Fatal("释放失败时不得清空 driven 追踪 (假报已恢复)")
 	}
 
-	// 故障清除后重试: 全部释放
+	// 故障清除后重试: 全部释放, 错误消失
 	mock.failOutbOnPort = -1
-	b.autoDetect(ctx)
+	if _, _, err := b.autoDetect(ctx); err != nil {
+		t.Fatalf("故障清除后重试清理应成功, 得到 %v", err)
+	}
 	if pins := b.drivenPins(); len(pins) != 0 {
 		t.Fatalf("故障清除后重试应释放全部针脚, 仍残留 %v", pins)
 	}
@@ -654,6 +665,103 @@ func TestAutoDetectRestoreConcurrentWithReads(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("autoDetect 与并发读总线发生死锁")
+	}
+}
+
+// detect 接口: 探测未命中时, 收尾清理成功与清理失败必须给出不同响应——
+// 清理失败意味着针脚可能仍为输出, 调用方需要知道必须重试,
+// 不能与 "未找到且已清理完成" 混为同一句提示。
+func TestDetectCleanupFailureDistinctFromCleanMiss(t *testing.T) {
+	stubAdmin(t, true)
+	stubPortAvailable(t, true)
+
+	// 情形 1: 未命中 + 清理完成 -> 原有提示, 无 cleanup_failed 标记
+	b := NewBus("Pin19", "Pin20", false)
+	b.pio = newMockPIO()
+	srv := &AppServer{
+		Bus:      b,
+		DetectFn: func(context.Context) (string, string, error) { return "", "", nil },
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/crps/detect", nil)
+	rec := httptest.NewRecorder()
+	srv.APIHandler().ServeHTTP(rec, req)
+	body := rec.Body.String()
+	if !strings.Contains(body, "未探测到电源接线") {
+		t.Fatalf("清理完成的未命中应回原提示, 得到 %s", body)
+	}
+	if strings.Contains(body, "cleanup_failed") {
+		t.Fatalf("清理完成不得带 cleanup_failed 标记, 得到 %s", body)
+	}
+
+	// 情形 2: 未命中 + 清理失败 -> cleanup_failed:true + 明确清理失败提示
+	b2 := NewBus("Pin19", "Pin20", false)
+	b2.pio = newMockPIO()
+	srv2 := &AppServer{
+		Bus: b2,
+		DetectFn: func(context.Context) (string, string, error) {
+			return "", "", errors.New("针脚 Pin21 未能释放回输入")
+		},
+	}
+	rec2 := httptest.NewRecorder()
+	srv2.APIHandler().ServeHTTP(rec2, httptest.NewRequest(http.MethodPost, "/api/crps/detect", nil))
+	body2 := rec2.Body.String()
+	if !strings.Contains(body2, `"cleanup_failed":true`) {
+		t.Fatalf("清理失败应带 cleanup_failed:true, 得到 %s", body2)
+	}
+	if !strings.Contains(body2, "清理 GPIO 失败") {
+		t.Fatalf("清理失败应含明确清理失败提示, 得到 %s", body2)
+	}
+	if strings.Contains(body2, "未探测到电源接线") {
+		t.Fatalf("清理失败不得与未找到混淆, 得到 %s", body2)
+	}
+}
+
+// 未配置探测扫描中途中断: 扫描会把引脚字段切到候选组合 (如 Pin19/Pin21),
+// 收尾必须还原为探测前 orig——否则残留组合会让 reconfigure 只传一侧引脚时
+// 拼出错误搭档。readMask 强制数据口读回全 1 (NACK) 使所有组合都不命中,
+// 等扫描切走字段后取消, 验证收尾还原字段并释放全部驱动针脚。
+func TestAutoDetectRestoresPinFieldsAfterScanResidue(t *testing.T) {
+	stubPortAvailable(t, true)
+	b := NewBus("Pin19", "Pin20", false)
+	mock := newMockPIO()
+	mock.readMask[0xA01] = 0xFF // Pin19/Pin21 数据口: 读回全 1 => SDA 恒高 => NACK => 不命中
+	mock.readMask[0xA05] = 0xFF // Pin20/Pin22 数据口: 同上
+	b.pio = mock
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _, _ = b.autoDetect(ctx)
+	}()
+	// 等扫描把引脚字段切离 orig (第 2 个候选组合 switchPin 成功后)
+	moved := false
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); {
+		if s, d := b.pinNames(); s != "Pin19" || d != "Pin20" {
+			moved = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !moved {
+		t.Fatal("扫描未在 3s 内切换引脚字段 (mock 行为与预期不符)")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("取消后 autoDetect 未及时返回")
+	}
+	// 收尾: 字段还原 orig, 驱动针脚全部释放, 未配置状态不变
+	if s, d := b.pinNames(); s != "Pin19" || d != "Pin20" {
+		t.Fatalf("收尾应还原引脚字段为 orig Pin19/Pin20, 得到 %s/%s", s, d)
+	}
+	if pins := b.drivenPins(); len(pins) != 0 {
+		t.Fatalf("收尾应释放全部驱动针脚, 仍残留 %v", pins)
+	}
+	if b.isConfigured() {
+		t.Fatal("探测收尾不得改变 configured 状态")
 	}
 }
 

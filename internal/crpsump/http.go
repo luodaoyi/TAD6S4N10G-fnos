@@ -169,8 +169,8 @@ type AppServer struct {
 	WebRoot    string
 	ConfigPath string
 	// DetectFn 可注入的自动探测函数 (单测失败路径用, 绕过真实 bitbang 扫描);
-	// nil 时使用 Bus.autoDetect
-	DetectFn func(ctx context.Context) (string, string)
+	// nil 时使用 Bus.autoDetect。第三个返回值是探测收尾清理错误 (针脚释放失败)。
+	DetectFn func(ctx context.Context) (string, string, error)
 }
 
 var mimeTypes = map[string]string{
@@ -440,8 +440,18 @@ func (s *AppServer) doPost(w http.ResponseWriter, r *http.Request, p string) {
 		if s.DetectFn != nil {
 			detect = s.DetectFn // 单测注入, 绕过真实 bitbang 扫描
 		}
-		scl, sda := detect(ctx)
+		scl, sda, cleanupErr := detect(ctx)
 		if scl == "" {
+			if cleanupErr != nil {
+				// 未找到接线且收尾清理失败: 针脚可能仍为输出, 必须与
+				// "未找到且已清理完成" 区分开, 让调用方知道需要重试
+				Logf("探测未命中且清理失败: %v", cleanupErr)
+				s.send(w, 200, map[string]any{
+					"ok": false, "found": false, "cleanup_failed": true,
+					"msg": "探测未命中, 且清理 GPIO 失败: " + cleanupErr.Error() + ", 请重试",
+				}, "application/json")
+				return
+			}
 			s.send(w, 200, map[string]any{
 				"ok": false, "found": false,
 				"msg": "未探测到电源接线, 请检查线缆后重试",
