@@ -163,6 +163,7 @@ test('「自动识别保存」显式点击才发一次 detect POST；失败文�
 
 
 test('断线后 GPIO 提示跟随轮询状态: 可读→红字→恢复绿字', async () => {
+  // 后端契约: STATUS_WORD 读回 nil 时 ok=null (通信断), 读回非零值时 ok=false 但 status_raw 有值 (电源故障)
   let statusSeq = 0;
   const { fetch } = recordingFetch((href) => {
     if (href.includes('api/crps/config')) {
@@ -173,7 +174,7 @@ test('断线后 GPIO 提示跟随轮询状态: 可读→红字→恢复绿字', 
       return statusSeq === 1
         ? { ok: true, ts: 1700000000, bus: 'gpio', addr: '0x5b', fan: 2600, fan_mode: 'auto' }
         : statusSeq === 2
-          ? { ok: false, status_raw: '0x????', ts: 1700000000, bus: 'gpio', addr: '0x5b' }
+          ? { ok: null, ts: 1700000000, bus: 'gpio', addr: '0x5b' } // 真正断线: STATUS_WORD 读回 nil
           : { ok: true, ts: 1700000000, bus: 'gpio', addr: '0x5b', fan: 2600, fan_mode: 'auto' };
     }
     return {};
@@ -182,7 +183,7 @@ test('断线后 GPIO 提示跟随轮询状态: 可读→红字→恢复绿字', 
   await tick();
   assert.match(app.element('gpio-msg').textContent, /当前接线可读/, '初始已配置可读 → 绿字');
 
-  // 断线: 轮询拿到 ok=false → GPIO 提示同步红字 (此前旧快照一直停留绿字)
+  // 断线: 轮询拿到 ok=null → GPIO 提示同步红字
   for (const fn of [...app.timers]) fn();
   await tick();
   assert.match(app.element('gpio-msg').textContent, /未检测到电源/, '断线后应显示红字引导');
@@ -192,6 +193,28 @@ test('断线后 GPIO 提示跟随轮询状态: 可读→红字→恢复绿字', 
   for (const fn of [...app.timers]) fn();
   await tick();
   assert.match(app.element('gpio-msg').textContent, /当前接线可读/, '恢复后应回到绿字');
+});
+
+test('电源故障 (ok=false+status_raw) 不得误报为断线, 应区分通信可读但状态字异常', async () => {
+  const { fetch } = recordingFetch((href) => {
+    if (href.includes('api/crps/config')) {
+      return { pins: ['Pin19', 'Pin20', 'Pin21', 'Pin22'], scl_pin: 'Pin19', sda_pin: 'Pin21', configured: true, readable: true };
+    }
+    if (href.includes('api/crps/status')) {
+      // STATUS_WORD 读回 0x0008 (风扇告警位), 通信链路正常但电源报告故障
+      return { ok: false, status_raw: '0008', ts: 1700000000, bus: 'gpio', addr: '0x5b', fan: 4200, fan_mode: 'auto' };
+    }
+    return {};
+  });
+  const app = loadCrpsContext({ fetch });
+  await tick();
+
+  // 轮询刷新后: 通信可读 → 不应显示 "未检测到电源"
+  for (const fn of [...app.timers]) fn();
+  await tick();
+  const msg = app.element('gpio-msg').textContent;
+  assert.doesNotMatch(msg, /未检测到电源/, 'ok=false+status_raw 不得误报为断线');
+  assert.match(msg, /状态字异常.*0008/, '应提示状态字异常并附原始值');
 });
 
 test('写盘失败告警优先: 轮询状态刷新不得覆盖告警文字', async () => {

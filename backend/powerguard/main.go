@@ -466,6 +466,8 @@ func initCrps(logger *log.Logger, cfgPath string) (http.Handler, func()) {
 	// (configured=true 时 NewBus 即写 GPIO 方向)。
 	crpsump.AdminCheck = powerguard.IsAdminRequest
 	crpsump.PortIOLocker = powerguard.PortIOLocker()
+	// 日志放到 crps.json 同目录 (宿主状态目录), 不使用全局可写的 /tmp
+	crpsump.LogPath = filepath.Join(filepath.Dir(cfgPath), "crps.log")
 	bus := crpsump.NewBus(sclPin, sdaPin, configured)
 	energy := crpsump.StartEnergy(bus, filepath.Join(filepath.Dir(cfgPath), "energy.json"))
 	crpsump.StartStatusRefresher(bus) // 状态快照后台刷新: CRPS 页面首开即有数据

@@ -926,24 +926,29 @@ function activateTab(tabID, focus = false) {
         const mobileMQ = window.matchMedia('(max-width: 640px)');
         const fit = () => {
           try {
+            if (!frame.offsetParent) return; // 面板隐藏: 不按 0 高度改写
             // 手机端: iframe 固定为可视高度, 内部自滚动。
-            // 若撑成内容全高, 移动 WebView 会把 iframe 区域内的滑动手势
-            // 消费在无滚可滚的内部文档上, 整页无法滑动。
             if (mobileMQ.matches) {
               const top = Math.max(0, frame.getBoundingClientRect().top);
               frame.style.height = Math.max(320, Math.round(window.innerHeight - top - 4)) + 'px';
               return;
             }
             const doc = frame.contentDocument;
-            if (doc && doc.documentElement) {
-              frame.style.height = doc.documentElement.scrollHeight + 'px';
+            if (doc && doc.body) {
+              // body 实际布局高度 (不受 iframe 初始视口下限影响), 内容收缩时可回缩
+              const h = Math.ceil(doc.body.getBoundingClientRect().height);
+              if (h > 0) frame.style.height = Math.max(320, h) + 'px';
             }
           } catch (e) { /* 同源保护, 不可读时保持 CSS 高度 */ }
         };
+        frame._crpsFit = fit;
         fit();
         if (frame._crpsFitTimer) clearInterval(frame._crpsFitTimer);
         frame._crpsFitTimer = setInterval(fit, 3000); // 内容随数据刷新高度会变, 周期校准
       });
+    } else if (frame && frame._crpsFit) {
+      // 已加载过: 切回时立即校准一次 (隐藏期间定时器一直在空转)
+      requestAnimationFrame(frame._crpsFit);
     }
   }
   // 只遍历主导航标签：曲线编辑器等页内 [role=tab] 自成 tablist，

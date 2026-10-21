@@ -187,8 +187,15 @@
     // 恢复后回到绿字——否则 loadGpioConfig 的旧快照会在断线后一直显示"当前接线可读"。
     // 未配置态由 loadGpioConfig 引导, 不在此覆盖; 写盘失败告警 (gpioSaveWarn) 优先保留。
     if (!gpioSaveWarn && data.error !== "gpio-not-configured") {
-      gpioMsgShow(data.ok === true,
-        data.ok === true ? "当前接线可读（已读到电源数据）" : "未检测到电源：请检查 PSCL/PSDA 接线，或点「自动识别保存」重新识别");
+      if (data.ok === true) {
+        gpioMsgShow(true, "当前接线可读（已读到电源数据）");
+      } else if (data.ok === false && data.status_raw) {
+        // 接线可读但电源报告状态字告警（如风扇/温度位非零）, 通信并未断开
+        gpioMsgShow(false, "接线可读，但电源状态字异常 (0x" + data.status_raw + ")");
+      } else {
+        // ok===null / undefined: readAll 未读到 STATUS_WORD, 通信链路中断
+        gpioMsgShow(false, "未检测到电源：请检查 PSCL/PSDA 接线，或点「自动识别保存」重新识别");
+      }
     }
     lastOk = data;
   }

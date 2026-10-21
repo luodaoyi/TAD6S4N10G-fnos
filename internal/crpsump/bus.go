@@ -410,9 +410,19 @@ func (b *Bus) reconfigure(scl, sda *string) (bool, string) {
 // 支持 ctx 取消; 中途取消会恢复探测前引脚。
 func (b *Bus) autoDetect(ctx context.Context) (string, string) {
 	origScl, origSda := b.pinNames()
+	// restore 收尾: 恢复探测前引脚, 并释放扫描过程中驱动过的其它针脚
+	// (未配置机器 orig=Pin19/Pin20, 扫描会把 Pin21/Pin22 也设为输出,
+	// 仅 switchPin 不能把它们释放回输入, 下次探测或实际使用会撞针脚方向)
 	restore := func() {
+		for _, name := range b.drivenPins() {
+			if name == origScl || name == origSda {
+				continue
+			}
+			cfg := GPPins[name]
+			_ = b.setPinDir(name, cfg, false) // 释放失败不致命, 下次重试
+		}
 		b.switchPin(origScl, origSda)
-		b.busReset() // 探测结束复位, 让电源回到正常态
+		b.busReset()
 	}
 	for _, scl := range UIPins {
 		for _, sda := range UIPins {

@@ -19,7 +19,7 @@ func ensureLogFile() *os.File {
 		return logFile
 	}
 	// openNoFollow (Linux): 拒绝把日志写入符号链接目标(防多用户环境下被劫持)
-	f, err := os.OpenFile(LogPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY|openNoFollow, 0644)
+	f, err := os.OpenFile(LogPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY|openNoFollow, 0600)
 	if err != nil {
 		return nil
 	}
