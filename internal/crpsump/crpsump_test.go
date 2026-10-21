@@ -40,13 +40,15 @@ type mockPIO struct {
 	failOutbOnPort int            // 非负时仅该端口 outb 失败 (测试局部写失败, 如 sioWrite 数据口)
 	failInb        bool           // true 时 inb 恒失败 (测试端口读错误向上传播)
 	failWhen       map[int64]bool // 定点故障注入: key=port<<8|v, 命中一次 outb(port,v) 失败后自动清除
+	failOnNth      map[int64]int  // 第 N 次 outb(port,v) 才失败 (同值写多次时精确打击第 N 次)
+	matchCount     map[int64]int  // failOnNth 的已匹配计数
 	sioExits       int            // 记录 sioExit (outb 0x2E=0xAA) 执行次数
 	writes         int
 }
 
 func newMockPIO() *mockPIO {
 	return &mockPIO{mem: map[int]byte{}, readMask: map[int]byte{}, failOutbOnPort: -1,
-		failWhen: map[int64]bool{}}
+		failWhen: map[int64]bool{}, failOnNth: map[int64]int{}, matchCount: map[int64]int{}}
 }
 
 // injectOutbFail 定点注入: 仅下一次 outb(port, v) 失败 (测试"仅方向寄存器索引
@@ -55,6 +57,21 @@ func (m *mockPIO) injectOutbFail(port int, v byte) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.failWhen[int64(port)<<8|int64(v)] = true
+}
+
+// injectOutbFailOnNth 第 N 次 outb(port, v) 才注入失败 (如"复位末尾 SDA 释放"
+// 与 initDirs 写同一值, 需跳过前几次命中精确打击最后一次)
+func (m *mockPIO) injectOutbFailOnNth(port int, v byte, n int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.failOnNth[int64(port)<<8|int64(v)] = n
+}
+
+// resetOutbCounts 清零 failOnNth 匹配计数 (测试准备阶段的写入不计入 N)
+func (m *mockPIO) resetOutbCounts() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.matchCount = map[int64]int{}
 }
 
 func (m *mockPIO) inb(port int) (byte, error) {
@@ -79,6 +96,12 @@ func (m *mockPIO) outb(port int, v byte) error {
 	if m.failWhen[key] {
 		delete(m.failWhen, key) // 一次性: 命中后自动恢复, 后续同参数写入正常
 		return errors.New("mock: 定点写失败")
+	}
+	if n, ok := m.failOnNth[key]; ok {
+		m.matchCount[key]++
+		if m.matchCount[key] == n { // 第 N 次同参数写入才失败 (前 N-1 次放行)
+			return errors.New("mock: 定点写失败")
+		}
 	}
 	if port == 0x2E && v == 0xAA {
 		m.sioExits++
@@ -625,7 +648,9 @@ func TestAutoDetectRestoreConfiguredRestoresOriginalPins(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	b.autoDetect(ctx)
+	if _, _, err := b.autoDetect(ctx); err != nil {
+		t.Fatalf("已配置收尾应成功 (switchPin+busReset 均无故障), 得到 %v", err)
+	}
 
 	if scl, sda := b.pinNames(); scl != "Pin19" || sda != "Pin20" {
 		t.Fatalf("已配置收尾应恢复原引脚, 得到 %s/%s", scl, sda)
@@ -636,6 +661,106 @@ func TestAutoDetectRestoreConfiguredRestoresOriginalPins(t *testing.T) {
 	}
 	if !b.isConfigured() {
 		t.Fatal("已配置收尾不得清除 configured 状态")
+	}
+}
+
+// 已配置收尾的两条失败路径都必须经 autoDetect 第三返回值上报:
+//  1. switchPin 恢复原引脚失败 (failOutb 全写失败) -> "恢复原引脚失败"
+//  2. switchPin 成功但 busReset 末尾 sdaRelease 端口写失败 -> "总线复位失败",
+//     SDA 滞留输出须保留在 driven 追踪; 故障清除后重试应释放并消除错误。
+// 复位末尾的释放与 initDirs 的 SDA 置输入写同一值 (Pin20: 0xCD 寄存器清 bit0
+// => sioWrite 数据口 0x2F 写 0x06), 用 failOnNth 跳过 initDirs 那次精确打击复位末尾。
+func TestAutoDetectRestoreConfiguredFailurePropagates(t *testing.T) {
+	stubPortAvailable(t, true)
+
+	// 路径 1: switchPin 失败
+	b1 := NewBus("Pin19", "Pin20", false)
+	m1 := newMockPIO()
+	b1.pio = m1
+	if ok, msg := b1.reconfigure(nil, nil); !ok {
+		t.Fatalf("reconfigure 应成功: %s", msg)
+	}
+	m1.failOutb = true
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, _, err := b1.autoDetect(ctx); err == nil || !strings.Contains(err.Error(), "恢复原引脚失败") {
+		t.Fatalf("switchPin 失败应报 '恢复原引脚失败', 得到 %v", err)
+	}
+
+	// 路径 2: busReset 末尾 sdaRelease 失败
+	b := NewBus("Pin19", "Pin20", false)
+	mock := newMockPIO()
+	b.pio = mock
+	if ok, msg := b.reconfigure(nil, nil); !ok {
+		t.Fatalf("reconfigure 应成功: %s", msg)
+	}
+	mock.resetOutbCounts()                  // reconfigure 准备阶段的写入不计入
+	mock.injectOutbFailOnNth(0x2F, 0x06, 2) // 第 1 次=initDirs 置 SDA 输入(放行), 第 2 次=复位末尾释放(失败)
+	if _, _, err := b.autoDetect(ctx); err == nil || !strings.Contains(err.Error(), "总线复位失败") {
+		t.Fatalf("busReset 失败应报 '总线复位失败', 得到 %v", err)
+	}
+	pins := b.drivenPins()
+	stuck := false
+	for _, p := range pins {
+		if p == "Pin20" {
+			stuck = true
+		}
+	}
+	if !stuck {
+		t.Fatalf("SDA 释放失败应保留 Pin20 在 driven 追踪 (滞留输出), 实际 %v", pins)
+	}
+	// 故障已一次性消耗: 重试应完成收尾, 释放 SDA 并消除错误
+	if _, _, err := b.autoDetect(ctx); err != nil {
+		t.Fatalf("故障清除后重试收尾应成功, 得到 %v", err)
+	}
+	pins = b.drivenPins()
+	if len(pins) != 1 || pins[0] != "Pin19" {
+		t.Fatalf("重试后应仅剩原 SCL (Pin19) 保持驱动, 实际 %v", pins)
+	}
+	if !b.isConfigured() {
+		t.Fatal("已配置收尾不得清除 configured 状态")
+	}
+}
+
+// detect 接口走真实 autoDetect (不注入 DetectFn): 已配置总线复位末尾 SDA 释放
+// 失败时, 响应必须带 cleanup_failed:true 且不回内部针脚细节; 故障消耗后重试
+// 恢复为普通未命中提示。用已取消的请求 ctx 让探测第一轮即走收尾。
+func TestDetectCleanupFailureFromBusReset(t *testing.T) {
+	stubAdmin(t, true)
+	stubPortAvailable(t, true)
+	b := NewBus("Pin19", "Pin20", false)
+	mock := newMockPIO()
+	b.pio = mock
+	if ok, msg := b.reconfigure(nil, nil); !ok {
+		t.Fatalf("reconfigure 应成功: %s", msg)
+	}
+	mock.resetOutbCounts()
+	mock.injectOutbFailOnNth(0x2F, 0x06, 2)
+	srv := &AppServer{Bus: b}
+
+	post := func() string {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		req := httptest.NewRequest(http.MethodPost, "/api/crps/detect", nil).WithContext(ctx)
+		rec := httptest.NewRecorder()
+		srv.APIHandler().ServeHTTP(rec, req)
+		return rec.Body.String()
+	}
+
+	body := post()
+	if !strings.Contains(body, `"cleanup_failed":true`) {
+		t.Fatalf("复位清理失败应带 cleanup_failed:true, 得到 %s", body)
+	}
+	if strings.Contains(body, "Pin20") || strings.Contains(body, "0x06") {
+		t.Fatalf("响应不得泄露内部针脚/寄存器细节, 得到 %s", body)
+	}
+
+	body = post() // 一次性故障已消耗: 重试清理成功, 回到普通未命中
+	if !strings.Contains(body, "未探测到电源接线") || strings.Contains(body, "cleanup_failed") {
+		t.Fatalf("重试清理成功应回普通未命中提示, 得到 %s", body)
+	}
+	if pins := b.drivenPins(); len(pins) != 1 || pins[0] != "Pin19" {
+		t.Fatalf("重试后应仅剩原 SCL 保持驱动, 实际 %v", pins)
 	}
 }
 
@@ -710,6 +835,9 @@ func TestDetectCleanupFailureDistinctFromCleanMiss(t *testing.T) {
 	}
 	if !strings.Contains(body2, "清理 GPIO 失败") {
 		t.Fatalf("清理失败应含明确清理失败提示, 得到 %s", body2)
+	}
+	if strings.Contains(body2, "Pin21") {
+		t.Fatalf("响应不得泄露内部针脚细节 (只记服务端日志), 得到 %s", body2)
 	}
 	if strings.Contains(body2, "未探测到电源接线") {
 		t.Fatalf("清理失败不得与未找到混淆, 得到 %s", body2)

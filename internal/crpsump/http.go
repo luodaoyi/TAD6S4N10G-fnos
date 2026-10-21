@@ -444,11 +444,12 @@ func (s *AppServer) doPost(w http.ResponseWriter, r *http.Request, p string) {
 		if scl == "" {
 			if cleanupErr != nil {
 				// 未找到接线且收尾清理失败: 针脚可能仍为输出, 必须与
-				// "未找到且已清理完成" 区分开, 让调用方知道需要重试
+				// "未找到且已清理完成" 区分开。错误细节只记服务端日志,
+				// 不下发给调用方 (内部针脚/寄存器信息无须暴露)。
 				Logf("探测未命中且清理失败: %v", cleanupErr)
 				s.send(w, 200, map[string]any{
 					"ok": false, "found": false, "cleanup_failed": true,
-					"msg": "探测未命中, 且清理 GPIO 失败: " + cleanupErr.Error() + ", 请重试",
+					"msg": "探测未命中, 且清理 GPIO 失败, 请重试",
 				}, "application/json")
 				return
 			}

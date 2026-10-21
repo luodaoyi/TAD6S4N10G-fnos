@@ -441,7 +441,10 @@ func (b *Bus) autoDetect(ctx context.Context) (string, string, error) {
 		if ok, msg := b.switchPin(origScl, origSda); !ok {
 			return fmt.Errorf("恢复原引脚失败: %s", msg)
 		}
-		b.busReset()
+		if err := b.busReset(); err != nil {
+			// 复位末尾 sdaRelease 的端口写失败会让 SDA 滞留输出, 必须如实上报
+			return fmt.Errorf("总线复位失败: %w", err)
+		}
 		return nil
 	}
 	for _, scl := range UIPins {
