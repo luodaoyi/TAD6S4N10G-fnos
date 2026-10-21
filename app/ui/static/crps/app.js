@@ -183,6 +183,13 @@
         '<br><span class="k">型号</span> ' + esc(data.mfr_model || "--");
     }
     $("ts").textContent = "更新于 " + (new Date(data.ts * 1000).toLocaleTimeString());
+    // GPIO 提示跟随最新连接状态: 已配置但读不到电源数据(断电/拔线/总线异常)时同步红字,
+    // 恢复后回到绿字——否则 loadGpioConfig 的旧快照会在断线后一直显示"当前接线可读"。
+    // 未配置态由 loadGpioConfig 引导, 不在此覆盖; 写盘失败告警 (gpioSaveWarn) 优先保留。
+    if (!gpioSaveWarn && data.error !== "gpio-not-configured") {
+      gpioMsgShow(data.ok === true,
+        data.ok === true ? "当前接线可读（已读到电源数据）" : "未检测到电源：请检查 PSCL/PSDA 接线，或点「自动识别保存」重新识别");
+    }
     lastOk = data;
   }
 
@@ -289,6 +296,14 @@
     sendFan(body, doneMsg);
   }
 
+  // manualPct 取手动占空比: 滑条 min=11 (光宝固件 10% 是回自动触发值, 见 Bus.setFan);
+  // 防御旧缓存 HTML (min=10) 组合下仍给出 10, 导致后端按 auto 处理、UI 跳回自动
+  function manualPct() {
+    var pct = Math.max(11, parseInt(slider.value, 10) || 0);
+    if (String(pct) !== slider.value) { slider.value = String(pct); pctLabel.textContent = pct + "%"; }
+    return pct;
+  }
+
   modeAuto.addEventListener("click", function () {
     modeGuardUntil = Date.now() + 5000;
     // 实测光宝固件: FAN_COMMAND_1=10% 会触发恢复自动温控(约2700转低速档), 可软切回, 无需断电。
@@ -300,7 +315,7 @@
   });
   modeManual.addEventListener("click", function () {
     modeGuardUntil = Date.now() + 5000;
-    requestFan({ mode: "manual", pct: parseInt(slider.value, 10) }, function (d) {
+    requestFan({ mode: "manual", pct: manualPct() }, function (d) {
       return "已切换：手动 " + d.pct + "%";
     });
   });
@@ -310,7 +325,7 @@
   });
 
   slider.addEventListener("change", function () {
-    var pct = parseInt(slider.value, 10);
+    var pct = manualPct();
     if (lastSent === pct) return;
     lastSent = pct;
     requestFan({ mode: "manual", pct: pct }, function (d) {
@@ -324,6 +339,7 @@
   var gpioSave = $("gpio-save");
   var gpioMsg = $("gpio-msg");
   var gpioPins = [];
+  var gpioSaveWarn = false; // 写盘失败告警存活标志: 置位期间 render 的轮询状态刷新不得覆盖告警
 
   // gpioMsgShow 显示 GPIO 配置区的提示消息 (ok/err 样式)
   function gpioMsgShow(ok, text) {
@@ -335,6 +351,7 @@
   // loadGpioConfig 拉取 GPIO 配置并重建针脚下拉 (preserveWarn 为需保留的写盘失败告警)
   function loadGpioConfig(preserveWarn) {
     if (!sclSel || !sdaSel) return;
+    gpioSaveWarn = !!preserveWarn; // 告警经此函数刷新后继续存活, 轮询状态不覆盖
     fetch("../api/crps/config")
       .then(function (r) { return r.json(); })
       .then(function (d) {
