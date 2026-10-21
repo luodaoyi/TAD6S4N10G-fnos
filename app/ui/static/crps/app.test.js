@@ -160,3 +160,88 @@ test('「自动识别保存」显式点击才发一次 detect POST；失败文�
   assert.match(msgText, /检测信号失败/);
   assert.match(msgText, /未探测到电源接线/, '后端 msg 应附加在固定文案后');
 });
+
+
+test('断线后 GPIO 提示跟随轮询状态: 可读→红字→恢复绿字', async () => {
+  let statusSeq = 0;
+  const { fetch } = recordingFetch((href) => {
+    if (href.includes('api/crps/config')) {
+      return { pins: ['Pin19', 'Pin20', 'Pin21', 'Pin22'], scl_pin: 'Pin19', sda_pin: 'Pin21', configured: true, readable: true };
+    }
+    if (href.includes('api/crps/status')) {
+      statusSeq++;
+      return statusSeq === 1
+        ? { ok: true, ts: 1700000000, bus: 'gpio', addr: '0x5b', fan: 2600, fan_mode: 'auto' }
+        : statusSeq === 2
+          ? { ok: false, status_raw: '0x????', ts: 1700000000, bus: 'gpio', addr: '0x5b' }
+          : { ok: true, ts: 1700000000, bus: 'gpio', addr: '0x5b', fan: 2600, fan_mode: 'auto' };
+    }
+    return {};
+  });
+  const app = loadCrpsContext({ fetch });
+  await tick();
+  assert.match(app.element('gpio-msg').textContent, /当前接线可读/, '初始已配置可读 → 绿字');
+
+  // 断线: 轮询拿到 ok=false → GPIO 提示同步红字 (此前旧快照一直停留绿字)
+  for (const fn of [...app.timers]) fn();
+  await tick();
+  assert.match(app.element('gpio-msg').textContent, /未检测到电源/, '断线后应显示红字引导');
+  assert.ok(app.element('gpio-msg').className.includes('err'), '断线提示应为 err 样式');
+
+  // 恢复: 轮询拿到 ok=true → 回到绿字
+  for (const fn of [...app.timers]) fn();
+  await tick();
+  assert.match(app.element('gpio-msg').textContent, /当前接线可读/, '恢复后应回到绿字');
+});
+
+test('写盘失败告警优先: 轮询状态刷新不得覆盖告警文字', async () => {
+  const { fetch } = recordingFetch((href, init = {}) => {
+    if (href.includes('api/crps/config')) {
+      if (init.method === 'POST') return { ok: true, scl_pin: 'Pin19', sda_pin: 'Pin21', msg: '写盘失败：设备只读' };
+      return { pins: ['Pin19', 'Pin20', 'Pin21', 'Pin22'], scl_pin: 'Pin19', sda_pin: 'Pin21', configured: true, readable: true };
+    }
+    if (href.includes('api/crps/status')) return { ok: true, ts: 1700000000, bus: 'gpio', addr: '0x5b', fan: 2600, fan_mode: 'auto' };
+    return {};
+  });
+  const app = loadCrpsContext({ fetch });
+  await tick();
+  app.element('scl-pin').value = 'Pin19';
+  app.element('sda-pin').value = 'Pin21';
+  app.click('gpio-save');
+  await tick();
+  assert.match(app.element('gpio-msg').textContent, /写盘失败/, '保存返回写盘告警应显示');
+
+  // 告警存活: 后续轮询即使 ok=true 也不覆盖告警
+  for (const fn of [...app.timers]) fn();
+  await tick();
+  assert.match(app.element('gpio-msg').textContent, /写盘失败/, '轮询状态刷新不得覆盖写盘告警');
+});
+
+test('手动模式钳制 pct≥11: 滑条 10 (固件回自动触发值) 不再原样发送', async () => {
+  const { requests, fetch } = recordingFetch((href, init = {}) => {
+    if (href.includes('api/crps/fan') && init.method === 'POST') return { ok: true, mode: 'manual', pct: JSON.parse(init.body).pct };
+    if (href.includes('api/crps/config')) return { pins: ['Pin19', 'Pin20', 'Pin21', 'Pin22'], scl_pin: 'Pin19', sda_pin: 'Pin21', configured: true, readable: true };
+    if (href.includes('api/crps/status')) return { ok: true, ts: 1700000000, bus: 'gpio', addr: '0x5b', fan: 2600, fan_mode: 'manual' };
+    return {};
+  });
+  const app = loadCrpsContext({ fetch });
+  await tick();
+
+  // 旧缓存 HTML 组合: 滑条仍是 min=10 的值 10 —— 点手动不得发送 10 (否则后端按 auto 处理、UI 跳回自动)
+  app.element('fan-slider').value = '10';
+  app.click('mode-manual');
+  await tick();
+  const fanPosts = requests.filter((q) => q.url.includes('api/crps/fan') && q.init.method === 'POST');
+  assert.equal(fanPosts.length, 1, '点击手动应恰好发一次风扇 POST');
+  assert.equal(JSON.parse(fanPosts[0].init.body).pct, 11, 'pct=10 应被钳制为 11');
+  assert.equal(app.element('fan-slider').value, '11', '滑条显示应同步钳制值');
+  assert.equal(app.element('fan-pct').textContent, '11%', '百分比标签应同步钳制值');
+
+  // 滑条 change 走同一钳制
+  app.element('fan-slider').value = '10';
+  app.element('fan-slider').listeners.get('change')();
+  await tick();
+  const fanPosts2 = requests.filter((q) => q.url.includes('api/crps/fan') && q.init.method === 'POST');
+  assert.equal(fanPosts2.length, 2, 'change 应补发一次');
+  assert.equal(JSON.parse(fanPosts2[1].init.body).pct, 11, 'change 的 pct=10 同样钳制为 11');
+});
