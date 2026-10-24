@@ -181,12 +181,20 @@ echo "== 5/6 更新平台记录（manifest / 图标 / 生命周期脚本）=="
 # 再用残缺副本顶上，服务就再也起不来了。
 METABAK_TMP="$APPMETA.bak-meta-$(date +%Y%m%d%H%M%S)"
 mkdir -p "$METABAK_TMP"
-cp -a "$APPMETA/cmd" "$APPMETA/wizard" "$METABAK_TMP/" || true
+if ! cp -a "$APPMETA/cmd" "$APPMETA/wizard" "$METABAK_TMP/"; then
+  rm -rf "$METABAK_TMP"
+  echo "备份 cmd/wizard 失败，已中止升级（回滚程序目录后服务会拉回原版）" >&2
+  exit 1
+fi
 if [ -d "$METABAK_TMP/cmd" ] && [ -f "$METABAK_TMP/cmd/main" ] && [ -d "$METABAK_TMP/wizard" ]; then
   # manifest 与图标同样是回滚要原样盖回去的平台记录：复制失败若被忽略，
   # 回滚就会拿残缺备份替换原件，还照样报「已回滚」。这里就地校验，
   # 缺任何一个都中止（此刻还没动过 $APPMETA 里的任何文件）。
-  cp -a "$APPMETA/manifest" "$APPMETA/ICON.PNG" "$APPMETA/ICON_256.PNG" "$METABAK_TMP/" 2>/dev/null || true
+  if ! cp -a "$APPMETA/manifest" "$APPMETA/ICON.PNG" "$APPMETA/ICON_256.PNG" "$METABAK_TMP/"; then
+    rm -rf "$METABAK_TMP"
+    echo "备份平台记录（manifest / 图标）失败，已中止升级（程序目录未替换，服务将原样拉回）" >&2
+    exit 1
+  fi
   if [ ! -f "$METABAK_TMP/manifest" ] || [ ! -f "$METABAK_TMP/ICON.PNG" ] || [ ! -f "$METABAK_TMP/ICON_256.PNG" ]; then
     rm -rf "$METABAK_TMP"
     echo "备份平台记录（manifest / 图标）失败，已中止升级（程序目录未替换，服务将原样拉回）" >&2
@@ -218,3 +226,4 @@ echo "如需手动回滚： sudo sh -c 'rm -rf $APPCENTER && mv $BAK $APPCENTER 
 echo
 echo "完成。请回飞牛桌面刷新模块页面（Windows 上 Ctrl+F5；手机 App 里退出该页面重进），"
 echo "然后核对按钮控制页的按键映射、备份任务、自动备份规则是否都还在。"
+
