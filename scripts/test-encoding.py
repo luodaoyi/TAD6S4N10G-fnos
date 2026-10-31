@@ -63,6 +63,32 @@ class EncodingCheck(unittest.TestCase):
         with self.assertRaises(ValueError):
             encoding.validate_range('--all')
 
+    def test_wasm_magic_does_not_exempt_text_by_extension(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            def git(*args):
+                return subprocess.check_output(['git', '-C', tmp, *args], stderr=subprocess.DEVNULL)
+            git('init', '-q')
+            # Complete v1 preamble is itself a valid empty WebAssembly module.
+            header = bytes([0, 97, 115, 109, 1, 0, 0, 0])
+            (root / 'module.wasm').write_bytes(header)
+            (root / 'module-no-extension').write_bytes(header)
+            (root / 'text.wasm').write_text('正常文本', encoding='utf-8')
+            git('add', '.')
+            git('-c', 'user.name=Encoding Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'test: wasm fixture')
+            errors, checked, _ = encoding.check(root)
+            self.assertEqual(errors, [])
+            self.assertEqual(checked, 1, 'text with a wasm suffix must still be inspected')
+            (root / 'text.wasm').write_text(chr(0xfffd), encoding='utf-8')
+            self.assertTrue(any('text.wasm' in issue and 'replacement' in issue for issue in encoding.check(root)[0]))
+            (root / 'text.wasm').write_bytes(bytes([0xff]))
+            self.assertTrue(any('text.wasm' in issue and 'invalid UTF-8' in issue for issue in encoding.check(root)[0]))
+            (root / 'text.wasm').write_text('正常文本', encoding='utf-8')
+            # A truncated magic / unknown version is not a recognized binary.
+            for data in [header[:4], header[:7], bytes([0, 97, 115, 109, 2, 0, 0, 0])]:
+                (root / 'module.wasm').write_bytes(data)
+                self.assertTrue(any('module.wasm' in issue for issue in encoding.check(root)[0]))
+
     def test_tracked_bytes_names_binary_and_symlink(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

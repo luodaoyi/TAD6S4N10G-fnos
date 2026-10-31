@@ -125,7 +125,7 @@ def check(root, commit_range=None):
         try:
             # Read a symlink's tracked target, never follow it into unrelated files.
             data = os.fsencode(os.readlink(path)) if path.is_symlink() else path.read_bytes()
-            if not path.is_symlink() and data.startswith((b'\x7fELF', b'\x89PNG\r\n\x1a\n', b'\xff\xd8\xff')):
+            if not path.is_symlink() and data.startswith((b'\x7fELF', b'\x89PNG\r\n\x1a\n', b'\xff\xd8\xff', b'\x00asm\x01\x00\x00\x00')):
                 continue
             text = data.decode('utf-8-sig')
         except UnicodeDecodeError as exc:
