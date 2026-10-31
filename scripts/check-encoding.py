@@ -84,7 +84,12 @@ def text_issues(text, allow_fixtures=False):
 
 
 def git(root, *args):
-    return subprocess.check_output(['git', '-C', str(root), *args])
+    """Honor root even when invoked from a hook in another repository."""
+    env = os.environ.copy()
+    local_vars = subprocess.check_output(['git', 'rev-parse', '--local-env-vars'])
+    for name in local_vars.decode('ascii').splitlines():
+        env.pop(name, None)
+    return subprocess.check_output(['git', '-C', str(root), *args], env=env)
 
 
 def validate_range(value):

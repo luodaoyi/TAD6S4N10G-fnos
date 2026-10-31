@@ -3,9 +3,9 @@
 import importlib.util
 import os
 from pathlib import Path
-import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location('encoding_check', Path(__file__).with_name('check-encoding.py'))
 encoding = importlib.util.module_from_spec(spec)
@@ -13,6 +13,33 @@ spec.loader.exec_module(encoding)
 
 
 class EncodingCheck(unittest.TestCase):
+    def test_git_commands_ignore_inherited_repository_environment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            caller, target = Path(tmp) / 'caller', Path(tmp) / 'target'
+            caller.mkdir()
+            target.mkdir()
+            encoding.git(caller, 'init', '-q')
+            (caller / 'caller.txt').write_text('caller', encoding='utf-8')
+            encoding.git(caller, 'add', '.')
+            encoding.git(caller, '-c', 'user.name=Encoding Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'test: caller')
+            before_head = encoding.git(caller, 'rev-parse', 'HEAD')
+            before_index = (caller / '.git/index').read_bytes()
+            inherited = {'GIT_DIR': str(caller / '.git'),
+                         'GIT_WORK_TREE': str(caller),
+                         'GIT_INDEX_FILE': str(caller / '.git/index'),
+                         'GIT_OBJECT_DIRECTORY': str(caller / '.git/objects'),
+                         'GIT_COMMON_DIR': str(caller / '.git')}
+            with patch.dict(os.environ, inherited):
+                encoding.git(target, 'init', '-q')
+                self.assertTrue((target / '.git').is_dir())
+                (target / 'target.txt').write_text('正常中文', encoding='utf-8')
+                encoding.git(target, 'add', '.')
+                encoding.git(target, '-c', 'user.name=Encoding Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'test: target')
+                self.assertEqual(encoding.git(target, 'ls-files'), b'target.txt\n')
+                self.assertEqual(encoding.check(target)[0], [])
+            self.assertEqual(encoding.git(caller, 'rev-parse', 'HEAD'), before_head)
+            self.assertEqual((caller / '.git/index').read_bytes(), before_index)
+
     def test_normal_unicode_and_legitimate_placeholders(self):
         text = '中文文件名、温度 45°C、€100、São Paulo、😀、' + chr(0xe001) + '\nconst value = x ?? 0; const status = "????";'
         self.assertEqual(encoding.text_issues(text), [])
@@ -68,7 +95,7 @@ class EncodingCheck(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             def git(*args):
-                return subprocess.check_output(['git', '-C', tmp, *args], stderr=subprocess.DEVNULL)
+                return encoding.git(root, *args)
             git('init', '-q')
             # Complete v1 preamble is itself a valid empty WebAssembly module.
             header = bytes([0, 97, 115, 109, 1, 0, 0, 0])
@@ -94,7 +121,7 @@ class EncodingCheck(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             def git(*args):
-                return subprocess.check_output(['git', '-C', tmp, *args], stderr=subprocess.DEVNULL)
+                return encoding.git(root, *args)
             git('init', '-q')
             os.symlink(b'bad-' + bytes([0xff]), os.fsencode(root / 'link.png'))
             damaged_directory = 'directory-' + chr(0xfffd)
@@ -115,7 +142,7 @@ class EncodingCheck(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             def git(*args):
-                return subprocess.check_output(['git', '-C', tmp, *args], stderr=subprocess.DEVNULL)
+                return encoding.git(root, *args)
             git('init', '-q')
             good = root / '正常.md'
             good.write_text('正常中文\n', encoding='utf-8')
