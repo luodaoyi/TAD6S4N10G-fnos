@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Check tracked text/names and new commit messages without rewriting bytes."""
 import argparse
+import codecs
 import json
 import os
 from pathlib import Path
@@ -31,6 +32,41 @@ def undo_cp936(value):
     return None
 
 
+def find_cp936_fragment(value):
+    """Find a complete recoverable fragment, including inside normal Chinese.
+
+    A normal prefix/suffix can invalidate whole-run decoding. Start only at
+    source-character boundaries and incrementally decode until the first bad
+    byte; keep complete UTF-8 boundaries with at least two recovered CJK chars.
+    """
+    parts = []
+    for char in value:
+        try:
+            parts.append(b'\x80' if char == '\u20ac' else char.encode('gb18030'))
+        except UnicodeError:
+            parts.append(None)
+    for start in range(len(parts)):
+        decoder = codecs.getincrementaldecoder('utf-8')()
+        recovered = ''
+        best = None
+        cjk_count = 0
+        for end in range(start, len(parts)):
+            if parts[end] is None:
+                break
+            try:
+                decoded = decoder.decode(parts[end])
+            except UnicodeError:
+                break
+            recovered += decoded
+            cjk_count += len(re.findall(r'[\u4e00-\u9fff]', decoded))
+            if (not decoder.getstate()[0] and cjk_count >= 2
+                    and len(recovered) < end - start + 1):
+                best = (start, end + 1, recovered)
+        if best:
+            return best
+    return None
+
+
 def text_issues(text, allow_fixtures=False):
     issues = []
     for number, line in enumerate(text.splitlines(), 1):
@@ -42,7 +78,7 @@ def text_issues(text, allow_fixtures=False):
             issues.append((number, 'Unicode replacement character'))
         if LATIN_MOJIBAKE.search(line):
             issues.append((number, 'possible UTF-8/Latin mojibake'))
-        if any(undo_cp936(match.group()) for match in NON_ASCII.finditer(line)):
+        if any(find_cp936_fragment(match.group()) for match in NON_ASCII.finditer(line)):
             issues.append((number, 'reversible UTF-8/CP936 mojibake'))
     return issues
 

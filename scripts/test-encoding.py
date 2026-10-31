@@ -23,6 +23,27 @@ class EncodingCheck(unittest.TestCase):
         self.assertEqual(encoding.undo_cp936(damaged), original)
         self.assertTrue(encoding.text_issues('feat: ' + damaged + ' (#33)'))
 
+    def test_mojibake_surrounded_by_normal_chinese_and_punctuation(self):
+        original = '图形化备份、三曲线风扇模式、移动设备面板与传感器默认名'
+        damaged = original.encode('utf-8').decode('gb18030', errors='replace').replace(chr(0xfffd), chr(0x20ac))
+        for prefix, suffix in [('', ''), ('标题：', ''), ('', '。'),
+                               ('标题：', '。'), ('正常说明（', '）结束'),
+                               ('中文', '中文')]:
+            with self.subTest(prefix=prefix, suffix=suffix):
+                mixed = prefix + damaged + suffix
+                self.assertTrue(encoding.text_issues(mixed))
+                fragment = encoding.find_cp936_fragment(mixed)
+                self.assertIsNotNone(fragment)
+                self.assertEqual(fragment[2], original)
+        short = '文件'.encode('utf-8').decode('gb18030')
+        self.assertTrue(encoding.text_issues('说明：' + short + '。'))
+
+    def test_normal_chinese_surroundings_are_not_damage(self):
+        for text in ['标题：图形化备份、三曲线风扇模式。', '正常说明（文件）结束',
+                     '中文文件中文', '文件名、目录、提交、标签、版本、默认值。',
+                     '编码检查不会修改正常中文或合法标点：。；，（）【】。']:
+            self.assertEqual(encoding.text_issues(text), [])
+
     def test_replacement_and_latin_mojibake(self):
         for value in [chr(0xfffd), 'caf' + chr(0xc3) + chr(0xa9)]:
             self.assertTrue(encoding.text_issues(value))
