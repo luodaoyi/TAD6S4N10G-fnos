@@ -17,6 +17,15 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate UTF-8 encoding
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python3 scripts/test-encoding.py
+          python3 scripts/check-encoding.py
 
       - name: Set up Go
         uses: actions/setup-go@v5
