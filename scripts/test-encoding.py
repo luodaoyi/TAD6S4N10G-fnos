@@ -3,6 +3,8 @@
 import importlib.util
 import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -13,6 +15,34 @@ spec.loader.exec_module(encoding)
 
 
 class EncodingCheck(unittest.TestCase):
+    def test_explicit_alternate_index_includes_its_tracked_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            encoding.git(root, 'init', '-q')
+            (root / 'normal.txt').write_text('正常中文', encoding='utf-8')
+            encoding.git(root, 'add', '.')
+            encoding.git(root, '-c', 'user.name=Encoding Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'test: default index')
+            default_index = (root / '.git/index').read_bytes()
+            alternate = root / '.git/alternate-index'
+            alternate.write_bytes(default_index)
+            (root / 'alternate-only.txt').write_text(chr(0xfffd), encoding='utf-8')
+            env = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
+            env['GIT_INDEX_FILE'] = str(alternate)
+            subprocess.check_output(['git', '-C', tmp, 'add', 'alternate-only.txt'], env=env)
+            self.assertEqual(encoding.check(root)[0], [])
+            errors = encoding.check(root, index_file=Path('.git/alternate-index'))[0]
+            self.assertTrue(any('alternate-only.txt:' in issue and 'replacement' in issue for issue in errors))
+            self.assertEqual((root / '.git/index').read_bytes(), default_index)
+            with self.assertRaises(OSError):
+                encoding.check(root, index_file=Path('.git/missing-index'))
+            env.pop('GITHUB_EVENT_PATH', None)
+            command = [sys.executable, encoding.__file__, '--root', tmp, '--index-file']
+            result = subprocess.run(command + ['.git/alternate-index'], env=env, capture_output=True)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn(b'alternate-only.txt:', result.stderr)
+            result = subprocess.run(command + ['.git/missing-index'], env=env, capture_output=True)
+            self.assertEqual(result.returncode, 2)
+
     def test_git_commands_ignore_inherited_repository_environment(self):
         with tempfile.TemporaryDirectory() as tmp:
             caller, target = Path(tmp) / 'caller', Path(tmp) / 'target'

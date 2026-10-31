@@ -83,12 +83,14 @@ def text_issues(text, allow_fixtures=False):
     return issues
 
 
-def git(root, *args):
+def git(root, *args, index_file=None):
     """Honor root even when invoked from a hook in another repository."""
     env = os.environ.copy()
     local_vars = subprocess.check_output(['git', 'rev-parse', '--local-env-vars'])
     for name in local_vars.decode('ascii').splitlines():
         env.pop(name, None)
+    if index_file is not None:
+        env['GIT_INDEX_FILE'] = str((root / index_file).resolve(strict=True))
     return subprocess.check_output(['git', '-C', str(root), *args], env=env)
 
 
@@ -111,10 +113,10 @@ def event_range(event):
     return None
 
 
-def check(root, commit_range=None):
+def check(root, commit_range=None, index_file=None):
     errors = []
     checked = 0
-    for raw in git(root, 'ls-files', '-z').split(b'\0'):
+    for raw in git(root, 'ls-files', '-z', index_file=index_file).split(b'\0'):
         if not raw:
             continue
         try:
@@ -163,13 +165,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', type=Path, default=Path.cwd())
     parser.add_argument('--commit-range', help='full-base-SHA..full-head-SHA')
+    parser.add_argument('--index-file', type=Path, help='explicit existing index; relative paths are resolved under --root')
     args = parser.parse_args()
     try:
         selected = args.commit_range
         if selected is None and os.environ.get('GITHUB_EVENT_PATH'):
             event = json.loads(Path(os.environ['GITHUB_EVENT_PATH']).read_text(encoding='utf-8'))
             selected = event_range(event)
-        errors, files, commits = check(args.root, selected)
+        errors, files, commits = check(args.root, selected, args.index_file)
     except (ValueError, KeyError, OSError, subprocess.CalledProcessError) as exc:
         print(f'Encoding check could not complete ({exc.__class__.__name__}).', file=sys.stderr)
         return 2
