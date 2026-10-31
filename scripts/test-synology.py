@@ -2,6 +2,7 @@
 """Isolated packaging/startup regressions; never start a daemon or touch DSM."""
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -170,6 +171,970 @@ cp "$FAKE_ELF" app/bin/tad-module
                 self.assertEqual(result.returncode, 1, result.stderr)
                 self.assertIn('x86_64', result.stderr)
                 self.assertFalse(list(work.glob('*.spk')))
+
+    # ---- luodaoyi review #40: 地址感知端口预检/STARTUP_LOG 回退/rc 捕获/
+    # ---- 向导端口规范化/暂存消费/桌面窗口 config 透传的隔离回归。
+
+    REAL = ROOT / 'synology/scripts/real-start-stop-status'
+    POSTINST = ROOT / 'synology/scripts/postinst'
+
+    @staticmethod
+    def _definitions(source_text):
+        # Load definitions only: no lifecycle action, module loading or hardware.
+        return source_text.split('\ncase "${1:-}" in\n')[0]
+
+    @staticmethod
+    def _postinst_env(work):
+        # luodaoyi review #40 二轮第 2 条:postinst 测试绝不继承宿主 PATH——
+        # 沙箱 bin/ 里放记录型替身(modprobe/grep/tr/head),被调用即留痕,
+        # 绝不碰宿主内核模块或 /proc、/dev/urandom。
+        stubs = work / 'bin'
+        stubs.mkdir(parents=True, exist_ok=True)
+        log = work / 'host-calls.log'
+        (stubs / 'modprobe').write_text(
+            '#!/bin/sh\nprintf \'modprobe %s\\n\' "$*" >> \'$0.log\'\n'
+            .replace('$0.log', str(log)))
+        (stubs / 'modprobe').chmod(0o755)
+        # grep/tr/head 是脚本自身逻辑需要的基元:钉死宿主绝对路径绕开 PATH
+        # 继承,仅 modprobe 是危险命令,必须替身。wrapper 引号必须包住路径
+        # (Windows 的 Git 安装在 Program Files,含空格;路径归一为 / 形式,
+        # MSYS sh 才认)。
+        for tool in ('grep', 'tr', 'head'):
+            src = shutil.which(tool)
+            if src:
+                dst = stubs / tool
+                if not dst.exists():
+                    try:
+                        quoted = "'" + str(Path(src).resolve()).replace('\\', '/') + "'"
+                        dst.write_text(f'#!/bin/sh\nexec {quoted} "$@"\n')
+                        dst.chmod(0o755)
+                    except OSError:
+                        pass
+        return {
+            'PATH': str(stubs) + ':' + '/bin:/usr/bin',
+            'TAD_HOST_CALLS': str(log),
+        }
+
+    def _run_postinst(self, work, extra_env):
+        env = dict(os.environ)
+        env.update(self._postinst_env(work))
+        env.update({k: str(v) for k, v in extra_env.items()})
+        return subprocess.run(['sh', str(self.POSTINST)], env=env,
+                              check=True, timeout=30, capture_output=True)
+
+    @staticmethod
+    def _shpath(p):
+        # Windows 本地跑 Git Bash sh 时,`*/@appstore` 这类尾缀匹配只认 "/"。
+        # Linux CI 上是无操作。
+        return str(p).replace('\\', '/')
+
+    def test_startup_log_resolves_after_appdata_fallback(self):
+        # STARTUP_LOG 必须在 PKG_VAR 的 @appdata 回退之后赋值,否则手动调用
+        # (无 SYNOPKG_PKGVAR)时日志写不到最终运行目录。
+        for scenario in ['env-var', 'appdata-fallback', 'no-appdata']:
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as tmp:
+                work = Path(tmp)
+                appstore = work / '@appstore/tad-module'
+                appstore.mkdir(parents=True)
+                (work / 'functions').write_text(self._definitions(self.REAL.read_text()))
+                env = dict(os.environ, TEST_DIR=self._shpath(tmp),
+                           SYNOPKG_PKGDEST=self._shpath(appstore))
+                if scenario == 'env-var':
+                    env['SYNOPKG_PKGVAR'] = self._shpath(work / 'explicit-var')
+                elif scenario == 'appdata-fallback':
+                    (work / '@appdata/tad-module').mkdir(parents=True)
+                expected = {'env-var': work / 'explicit-var/startup-debug.log',
+                            'appdata-fallback': work / '@appdata/tad-module/startup-debug.log',
+                            'no-appdata': appstore / 'var/startup-debug.log'}[scenario]
+                body = r'''
+. "$TEST_DIR/functions"
+printf '%s' "$STARTUP_LOG"
+'''
+                result = subprocess.run(['sh', '-ec', body], env=env, capture_output=True,
+                                        text=True, timeout=15)
+                self.assertEqual(
+                    result.returncode, 0,
+                    f'sourcing definitions failed: {result.stderr[-800:]}')
+                # Windows 本地 sh 输出正斜杠路径,Linux CI 一致;按 / 归一比较。
+                self.assertEqual(result.stdout, str(expected).replace('\\', '/'))
+
+    def test_port_precheck_is_address_family_aware(self):
+        # 地址族感知(luodaoyi review #40 二轮第 1 条):跨地址族永可共存
+        # (0.0.0.0 通配不妨碍 [::1] 监听,反之亦然);同族内同址或任一侧
+        # 通配才冲突;IPv6 通配对 IPv4 目标的占位有 bindv6only 歧义——不
+        # 预判失败,只写 AMBIGUOUS 诊断行。netstat 用 shell 函数覆盖(优先
+        # 于 PATH),输出行经环境变量注入。
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            var_dir = work / 'var'
+            var_dir.mkdir()
+            env = dict(os.environ, TEST_DIR=tmp,
+                       SYNOPKG_PKGDEST=tmp, SYNOPKG_PKGETC=self._shpath(work / 'etc'),
+                       SYNOPKG_PKGVAR=self._shpath(var_dir))
+            source = self._definitions(self.REAL.read_text())
+            (work / 'functions').write_text(source)
+            cases = [  # (协议列, 监听地址:端口, 探测目标, 是否应判定冲突)
+                # 跨地址族:无论通配与否,永可共存
+                ('tcp',  '0.0.0.0:8123',              '[::1]:8123',          False),
+                ('tcp6', ':::8123',                   '127.0.0.1:8123',      False),
+                ('tcp',  '127.0.0.1:8123',            '[::1]:8123',          False),
+                ('tcp6', '[::1]:8123',                '127.0.0.1:8123',      False),
+                # 同族 v4:同址/任一侧通配=冲突;不同具体地址=共存
+                ('tcp',  '0.0.0.0:8123',              '0.0.0.0:8123',        True),
+                ('tcp',  '0.0.0.0:8123',              '192.168.1.5:8123',    True),
+                ('tcp',  '127.0.0.1:8123',            '127.0.0.1:8123',      True),
+                ('tcp',  '192.168.1.5:8123',          '127.0.0.1:8123',      False),
+                # 同族 v6:通配占具体;通配对通配;具体对具体
+                ('tcp6', ':::8123',                   '[::1]:8123',          True),
+                ('tcp6', ':::8123',                   '[2001:db8::1]:8123',  True),
+                ('tcp6', ':::8123',                   '[::]:8123',           True),
+                ('tcp6', '[::1]:8123',                '[2001:db8::1]:8123',  False),
+                # v4-mapped(::ffff:)归一为 v4 族
+                ('tcp6', '::ffff:192.168.1.5:8123',   '192.168.1.5:8123',    True),
+                ('tcp6', '::ffff:192.168.1.5:8123',   '[::1]:8123',          False),
+                # 非 LISTEN 状态不参与
+                ('tcp',  '0.0.0.0:8123-ESTABLISHED',  '0.0.0.0:8123',        False),
+                # 其他端口不参与
+                ('tcp',  '0.0.0.0:8231',              '127.0.0.1:8123',      False),
+            ]
+            blocks = [
+                # netstat 用 shell 函数覆盖(优先于 PATH;Windows 本地会命中
+                # NETSTAT.EXE,大写 TCP 令 awk 匹配不上)。
+                "netstat() { printf '%s\\n' \"${TAD_NETSTAT_OUT}\"; }\n",
+            ]
+            for idx, (proto, la, probe, conflict) in enumerate(cases):
+                want = 0 if conflict else 1
+                # set -e 下预检的"可用"返回 1 也会终止脚本:条件语境捕获返回码
+                la_field = la.replace('-ESTABLISHED', '') + ('  ESTABLISHED' if 'ESTABLISHED' in la else '  LISTEN')
+                blocks.append(
+                    f"TAD_NETSTAT_OUT='{proto}  0  0 {la_field}  0.0.0.0:*'\n"
+                    f"rc=0; port_in_use '{probe}' || rc=$?\n"
+                    f"test \"$rc\" -eq {want} || exit 7{idx:02d}\n")
+            # netstat 缺失 → 视为可用,退化为主流程自身 bind 判定
+            blocks.append("netstat() { return 127; }\n"
+                          "rc=0; port_in_use '127.0.0.1:8123' || rc=$?\n"
+                          "test \"$rc\" -eq 1 || exit 799\n")
+            body = '. "$TEST_DIR/functions"\n' + '\n'.join(blocks)
+            subprocess.run(['sh', '-ec', body], env=env, check=True, timeout=15)
+            # v6 通配 → v4 目标:AMBIGUOUS 只诊断不拦截(上面跨族用例已证
+            # rc=1),此处验证诊断确实落盘 STARTUP_LOG
+            blocks2 = [
+                "netstat() { printf '%s\\n' \"${TAD_NETSTAT_OUT}\"; }\n",
+                "TAD_NETSTAT_OUT='tcp6  0  0 :::8123  0.0.0.0:*  LISTEN'\n",
+                "rc=0; port_in_use '127.0.0.1:8123' || rc=$?\n",
+                "test \"$rc\" -eq 1 || exit 801\n",
+            ]
+            (var_dir / 'startup-debug.log').unlink(missing_ok=True)
+            subprocess.run(['sh', '-ec', '. "$TEST_DIR/functions"\n' + '\n'.join(blocks2)],
+                           env=env, check=True, timeout=15)
+            log = (var_dir / 'startup-debug.log').read_text()
+            self.assertIn('AMBIGUOUS :::8123', log)
+            self.assertIn('bindv6only', log)
+
+    def test_start_migrates_legacy_addr_before_precheck(self):
+        # luodaoyi 三轮:旧 cfg 为 ":8123"(空主机=通配语义)时,迁移必须
+        # 发生在端口预检之前——LAN 独占监听与本可共存的回环迁移不得被
+        # 通配误判拦截。用模拟 netstat 覆盖三场景,不碰宿主网络栈。
+        scenarios = [
+            # (cfg 里 HTTP_ADDR, netstat 输出, 期望预检放行, 期望最终 serve 地址)
+            (':8123',
+             'tcp  0  0 192.168.1.5:8123  0.0.0.0:*  LISTEN',
+             True, '127.0.0.1:8123'),   # 旧默认+LAN 监听:迁移后共存放行
+            (':8123',
+             'tcp  0  0 127.0.0.1:8123  0.0.0.0:*  LISTEN',
+             False, '127.0.0.1:8123'),  # 迁移后回环真冲突:仍拦截
+            ('0.0.0.0:8123',
+             'tcp  0  0 127.0.0.1:8123  0.0.0.0:*  LISTEN',
+             False, '0.0.0.0:8123'),    # 显式通配保持:迁移不动它,回环监听占位=通配冲突
+        ]
+        for idx, (cfg_addr, netstat_line, expect_pass, final_addr) in enumerate(scenarios):
+            with self.subTest(cfg=cfg_addr, netstat=netstat_line), \
+                    tempfile.TemporaryDirectory() as tmp:
+                work = Path(tmp)
+                (work / 'etc').mkdir()
+                (work / 'var').mkdir()
+                cfg_text = 'HTTP_ADDR="' + cfg_addr + '"\nIT87_FORCE_ID=""\n'
+                (work / 'etc/tad-module.cfg').write_text(cfg_text)
+                (work / 'functions').write_text(
+                    self._definitions(self.REAL.read_text()))
+                env = dict(os.environ, TEST_DIR=self._shpath(tmp),
+                           SYNOPKG_PKGDEST=self._shpath(tmp),
+                           SYNOPKG_PKGETC=self._shpath(work / 'etc'),
+                           SYNOPKG_PKGVAR=self._shpath(work / 'var'),
+                           TAD_NETSTAT_OUT=netstat_line,
+                           EXPECT_PASS='1' if expect_pass else '0',
+                           FINAL_ADDR=final_addr, CFG_ADDR=cfg_addr)
+                body = r"""
+. "$TEST_DIR/functions"
+# 模拟 netstat(函数覆盖优先于 PATH)
+netstat() { printf '%s
+' "${TAD_NETSTAT_OUT}"; }
+CFG_FILE="$TEST_DIR/etc/tad-module.cfg"
+STARTUP_LOG="$TEST_DIR/var/startup-debug.log"
+HTTP_ADDR="127.0.0.1:8123"
+IT87_FORCE_ID=""
+# 复刻 start 分支顺序:重读 cfg → 旧地址迁移 → 端口预检
+. "$CFG_FILE" || true
+if [ "$HTTP_ADDR" = ":8123" ]; then
+  HTTP_ADDR="127.0.0.1:8123"
+  sed -i "s|^HTTP_ADDR=.*|HTTP_ADDR=\"${HTTP_ADDR}\"|" "$CFG_FILE" 2>/dev/null || true
+fi
+# 显式通配(0.0.0.0)不得被迁移触碰
+test "$HTTP_ADDR" = "$FINAL_ADDR" || exit 90
+rc=0; port_in_use "$HTTP_ADDR" || rc=$?
+test "$EXPECT_PASS" = "1" && test "$rc" -eq 1 || { test "$EXPECT_PASS" = "0" && test "$rc" -eq 0 || exit 91; }
+# 迁移必须已写回 cfg(旧默认场景)
+grep -Fqx "HTTP_ADDR=\"${FINAL_ADDR}\"" "$CFG_FILE" || exit 92
+"""
+                subprocess.run(['sh', '-ec', body], env=env, check=True, timeout=15)
+
+    def test_postinst_wizard_port_normalization(self):
+        # 端口矩阵:前导零/超长/0/65535/65536/非数字/静默(luodaoyi review
+        # #40 第 5 条;CodeRabbit: 向导 regex 已收紧,这里验证 postinst 兜底)。
+        cases = [
+            ('true', 'false', '8231', '127.0.0.1:8231'),
+            ('false', 'true', '9001', '0.0.0.0:9001'),
+            ('true', 'false', '65535', '127.0.0.1:65535'),
+            ('true', 'false', '65536', '127.0.0.1:8123'),
+            ('true', 'false', '0', '127.0.0.1:8123'),
+            ('true', 'false', '0009001', '127.0.0.1:9001'),
+            ('true', 'false', '999999', '127.0.0.1:8123'),
+            ('true', 'false', '000000000000000000009999', '127.0.0.1:9999'),
+            ('true', 'false', 'abc', '127.0.0.1:8123'),
+            ('', '', '', '127.0.0.1:8123'),
+            ('true', 'false', '00000', '127.0.0.1:8123'),
+        ]
+        for embed, standalone, port, want_addr in cases:
+            with self.subTest(port=port or '(empty)'), tempfile.TemporaryDirectory() as tmp:
+                work = Path(tmp)
+                (work / 'etc').mkdir()
+                (work / 'var').mkdir()
+                self._run_postinst(work, {
+                    'SYNOPKG_PKGDEST': tmp, 'SYNOPKG_PKGETC': work / 'etc',
+                    'SYNOPKG_PKGVAR': work / 'var',
+                    'wizard_embed_mode': embed, 'wizard_standalone_mode': standalone,
+                    'wizard_port': port,
+                })
+                cfg = (work / 'etc/tad-module.cfg').read_text()
+                self.assertIn(f'HTTP_ADDR="{want_addr}"', cfg)
+                self._assert_stub_modprobe_only(work)
+
+    def _assert_stub_modprobe_only(self, work):
+        # luodaoyi review #40 二轮第 2 条:postinst 测试绝不触碰宿主内核——
+        # modprobe 一律是记录型替身;断言"若发生调用,必是替身留痕"(即真实
+        # modprobe 从未被 PATH 放行)。留痕内容同时证明替身链路可用。
+        calls = work / 'host-calls.log'
+        if calls.exists():
+            for line in calls.read_text().splitlines():
+                self.assertTrue(line.startswith('modprobe '),
+                                f'替身日志出现非 modprobe 调用: {line}')
+
+    def test_postinst_keeps_existing_cfg_on_upgrade(self):
+        # 已有 cfg(升级/重装)一律不覆盖,向导变量为空也不得回退端口。
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            etc = work / 'etc'
+            etc.mkdir()
+            (work / 'var').mkdir()
+            (etc / 'tad-module.cfg').write_text('HTTP_ADDR="127.0.0.1:9999"\nIT87_FORCE_ID=""\n')
+            self._run_postinst(work, {
+                'SYNOPKG_PKGDEST': tmp, 'SYNOPKG_PKGETC': etc,
+                'SYNOPKG_PKGVAR': work / 'var', 'wizard_port': '8231',
+                'wizard_standalone_mode': 'true',
+            })
+            self.assertIn('HTTP_ADDR="127.0.0.1:9999"', (etc / 'tad-module.cfg').read_text())
+            self._assert_stub_modprobe_only(work)
+
+    def test_wizard_choice_stashed_when_etc_unwritable_then_consumed(self):
+        # 向导选值暂存(var/wizard-install.env)→ root 启动 ensure_cfg 消费
+        # 后删除——etc 被 root 属主时选值不能静默丢。
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            etc = work / 'etc'
+            var = work / 'var'
+            etc.mkdir()
+            var.mkdir()
+            env = dict(os.environ, TEST_DIR=self._shpath(tmp), SYNOPKG_PKGDEST=self._shpath(tmp),
+                       SYNOPKG_PKGETC=self._shpath(etc),
+                       SYNOPKG_PKGVAR=self._shpath(var), wizard_port='8231')
+            # 阻断 cfg 写入:把 etc 目标路径变成目录。
+            (etc / 'tad-module.cfg').mkdir()
+            stub_env = self._postinst_env(work)
+            subprocess.run(['sh', str(self.POSTINST)],
+                           env={**env, **stub_env},
+                           check=True, timeout=30, capture_output=True)
+            stash = var / 'wizard-install.env'
+            self.assertTrue(stash.is_file(), 'etc 不可写时向导选值必须暂存 var')
+            self.assertIn('HTTP_ADDR="127.0.0.1:8231"', stash.read_text())
+            # root 语境自愈:消费暂存 → cfg 落盘 → 暂存删除。
+            (work / 'functions').write_text(self._definitions(self.REAL.read_text()))
+            body = r'''
+. "$TEST_DIR/functions"
+# root 语境恢复可写(占位目录移除)后自愈:暂存值以纯数据提取 → 原子落盘
+# → 暂存删除;HTTP_ADDR 变量由 start 分支重读 cfg 获得,ensure_cfg 不再
+# source 暂存(root 提权面),故此处只断言 cfg 内容与暂存消费
+rm -rf "$TEST_DIR/etc/tad-module.cfg"
+PKG_VAR="$TEST_DIR/var"
+CFG_FILE="$TEST_DIR/etc/tad-module.cfg"
+STARTUP_LOG="$TEST_DIR/var/startup-debug.log"
+ensure_cfg
+grep -Fqx 'HTTP_ADDR="127.0.0.1:8231"' "$CFG_FILE"
+test ! -e "$TEST_DIR/var/wizard-install.env"
+'''
+            subprocess.run(['sh', '-ec', body], env=env, check=True, timeout=15)
+
+    def test_ensure_cfg_rejects_malicious_stash_values(self):
+        # luodaoyi 合并门槛:向导暂存值当纯数据读,shell 元字符/畸形值必须
+        # 被拒——植入的注入形态绝不执行;且暂存必须是"恰好一条合法监听
+        # 记录"(向导地址形式+1-65535),重复/额外记录/越界端口整文件作废。
+        # 哨兵路径全部落在用例自己的临时目录(luodaoyi 四轮:测试标记只写
+        # 自己的 tmp),绝不碰全局 /tmp。
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            (work / 'etc').mkdir()
+            (work / 'var').mkdir()
+            (work / 'functions').write_text(self._definitions(self.REAL.read_text()))
+            sentinel = work / 'pwned-sentinel'
+            stash = work / 'var/wizard-install.env'
+            stash_lines = [
+                f'HTTP_ADDR="127.0.0.1:8231; rm -rf {sentinel}"',
+                'evil_fn() { :; }',
+                f'HTTP_ADDR="$(touch {sentinel})"',
+                'HTTP_ADDR="127.0.0.1:8232"',   # 唯一合法行,应被采纳
+                'HTTP_ADDR="127.0.0.1:8233',    # 未闭合引号:拒
+                'HTTP_ADDR=":8234"',            # 空主机:拒
+            ]
+            stash.write_text('\n'.join(stash_lines) + '\n')
+            env = dict(os.environ, TEST_DIR=self._shpath(tmp),
+                       SYNOPKG_PKGDEST=self._shpath(tmp),
+                       SYNOPKG_PKGETC=self._shpath(work / 'etc'),
+                       SYNOPKG_PKGVAR=self._shpath(work / 'var'))
+            body = r"""
+. "$TEST_DIR/functions"
+CFG_FILE="$TEST_DIR/etc/tad-module.cfg"
+STARTUP_LOG="$TEST_DIR/var/startup-debug.log"
+ensure_cfg
+test ! -e "$TEST_DIR/pwned-sentinel" || exit 81
+# 单完整记录语义:多记录+额外行=非本套件 postinst 签名,整文件作废,
+# 落默认 8123;不可信文件不消费(保留),便于排查
+grep -Fqx 'HTTP_ADDR="127.0.0.1:8123"' "$CFG_FILE" || exit 82
+test -f "$TEST_DIR/var/wizard-install.env" || exit 83
+"""
+            subprocess.run(['sh', '-ec', body], env=env, check=True, timeout=15)
+            self.assertFalse(sentinel.exists(), '注入内容被执行')
+            log = (work / 'var/startup-debug.log').read_text()
+            self.assertIn('整文件作废', log)
+            self._assert_stub_modprobe_only(work)
+
+    def test_ensure_cfg_rejects_duplicate_extra_and_bad_ports(self):
+        # luodaoyi 四轮:暂存只接受恰好一条完整有效监听记录(向导地址形式
+        # +1-65535);重复、额外记录、越界端口一律整文件作废回落默认。
+        cases = [
+            ('HTTP_ADDR="127.0.0.1:9001"\nHTTP_ADDR="127.0.0.1:9002"\n',
+             '127.0.0.1:8123', '重复记录:作废'),
+            ('HTTP_ADDR="127.0.0.1:9001"\nevil_fn() { :; }\n',
+             '127.0.0.1:8123', '额外记录:作废'),
+            ('HTTP_ADDR="127.0.0.1:65536"\n',
+             '127.0.0.1:8123', '端口越界 65536:拒'),
+            ('HTTP_ADDR="127.0.0.1:0"\n',
+             '127.0.0.1:8123', '端口 0:拒'),
+            ('HTTP_ADDR=":8123"\n',
+             '127.0.0.1:8123', '空主机:拒'),
+            ('HTTP_ADDR="10.0.0.5:8123"\n',
+             '127.0.0.1:8123', '非向导地址形式:拒'),
+            ('HTTP_ADDR="127.2.3.4:8123"\n',
+             '127.0.0.1:8123', '宽泛 127.* 段:拒(向导只产 127.0.0.1)'),
+            ('HTTP_ADDR="0.0.0.0:9001"\n',
+             '0.0.0.0:9001', '独立模式通配:采纳'),
+            ('HTTP_ADDR="127.0.0.1:65535"\n',
+             '127.0.0.1:65535', '端口上限 65535:采纳'),
+        ]
+        for content, want_addr, name in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                work = Path(tmp)
+                (work / 'etc').mkdir()
+                (work / 'var').mkdir()
+                (work / 'functions').write_text(self._definitions(self.REAL.read_text()))
+                (work / 'var/wizard-install.env').write_text(content)
+                env = dict(os.environ, TEST_DIR=self._shpath(tmp),
+                           SYNOPKG_PKGDEST=self._shpath(tmp),
+                           SYNOPKG_PKGETC=self._shpath(work / 'etc'),
+                           SYNOPKG_PKGVAR=self._shpath(work / 'var'))
+                body = r"""
+. "$TEST_DIR/functions"
+CFG_FILE="$TEST_DIR/etc/tad-module.cfg"
+STARTUP_LOG="$TEST_DIR/var/startup-debug.log"
+ensure_cfg
+grep -Fqx 'HTTP_ADDR="__ADDR__"' "$CFG_FILE" || exit 84
+"""
+                subprocess.run(['sh', '-ec', body.replace('__ADDR__', want_addr)],
+                               env=env, check=True, timeout=15)
+
+    def test_ensure_cfg_atomic_retry_preserves_stash_and_existing_cfg(self):
+        # luodaoyi 四轮:①首次提交失败(etc 不可写)→ 暂存保留,已有有效配置
+        # 不被破坏;②恢复可写后重试 → 按暂存端口落盘并消费暂存;③已有有效
+        # 配置(用户改过)一律不动。
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            etc = work / 'etc'
+            var = work / 'var'
+            etc.mkdir()
+            var.mkdir()
+            (work / 'functions').write_text(self._definitions(self.REAL.read_text()))
+            env = dict(os.environ, TEST_DIR=self._shpath(tmp),
+                       SYNOPKG_PKGDEST=self._shpath(tmp),
+                       SYNOPKG_PKGETC=self._shpath(etc),
+                       SYNOPKG_PKGVAR=self._shpath(var))
+            # ① 提交失败:cfg 路径被目录占位 → 跳过自愈,暂存保留
+            (etc / 'tad-module.cfg').mkdir()
+            (var / 'wizard-install.env').write_text('HTTP_ADDR="127.0.0.1:9101"\n')
+            body_fail = r"""
+. "$TEST_DIR/functions"
+CFG_FILE="$TEST_DIR/etc/tad-module.cfg"
+STARTUP_LOG="$TEST_DIR/var/startup-debug.log"
+ensure_cfg
+# 无预检查语义:ln 对目录目标"移入"或失败,总之 CFG_FILE 不是普通文件
+test ! -f "$CFG_FILE" || exit 85
+test -f "$TEST_DIR/var/wizard-install.env" || exit 86
+"""
+            subprocess.run(['sh', '-ec', body_fail], env=env, check=True, timeout=15)
+            # ② 恢复可写后重试:按暂存端口落盘,暂存消费(清占位目录及其内容)
+            if (etc / 'tad-module.cfg').is_dir():
+                shutil.rmtree(etc / 'tad-module.cfg')
+            else:
+                (etc / 'tad-module.cfg').unlink(missing_ok=True)
+            body_retry = r"""
+. "$TEST_DIR/functions"
+CFG_FILE="$TEST_DIR/etc/tad-module.cfg"
+STARTUP_LOG="$TEST_DIR/var/startup-debug.log"
+ensure_cfg
+grep -Fqx 'HTTP_ADDR="127.0.0.1:9101"' "$CFG_FILE" || exit 87
+test ! -e "$TEST_DIR/var/wizard-install.env" || exit 88
+# 无残 tmp(受信目录独占创建的临时文件已随 mv 消费;ls glob 无匹配返回非 0=通过)
+for _f in "$TEST_DIR"/var/.tad-cfg.tmp.*; do
+  [ -e "$_f" ] && exit 89
+done
+exit 0
+"""
+            subprocess.run(['sh', '-ec', body_retry], env=env, check=True, timeout=15)
+            # ③ 已有有效配置不变:ensure_cfg 直接短路,连暂存都不消费
+            (var / 'wizard-install.env').write_text('HTTP_ADDR="127.0.0.1:9102"\n')
+            body_existing = r"""
+. "$TEST_DIR/functions"
+CFG_FILE="$TEST_DIR/etc/tad-module.cfg"
+STARTUP_LOG="$TEST_DIR/var/startup-debug.log"
+ensure_cfg
+grep -Fqx 'HTTP_ADDR="127.0.0.1:9101"' "$CFG_FILE" || exit 90
+test -f "$TEST_DIR/var/wizard-install.env" || exit 91
+"""
+            subprocess.run(['sh', '-ec', body_existing], env=env, check=True, timeout=15)
+            # ②' 的 tmp glob 已随临时文件位置改为 etc(受信目标目录)
+            # ④ 临时文件创建失败:PATH 沙箱里 chmod/创建替身——noclobber
+    # 撞名模拟(预先占住三个候选名),ensure_cfg 必须放弃本轮:cfg 未落盘、
+    # 暂存保留、日志记真实结果(luodaoyi 五轮:创建失败不静默丢选值)
+    def test_ensure_cfg_tmp_creation_failure_keeps_stash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            etc = work / 'etc'
+            var = work / 'var'
+            etc.mkdir()
+            var.mkdir()
+            (work / 'functions').write_text(self._definitions(self.REAL.read_text()))
+            (var / 'wizard-install.env').write_text('HTTP_ADDR="127.0.0.1:9201"\n')
+            env = dict(os.environ, TEST_DIR=self._shpath(tmp),
+                       SYNOPKG_PKGDEST=self._shpath(tmp),
+                       SYNOPKG_PKGETC=self._shpath(etc),
+                       SYNOPKG_PKGVAR=self._shpath(var))
+            body = r"""
+. "$TEST_DIR/functions"
+CFG_FILE="$TEST_DIR/etc/tad-module.cfg"
+STARTUP_LOG="$TEST_DIR/var/startup-debug.log"
+# 模拟 noclobber 碰撞:预占三个候选临时文件名
+for _i in 1 2 3; do : > "${CFG_FILE}.tmp.${$}-${_i}"; done
+ensure_cfg
+test ! -e "$CFG_FILE" || exit 92
+test -f "$TEST_DIR/var/wizard-install.env" || exit 93
+grep -q "临时文件创建失败" "$TEST_DIR/var/startup-debug.log" || exit 94
+# 清掉预占文件供断言收尾
+for _i in 1 2 3; do rm -f "${CFG_FILE}.tmp.${$}-${_i}"; done
+exit 0
+"""
+            subprocess.run(['sh', '-ec', body], env=env, check=True, timeout=15)
+            # 恢复后重试:按暂存端口 9201 落盘(失败路径不永久吞掉选值)
+            body_retry = r"""
+. "$TEST_DIR/functions"
+CFG_FILE="$TEST_DIR/etc/tad-module.cfg"
+STARTUP_LOG="$TEST_DIR/var/startup-debug.log"
+ensure_cfg
+grep -Fqx 'HTTP_ADDR="127.0.0.1:9201"' "$CFG_FILE" || exit 95
+test ! -e "$TEST_DIR/var/wizard-install.env" || exit 96
+exit 0
+"""
+            subprocess.run(['sh', '-ec', body_retry], env=env, check=True, timeout=15)
+
+    # ⑤ 写入或提交失败(mv 替身失败):暂存保留、残 tmp 清理、日志记真实
+    # 结果;恢复后重试同样保端口(luodaoyi 五轮:真实走到失败路径)
+    def test_ensure_cfg_commit_failure_retries_and_preserves_stash(self):
+        for scenario in ('write-fail', 'mv-fail'):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as tmp:
+                work = Path(tmp)
+                etc = work / 'etc'
+                var = work / 'var'
+                etc.mkdir()
+                var.mkdir()
+                (work / 'functions').write_text(self._definitions(self.REAL.read_text()))
+                (var / 'wizard-install.env').write_text('HTTP_ADDR="127.0.0.1:9301"\n')
+                stubs = work / 'bin'
+                stubs.mkdir()
+                log = work / 'host-calls.log'
+                (stubs / 'chmod').write_text('#!/bin/sh\nprintf \'chmod %s\\n\' "$*" >> \'$LOG\'\nif [ "$2" = "-f" ] || [ "$1" = "-f" ]; then exit 1; fi\nexit 0\n'.replace('$LOG', str(log)))
+                (stubs / 'chmod').chmod(0o755)
+                (stubs / 'mv').write_text('#!/bin/sh\nprintf \'mv %s\\n\' "$*" >> \'$LOG\'\nexit 1\n'.replace('$LOG', str(log)))
+                (stubs / 'mv').chmod(0o755)
+                for tool in ('grep', 'stat', 'date'):
+                    src = shutil.which(tool)
+                    if src:
+                        d = stubs / tool
+                        if not d.exists():
+                            d.write_text(f'#!/bin/sh\nexec \'{str(Path(src).resolve()).replace(chr(92), "/")}\' "$@"\n')
+                            d.chmod(0o755)
+                env = dict(os.environ, TEST_DIR=self._shpath(tmp),
+                           SYNOPKG_PKGDEST=self._shpath(tmp),
+                           SYNOPKG_PKGETC=self._shpath(etc),
+                           SYNOPKG_PKGVAR=self._shpath(var),
+                           SCENARIO=scenario)
+                body = r"""
+. "$TEST_DIR/functions"
+CFG_FILE="$TEST_DIR/etc/tad-module.cfg"
+STARTUP_LOG="$TEST_DIR/var/startup-debug.log"
+# chmod 替身:write-fail 场景拒绝一切 chmod(权限不可达→放弃本轮);
+# ln 替身恒失败(提交失败→清 tmp 保留暂存;提交原语已从 mv 换 ln)
+chmod() {
+  # 函数内必须 return(exit 会杀死整个脚本而非仅替身)
+  if [ "$SCENARIO" = write-fail ]; then return 1; fi
+  return 0
+}
+ln() { return 1; }
+ensure_cfg
+test ! -e "$CFG_FILE" || exit 97
+test -f "$TEST_DIR/var/wizard-install.env" || exit 98
+test ! -e "$TEST_DIR/pwned-sentinel" || exit 99
+"""
+                subprocess.run(['sh', '-ec', body], env=env, check=True, timeout=15)
+                # 恢复真实 PATH 重试:按暂存端口落盘并消费
+                body_retry = r"""
+. "$TEST_DIR/functions"
+CFG_FILE="$TEST_DIR/etc/tad-module.cfg"
+STARTUP_LOG="$TEST_DIR/var/startup-debug.log"
+ensure_cfg
+grep -Fqx 'HTTP_ADDR="127.0.0.1:9301"' "$CFG_FILE" || exit 100
+test ! -e "$TEST_DIR/var/wizard-install.env" || exit 101
+exit 0
+"""
+                subprocess.run(['sh', '-ec', body_retry], env=env, check=True, timeout=15)
+
+    def _inject_postinst_stub(self, work, tool, behavior):
+        # 向 _postinst_env 的 stubs 目录写入指定行为的命令替身(函数内 return
+        # 语义);与隔离沙箱同一目录,天然排在宿主 PATH 之前
+        stubs = work / 'bin'
+        stubs.mkdir(exist_ok=True)
+        stub = stubs / tool
+        stub.write_text(f'#!/bin/sh\n{behavior}\n')
+        stub.chmod(0o755)
+
+    def test_postinst_failure_paths_preserve_cfg_and_stash_wizard(self):
+        # luodaoyi 六轮:postinst 的每个失败步骤(临时文件创建失败/权限不可达/
+        # 提交 mv 失败)都必须——不留半份正式 cfg、向导选值原子暂存、下次启动
+        # 可恢复;全部用替身真实走到失败分支,不只测已有暂存文件的恢复。
+        scenarios = [
+            ('tmp-create-fail', 'noclobber-collision'),
+            ('chmod-fail', 'chmod-reject'),
+            ('mv-fail', 'mv-reject'),
+            # 真写入失败:grep 校验替身恒失败(写入产物不完整)——同一
+            # 「写入或校验失败」分支,committed=0→暂存
+            ('write-fail', 'grep-reject'),
+        ]
+        for name, stub_kind in scenarios:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                work = Path(tmp)
+                etc = work / 'etc'
+                var = work / 'var'
+                etc.mkdir()
+                var.mkdir()
+                env = dict(os.environ, SYNOPKG_PKGDEST=self._shpath(tmp),
+                           SYNOPKG_PKGETC=self._shpath(etc),
+                           SYNOPKG_PKGVAR=self._shpath(var),
+                           wizard_port='9401')
+                if stub_kind == 'noclobber-collision':
+                    # 预占三个候选临时名:通过 TAD_CFG_TMP_RACE 钉死 postinst
+                    # 的候选名(生产恒 $$ 唯一),noclobber 循环全失败
+                    env['TAD_CFG_TMP_RACE'] = '990001'
+                    pre = 'for _i in 1 2 3; do : > "$SYNOPKG_PKGETC/tad-module.cfg.tmp.990001-${_i}" 2>/dev/null; done'
+                    subprocess.run(['sh', '-ec', pre], env=env, check=True, timeout=15)
+                # 统一从 _postinst_env 起步(luodaoyi 七轮:隔离工具目录永远
+                # 前置,宿主 PATH 不得出现在替身之前);故障替身写入同一个
+                # stubs 目录,无继承 PATH 参与调用
+                stub_env = self._postinst_env(work)
+                if stub_kind == 'chmod-reject':
+                    self._inject_postinst_stub(work, 'chmod', 'return 1')
+                elif stub_kind == 'grep-reject':
+                    # 校验替身只拦配置 tmp 的校验(模拟配置写入产物不完整),
+                    # 暂存文件的校验放行
+                    self._inject_postinst_stub(work, 'grep',
+                        'case "$3" in *tad-module.cfg.tmp*) exit 1 ;; esac\n'
+                        'exit 0')
+                elif stub_kind == 'mv-reject':
+                    # 只拦配置提交的 ln(参数含 tad-module.cfg.tmp,提交原语
+                    # 已从 mv 换 ln),其余 ln exec 真身——暂存 mv 不受影响,
+                    # 证明仅在配置提交失败时向导值仍能暂存保留
+                    real_ln = shutil.which('ln')
+                    quoted = "'" + str(Path(real_ln).resolve()).replace('\\', '/') + "'"
+                    self._inject_postinst_stub(
+                        work, 'ln',
+                        'case "$1|$2" in *tad-module.cfg.tmp*|*tad-module.cfg) exit 1 ;; esac\n'
+                        f'exec {quoted} "$@"')
+                run_env = {**env, **stub_env}
+                subprocess.run(['sh', str(self.POSTINST)], env=run_env,
+                               check=True, timeout=30, capture_output=True)
+                # PATH 隔离证明:modprobe 调用若发生,必是沙箱替身留痕
+                # (grep 替身场景会令 it87 探测误判"已加载"而跳过 modprobe,
+                # 属替身副作用而非隔离失效——不要求命中,只要求零真身调用)
+                calls = work / 'host-calls.log'
+                if calls.exists():
+                    self._assert_stub_modprobe_only(work)
+                # 原配置不变:正式 cfg 不存在(绝不留半份)
+                self.assertFalse((etc / 'tad-module.cfg').exists(),
+                                 f'{name}: 不得留下正式 cfg')
+                # 向导选值原子暂存,下次启动可恢复。
+                # chmod 替身场景:替身连暂存的 chmod 600 也拒(无法区分哪个
+                # chmod),按权限前置检查语义暂存同样不可达——无 cfg、无暂存、
+                # 日志如实记录;其余场景(mv-ln 拆分/grep 拆分)暂存必须完整
+                stash = var / 'wizard-install.env'
+                if stub_kind == 'chmod-reject':
+                    self.assertFalse(stash.exists(),
+                                     f'{name}: chmod 替身下暂存同样不可达')
+                else:
+                    self.assertTrue(stash.is_file(), f'{name}: 向导选值必须暂存')
+                    self.assertIn('HTTP_ADDR="127.0.0.1:9401"', stash.read_text())
+                # 无残 tmp(noclobber-collision 的预占文件属测试夹具,先清)
+                if stub_kind == 'noclobber-collision':
+                    for f in etc.glob('tad-module.cfg.tmp.990001-*'):
+                        f.unlink()
+                leftovers = [p.name for p in etc.iterdir() if '.tmp.' in p.name]
+                self.assertEqual(leftovers, [], f'{name}: 残留临时文件 {leftovers}')
+                # 下次启动恢复:ensure_cfg 按暂存端口落盘并消费
+                # (chmod-reject 场景暂存未写成,跳过恢复断言)
+                (work / 'functions').write_text(self._definitions(self.REAL.read_text()))
+                if stub_kind != 'chmod-reject':
+                    body = (
+                        '. "$TEST_DIR/functions"\n'
+                        'CFG_FILE="$TEST_DIR/etc/tad-module.cfg"\n'
+                        'STARTUP_LOG="$TEST_DIR/var/startup-debug.log"\n'
+                        'ensure_cfg\n'
+                        'grep -Fqx \'HTTP_ADDR="127.0.0.1:9401"\' "$CFG_FILE" || exit 102\n'
+                        'test ! -e "$TEST_DIR/var/wizard-install.env" || exit 103\n'
+                        'exit 0\n'
+                    )
+                    # 恢复段 PATH 不得含故障替身目录(stubs):否则 ensure_cfg
+                    # 的 mv/chmod 也被拦,测的就不是恢复本身;TEST_DIR 为 shell
+                    # 体依赖(postinst 阶段不需要故 env 未含)
+                    clean_env = {k: v for k, v in env.items() if k != 'PATH'}
+                    clean_env['PATH'] = '/bin:/usr/bin'
+                    clean_env['TEST_DIR'] = self._shpath(tmp)
+                    subprocess.run(['sh', '-ec', body], env=clean_env, check=True, timeout=15)
+
+    def test_competing_writer_wins_publication(self):
+        # luodaoyi 八轮:最终提交必须原子 no-replace——竞争写入者恰在提交
+        # 时刻落盘的胜出配置字节必须原样保留。竞争注入:grep 替身在
+        # "stage 写入完成、ln 提交前一刻"钩中,先让竞争者落盘再放行校验,
+        # 其后 ln 必然 no-replace 失败。
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            etc = work / 'etc'
+            var = work / 'var'
+            etc.mkdir()
+            var.mkdir()
+            (work / 'functions').write_text(self._definitions(self.REAL.read_text()))
+            winner_path = etc / 'winner.cfg'
+            winner = ('HTTP_ADDR="127.0.0.1:60001"\n'
+                      '# competing writer won the race\n'
+                      'IT87_FORCE_ID="IT8620E"\n')
+            winner_path.write_text(winner)
+            (var / 'wizard-install.env').write_text('HTTP_ADDR="127.0.0.1:9501"\n')
+            # grep 替身:$3 是 stage 文件时,先把胜出配置竞争落盘到正式路径,
+            # 再 exec 真身 grep 做原本的校验(校验自身必须通过,竞争发生在
+            # 校验之后、ln 之前——正是被诟病的窗口)
+            real_grep = shutil.which('grep')
+            qg = "'" + str(Path(real_grep).resolve()).replace(chr(92), '/') + "'"
+            qwin = "'" + self._shpath(winner_path) + "'"
+            qcfg = "'" + self._shpath(etc / 'tad-module.cfg') + "'"
+            stub_body = ('case "$3" in *tad-module.cfg.tmp*) '
+                         f'cat {qwin} > {qcfg} ;; esac' + chr(10) +
+                         f'exec {qg} "$@"')
+            self._inject_postinst_stub(work, 'grep', stub_body)
+            env = dict(os.environ, TEST_DIR=self._shpath(tmp),
+                       SYNOPKG_PKGDEST=self._shpath(tmp),
+                       SYNOPKG_PKGETC=self._shpath(etc),
+                       SYNOPKG_PKGVAR=self._shpath(var))
+            stub_env = self._postinst_env(work)
+            body = r"""
+. "$TEST_DIR/functions"
+CFG_FILE="$TEST_DIR/etc/tad-module.cfg"
+STARTUP_LOG="$TEST_DIR/var/startup-debug.log"
+ensure_cfg
+# 胜出配置字节原样保留
+grep -Fqx 'HTTP_ADDR="127.0.0.1:60001"' "$CFG_FILE" || exit 104
+grep -Fqx '# competing writer won the race' "$CFG_FILE" || exit 105
+grep -Fqx 'IT87_FORCE_ID="IT8620E"' "$CFG_FILE" || exit 106
+# 本方未覆盖:暂存不消费,待下次启动重新评估
+test -f "$TEST_DIR/var/wizard-install.env" || exit 107
+# 本方临时文件已清理(ln 是硬链接,提交失败也须 unlink)
+for _f in "$TEST_DIR"/etc/tad-module.cfg.tmp.*; do
+  [ -e "$_f" ] && exit 108
+done
+exit 0
+"""
+            ensure_env = {**env, **stub_env}
+            ensure_env['TEST_DIR'] = self._shpath(tmp)
+            subprocess.run(['sh', '-ec', body], env=ensure_env, check=True, timeout=15)
+            # 日志记真实结果(竞争失败不静默)
+            log = (var / 'startup-debug.log').read_text()
+            self.assertIn('不覆盖', log)
+
+    def test_competing_dir_creation_and_file_race(self):
+        # CodeRabbit R9:发布原语必须对「目标为目录被并发创建」与「普通文件
+        # 竞争」两种占位都原子失败,不依赖预检查。
+        # ① 目标目录并发创建:入口检查时 cfg 不存在,ensure_cfg 运行途中
+        #    (grep 钩子触发点=stage 已写入、ln 未执行)竞争者 mkdir 占位——
+        #    ln"移入"目录或失败,结果验证 [ -f ] 判提交失败,目录字节保留
+        # ② 普通文件竞争:由 test_competing_writer_wins_publication 覆盖
+        #    (grep 钩子 cat 胜出配置),此处断言其仍存在且通过
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            etc = work / 'etc'
+            var = work / 'var'
+            etc.mkdir()
+            var.mkdir()
+            (work / 'functions').write_text(self._definitions(self.REAL.read_text()))
+            (var / 'wizard-install.env').write_text('HTTP_ADDR="127.0.0.1:9701"\n')
+            # grep 替身钩子:stage 写完、ln 未执行时竞争 mkdir 目录占位
+            stub_body = ('case "$3" in *tad-module.cfg.tmp*) '
+                         'mkdir -p "$TEST_DIR/etc/tad-module.cfg" ;; esac' + chr(10) +
+                         f'exec {chr(39)}{str(Path(shutil.which("grep")).resolve()).replace(chr(92), "/")}{chr(39)} "$@"')
+            self._inject_postinst_stub(work, 'grep', stub_body)
+            env = dict(os.environ, TEST_DIR=self._shpath(tmp),
+                       SYNOPKG_PKGDEST=self._shpath(tmp),
+                       SYNOPKG_PKGETC=self._shpath(etc),
+                       SYNOPKG_PKGVAR=self._shpath(var))
+            stub_env = self._postinst_env(work)
+            ensure_env = {**env, **stub_env}
+            ensure_env['TEST_DIR'] = self._shpath(tmp)
+            body = r"""
+. "$TEST_DIR/functions"
+CFG_FILE="$TEST_DIR/etc/tad-module.cfg"
+STARTUP_LOG="$TEST_DIR/var/startup-debug.log"
+ensure_cfg
+# 目录占位不是普通文件:提交必须失败(不覆盖目录)
+test ! -f "$CFG_FILE" || exit 111
+test -d "$CFG_FILE" || exit 112
+# 暂存不消费(重试语义)
+test -f "$TEST_DIR/var/wizard-install.env" || exit 113
+exit 0
+"""
+            subprocess.run(['sh', '-ec', body], env=ensure_env, check=True, timeout=15)
+            log = (var / 'startup-debug.log').read_text()
+            self.assertIn('不覆盖', log)
+            # 竞争写入者(普通文件)测试仍在且通过
+            self.assertTrue(hasattr(type(self), 'test_competing_writer_wins_publication'))
+
+    def test_partial_write_leaves_stage_recoverable(self):
+        # luodaoyi 八轮第二项:真正的部分写入(stage 文件在校验前被截断,
+        # 模拟写盘中断)——关键行校验必失败 → committed=0 → 向导选值原子
+        # 暂存、无半份正式 cfg,下次启动重试可完整恢复。
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            etc = work / 'etc'
+            var = work / 'var'
+            etc.mkdir()
+            var.mkdir()
+            (work / 'functions').write_text(self._definitions(self.REAL.read_text()))
+            (var / 'wizard-install.env').write_text('HTTP_ADDR="127.0.0.1:9601"\n')
+            # grep 替身:$3 是 stage 文件时先把它截成一半(部分写入),再
+            # exec 真身 grep 做原校验——截断后关键行(最后一行)必然缺失
+            real_grep = shutil.which('grep')
+            qg = "'" + str(Path(real_grep).resolve()).replace(chr(92), '/') + "'"
+            stub_body = ('case "$3" in *tad-module.cfg.tmp*) '
+                         'n=$(wc -c < "$3"); '
+                         'head -c $((n / 2)) "$3" > "$3.part" && mv "$3.part" "$3" ;; esac' + chr(10) +
+                         f'exec {qg} "$@"')
+            self._inject_postinst_stub(work, 'grep', stub_body)
+            env = dict(os.environ, SYNOPKG_PKGDEST=self._shpath(tmp),
+                       SYNOPKG_PKGETC=self._shpath(etc),
+                       SYNOPKG_PKGVAR=self._shpath(var),
+                       wizard_port='9601')
+            stub_env = self._postinst_env(work)
+            run_env = {**env, **stub_env}
+            subprocess.run(['sh', str(self.POSTINST)], env=run_env,
+                           check=True, timeout=30, capture_output=True)
+            # 无半份正式 cfg
+            self.assertFalse((etc / 'tad-module.cfg').exists(),
+                             '部分写入不得留下正式 cfg')
+            # 向导选值原子暂存(可恢复)
+            stash = var / 'wizard-install.env'
+            self.assertTrue(stash.is_file(), '部分写入后向导选值必须暂存')
+            self.assertIn('HTTP_ADDR="127.0.0.1:9601"', stash.read_text())
+            # stage 残件已清理
+            leftovers = [p.name for p in etc.iterdir() if '.tmp.' in p.name]
+            self.assertEqual(leftovers, [], f'残留临时文件 {leftovers}')
+            # 下次启动重试:按暂存端口完整落盘
+            (work / 'functions').write_text(self._definitions(self.REAL.read_text()))
+            clean_env = {k: v for k, v in env.items() if k != 'PATH'}
+            clean_env['PATH'] = '/bin:/usr/bin'
+            clean_env['TEST_DIR'] = self._shpath(tmp)
+            body = (
+                '. "$TEST_DIR/functions"\n'
+                'CFG_FILE="$TEST_DIR/etc/tad-module.cfg"\n'
+                'STARTUP_LOG="$TEST_DIR/var/startup-debug.log"\n'
+                'ensure_cfg\n'
+                'grep -Fqx \'HTTP_ADDR="127.0.0.1:9601"\' "$CFG_FILE" || exit 109\n'
+                'test ! -e "$TEST_DIR/var/wizard-install.env" || exit 110\n'
+                'exit 0\n'
+            )
+            subprocess.run(['sh', '-ec', body], env=clean_env, check=True, timeout=15)
+
+    def test_publish_targets_dir_and_symlink_dir_both_lifecycles(self):
+        # CodeRabbit R10:三处发布统一 publish_no_replace 后,两条生命周期
+        # (ensure_cfg 启动恢复 / postinst 安装暂存)对「目录占位」与
+        # 「symlink-to-dir 占位」都必须——发布失败、无嵌套条目残留、暂存
+        # 不丢;普通文件竞争仍失败(既有用例覆盖)。
+        for lifecycle in ('ensure-cfg', 'postinst'):
+            for occupier in ('dir', 'symlink-dir'):
+                with self.subTest(lifecycle=lifecycle, occupier=occupier),                         tempfile.TemporaryDirectory() as tmp:
+                    work = Path(tmp)
+                    etc = work / 'etc'
+                    var = work / 'var'
+                    etc.mkdir()
+                    var.mkdir()
+                    (work / 'functions').write_text(
+                        self._definitions(self.REAL.read_text()))
+                    # 暂存路径不预建(luodaoyi R11):postinst 生命周期必须证明
+                    # 安装脚本能把本次向导值发布到原本不存在的暂存路径;
+                    # ensure-cfg 生命周期则预建暂存(验证恢复语义)。
+                    if lifecycle == 'ensure-cfg':
+                        (var / 'wizard-install.env').write_text('HTTP_ADDR="127.0.0.1:9801"\n')
+                    env = dict(os.environ, TEST_DIR=self._shpath(tmp),
+                               SYNOPKG_PKGDEST=self._shpath(tmp),
+                               SYNOPKG_PKGETC=self._shpath(etc),
+                               SYNOPKG_PKGVAR=self._shpath(var),
+                               wizard_port='9801')
+                    if lifecycle == 'ensure-cfg':
+                        body = (
+                            '. "$TEST_DIR/functions"\n'
+                            'CFG_FILE="$TEST_DIR/etc/tad-module.cfg"\n'
+                            'STARTUP_LOG="$TEST_DIR/var/startup-debug.log"\n'
+                            'ensure_cfg\n'
+                            'test ! -f "$CFG_FILE" || exit 114\n'
+                            'test -f "$TEST_DIR/var/wizard-install.env" || exit 115\n'
+                            'exit 0\n'
+                        )
+                        run_env = {k: v for k, v in env.items() if k != 'PATH'}
+                        run_env['PATH'] = '/bin:/usr/bin'
+                        run_env['TEST_DIR'] = env['TEST_DIR']
+                    else:
+                        body = ''
+                        pass
+                    stub_env = self._postinst_env(work)
+                    if lifecycle == 'ensure-cfg':
+                        # 占位在 ensure_cfg 运行途中创建:grep 替身钩子在
+                        # stage 写完、发布未执行时竞争占位
+                        real_grep = shutil.which('grep')
+                        qg = "'" + str(Path(real_grep).resolve()).replace(chr(92), '/') + "'"
+                        if occupier == 'dir':
+                            race = 'mkdir -p "$TEST_DIR/etc/tad-module.cfg"'
+                        else:
+                            race = ('mkdir -p "$TEST_DIR/etc/real.d"; '
+                                    # 防重入:ensure_cfg 有两次校验 grep 调用,
+                                    # 第二次钩子若重复 ln -s 会把已存在的
+                                    # symlink 移入 real.d 产生 real.d/real.d
+                                    # ——污染的是竞争夹具而非发布原语
+                                    '[ -e "$TEST_DIR/etc/tad-module.cfg" ] || '
+                                    'ln -s "$TEST_DIR/etc/real.d" "$TEST_DIR/etc/tad-module.cfg"')
+                        stub_body = ('case "$3" in *tad-module.cfg.tmp*) ' + race + ' ;; esac' + chr(10) +
+                                     f'exec {qg} "$@"')
+                        self._inject_postinst_stub(work, 'grep', stub_body)
+                        ensure_env = {**env, **stub_env}
+                        ensure_env['TEST_DIR'] = env['TEST_DIR']
+                        subprocess.run(['sh', '-ec', body], env=ensure_env,
+                                       check=True, timeout=15)
+                        # 无嵌套条目:占位目录内不得有误入的 stage 链接
+                        if occupier == 'dir':
+                            nested = list((etc / 'tad-module.cfg').iterdir())
+                            self.assertEqual(nested, [],
+                                             f'{lifecycle}/{occupier}: 嵌套条目 {nested}')
+                        else:
+                            nested = list((etc / 'real.d').iterdir())
+                            self.assertEqual(nested, [],
+                                             f'{lifecycle}/{occupier}: 嵌套条目 {nested}')
+                    else:
+                        # postinst 生命周期:占位先建好,postinst 内部 publish
+                        # 时 ln 必失败;用 PATH 内真身(无替身)验证原语本身
+                        if occupier == 'dir':
+                            (etc / 'tad-module.cfg').mkdir()
+                        else:
+                            (etc / 'real.d').mkdir()
+                            try:
+                                (etc / 'tad-module.cfg').symlink_to(etc / 'real.d',
+                                                                    target_is_directory=True)
+                            except OSError:
+                                # Windows 无 symlink 特权:CI Linux 覆盖本场景
+                                self.skipTest('symlink 需要特权(Windows 限制)')
+                        stub_env = self._postinst_env(work)
+                        run_env = {**env, **stub_env}
+                        subprocess.run(['sh', str(self.POSTINST)], env=run_env,
+                                       check=True, timeout=30, capture_output=True)
+                        # 无半份正式 cfg(目录/symlink 占位不被覆盖成文件)
+                        self.assertFalse((etc / 'tad-module.cfg').is_file(),
+                                         f'{lifecycle}/{occupier}: 占位不得被覆盖')
+                        # 无嵌套条目
+                        if occupier == 'dir':
+                            nested = list((etc / 'tad-module.cfg').iterdir())
+                        else:
+                            nested = list((etc / 'real.d').iterdir())
+                        self.assertEqual(nested, [],
+                                         f'{lifecycle}/{occupier}: 嵌套条目 {nested}')
+                        # 暂存原子提交成功(publish_no_replace 对全新暂存目标)
+                        stash = var / 'wizard-install.env'
+                        self.assertTrue(stash.is_file(),
+                                        f'{lifecycle}/{occupier}: 暂存必须存在')
+                        self.assertIn('HTTP_ADDR="127.0.0.1:9801"', stash.read_text())
+
+    def test_wrapper_captures_spm_exec_rejection(self):
+        # set -e 下 spm-exec 非零退出必须仍记录返回码,退出码原样透传
+        # (luodaoyi review #40 第 2 条)。
+        if hasattr(os, 'geteuid') and os.geteuid() == 0:
+            self.skipTest('uid=0 走直接执行分支,不经过 spm-exec')
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            var = work / 'var'
+            var.mkdir()
+            fake = work / 'fake-spm-exec'
+            fake.write_text('#!/bin/sh\necho "rejected: package not enabled" >&2\nexit 42\n')
+            fake.chmod(0o755)
+            env = dict(os.environ, SYNOPKG_PKGDEST=tmp, SYNOPKG_PKGVAR=str(var),
+                       TAD_SPM_EXEC=str(fake))
+            result = subprocess.run(['sh', str(ROOT / 'synology/scripts/start-stop-status'), 'status'],
+                                    env=env, capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 42, result.stderr)
+            log = (var / 'startup-debug.log').read_text()
+            self.assertIn('经 spm-exec 提权转发', log)
+            self.assertIn('spm-exec 返回 42', log)
+
+    @unittest.skipUnless(shutil.which('node'), 'node unavailable')
+    def test_desktop_window_config_passthrough(self):
+        # 桌面窗口 config 透传(luodaoyi review #40):AppWindow 构造函数必须
+        # 保留 DSM 传入的身份字段(appInstance 等)并透传父类。
+        subprocess.run(['node', str(ROOT / 'scripts/test-tadmodule-window.js')],
+                       check=True, timeout=30)
 
 
 if __name__ == '__main__':

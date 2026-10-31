@@ -36,6 +36,12 @@ if [ -z "${SYNOPKG_PKGVAR:-}" ]; then
       ;;
   esac
 fi
+# 与薄壳 start-stop-status 写同一个诊断文件。此前本脚本只引用未定义该变量，
+# set -u 下端口占用预检一触发就死于 unbound variable，提示与日志全落空。
+# 必须在 PKG_VAR 的 @appdata 回退解析完之后再赋值——手动调用(无
+# SYNOPKG_PKGVAR)时目录可能已被回退改写，日志要落进最终运行目录
+# (luodaoyi review #40 第 4 条)。
+STARTUP_LOG="${PKG_VAR}/startup-debug.log"
 BIN="${PKGDEST}/bin/tad-module"
 WEBROOT="${PKGDEST}/ui/static"
 PIDFILE="${PKG_VAR}/tad-module.pid"
@@ -64,6 +70,93 @@ process_identity() {
   boot="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)" || return 1
   [ -n "${start}" ] && [ -n "${boot}" ] || return 1
   printf '%s %s\n' "${start}" "${boot}"
+}
+
+# port_in_use <host:port> 检测目标地址:端口是否真的无法 bind(端口预检)。
+# 地址族感知(luodaoyi review #40 二轮第 1 条):跨地址族(目标 v4/监听 v6
+# 或反之)是不同 socket 域,永可共存——0.0.0.0 通配不妨碍 [::1] 监听;
+# 同族内同址或任一侧通配才冲突。IPv6 通配 :: 对 IPv4 目标的占位取决于
+# net.ipv6.bindv6only(双栈时默认同时占 v4),脚本无法可靠判定,此时不
+# 预判失败,只记诊断(STARTUP_LOG)交由服务实际 bind 定论。
+# netstat 缺失/无输出时返回 1(视为可用),退化为主流程自身 bind 失败报错——
+# 预检只是提前给出可操作提示,最终以实际 bind 为准。
+# 输出 CONFLICT/AMBIGUOUS 行;退出码 0=确认冲突,1=可共存/歧义。
+port_in_use() {
+  want_port="${1##*:}"
+  want_addr="${1%:*}"
+  case "${want_addr}" in
+    localhost) want_addr="127.0.0.1"; want_family=4 ;;
+    \[*\])
+      want_addr="${want_addr#\[}"; want_addr="${want_addr%\]}"
+      case "${want_addr}" in
+        ::ffff:*) want_addr="${want_addr#::ffff:}"; want_family=4 ;;
+        *:*) want_family=6 ;;
+        *) want_family=4 ;;
+      esac
+      ;;
+    *) want_family=4 ;;
+  esac
+  case "${want_addr}" in
+    ""|"*"|"0.0.0.0"|"::") want_wild=1 ;;
+    *) want_wild=0 ;;
+  esac
+  netstat -tln 2>/dev/null | awk -v wp="${want_port}" -v wa="${want_addr}" \
+    -v ww="${want_wild}" -v wf="${want_family}" '
+    $1 == "tcp" || $1 == "tcp6" {
+      listen = 0
+      for (i = 5; i <= NF; i++) if ($i == "LISTEN") { listen = 1; break }
+      if (!listen) next
+      la = $4
+      if (la !~ /:/) next
+      # 端口 = 最后一个冒号之后;地址 = 之前(剥 [])
+      pos = 0
+      for (i = length(la); i >= 1; i--) if (substr(la, i, 1) == ":") { pos = i; break }
+      lport = substr(la, pos + 1)
+      laddr = substr(la, 1, pos - 1)
+      gsub(/[\[\]]/, "", laddr)
+      # tcp6 行的 v4-mapped(::ffff:x,排除 ::ffff:0.0.0.0 形态的歧义写法)
+      # 归一为 IPv4 地址族参与比较
+      if (laddr ~ /^::ffff:[0-9]/) {
+        lfamily = 4; sub(/^::ffff:/, "", laddr)
+      } else if ($1 == "tcp6") {
+        lfamily = 6
+      } else {
+        lfamily = 4
+      }
+      if (lport != wp) next
+      lwild = (laddr == "" || laddr == "*" || laddr == "0.0.0.0" || laddr == "::") ? 1 : 0
+      # IPv6 通配监听对 IPv4 目标:占位取决于 net.ipv6.bindv6only(双栈默认
+      # 同时占 v4),脚本无法可靠判定——不预判失败,记诊断交实际 bind 定论
+      # (luodaoyi review #40 二轮第 1 条)。同族 v6 内该场景仍是冲突,不适用。
+      if (lfamily == 6 && lwild == 1 && wf == 4) {
+        printf "AMBIGUOUS %s\n", la
+        next
+      }
+      # 跨族其余组合(不同 socket 域)永可共存
+      if (lfamily != wf) next
+      # 同族:同址,或恰一侧通配(通配占全族地址),或两侧都通配
+      if (laddr == wa || ww != lwild || (ww == 1 && lwild == 1)) {
+        printf "CONFLICT %s\n", la
+        exit 0
+      }
+      # 同族、两个具体地址不同址:无冲突,继续看下一行
+    }
+  ' | {
+    # AMBIGUOUS 只诊断不拦截;有 CONFLICT 行才判冲突
+    result=1
+    while IFS= read -r line; do
+      case "${line}" in
+        CONFLICT*)
+          echo "$(date '+%Y-%m-%dT%H:%M:%S') 端口预检:${line}" >> "${STARTUP_LOG}" 2>/dev/null || true
+          result=0
+          ;;
+        AMBIGUOUS*)
+          echo "$(date '+%Y-%m-%dT%H:%M:%S') 端口预检:${line}(IPv6 通配对 IPv4 的占位取决于 net.ipv6.bindv6only,不预判,以服务实际 bind 为准)" >> "${STARTUP_LOG}" 2>/dev/null || true
+          ;;
+      esac
+    done
+    return "${result}"
+  }
 }
 
 daemon_pid() {
@@ -133,21 +226,159 @@ ensure_proxy_token() {
   chmod 600 "${PROXY_TOKEN}"
 }
 
+# publish_no_replace <stage> <dest>
+# 三处发布(cfg 提交/暂存提交)统一使用的单一已验证原子 no-replace 原语
+# (CodeRabbit R10):
+#   1. 权限已在 stage 上设好(调用方负责),本函数发布后不再 chmod 终路径;
+#   2. ln(无 -f)=link(2):对已存在的普通文件/符号链接目标内核级原子失败;
+#   3. 目标为「目录或指向目录的符号链接」时,部分 ln 实现会把 stage "移入"
+#      目录(link 目标变为 dst/<basename stage>)——移入即判定发布失败:
+#      竞争占位不是本方该覆盖的对象,且必须精确清理误入的嵌套链接,
+#      不留嵌套条目;
+#   4. 提交成败以结果验证 [ -f dst ](且 dst 未变为目录)为准。
+publish_no_replace() {
+  _pub_stage="$1"
+  _pub_dst="$2"
+  _pub_rc=1
+  if ln "${_pub_stage}" "${_pub_dst}" 2>/dev/null; then
+    if [ -f "${_pub_dst}" ]; then
+      # 正常提交:stage 与终路径同一 inode,unlink stage 保终路径存活
+      rm -f "${_pub_stage}" 2>/dev/null || true
+      _pub_rc=0
+    else
+      # ln 把 stage 移入了目录占位(dst 是目录或目录符号链接):
+      # 精确清理误入的嵌套链接,发布失败
+      rm -f "${_pub_dst}/$(basename "${_pub_stage}")" 2>/dev/null || true
+    fi
+  fi
+  return "${_pub_rc}"
+}
+
 ensure_cfg() {
   # 默认运行参数自愈:postinst 以套件用户跑,etc 被 root 属主时写不进
   # (安装不阻断),这里在 root 语境补齐;已有配置(用户改过)不动
   if [ -f "${CFG_FILE}" ]; then
     return 0
   fi
-  {
-    echo "# tad-module（DSM 版）运行参数；修改后重启套件生效"
-    echo "# 默认桌面嵌入模式：只监听本机回环，由 DSM nginx 反代 /webman/3rdparty/tad-module/ 提供，鉴权走 DSM 登录"
-    echo "# 改成 0.0.0.0:8123 可独立端口访问（启动时会自动生成 Basic 凭据，见 etc/initial-password.txt）"
-    echo 'HTTP_ADDR="127.0.0.1:8123"'
-    echo "# it87 探测参数（仅当系统自带 it87 模块时生效，如 force_id=\"IT8620E\"）"
-    echo 'IT87_FORCE_ID=""'
-  } > "${CFG_FILE}" 2>/dev/null || true
-  chmod 600 "${CFG_FILE}" 2>/dev/null || true
+  # 安装向导选值寄存(postinst 写不进 etc 时暂存在 var):有则沿用,
+  # cfg 完整落盘成功才消费删除;写不进则保留,下次启动重试。
+  # 不 source 暂存文件(CodeRabbit 三轮域外 Major):该文件由套件用户的
+  # postinst 写入,本脚本以 root 运行,source 会执行其中任意 shell——
+  # var 目录一旦被植入内容即 root 提权。只按行提取 HTTP_ADDR 单值。
+  # 单完整记录(luodaoyi 四轮):值必须是「向导支持的地址形式+1-65535 端口」
+  # 的整体校验(127.x/局域网 v4 字面量 或 0.0.0.0 通配 + 合法端口),整个
+  # 暂存文件恰好一条 HTTP_ADDR 记录——重复、额外记录(其他 key)一律整文件
+  # 作废回落默认;非法即忽略。
+  WIZ_ADDR=""
+  WIZ_ENV="${PKG_VAR}/wizard-install.env"
+  if [ -f "${WIZ_ENV}" ]; then
+    wiz_records=0
+    wiz_other=0
+    while IFS= read -r wiz_line || [ -n "${wiz_line}" ]; do
+      # 兼容 CRLF 暂存文件:剥行尾回车符再匹配
+      wiz_line="${wiz_line%$'\r'}"
+      case "${wiz_line}" in
+        "") continue ;;
+        'HTTP_ADDR="'*'"')
+          wiz_records=$((wiz_records + 1))
+          wiz_val="${wiz_line#HTTP_ADDR=\"}"
+          wiz_val="${wiz_val%\"}"
+          wiz_port="${wiz_val##*:}"
+          wiz_host="${wiz_val%:*}"
+          case "${wiz_port}" in
+            ''|*[!0-9]*) continue ;;
+          esac
+          while :; do
+            case "${wiz_port}" in
+              0[0-9]*) wiz_port="${wiz_port#0}" ;;
+              *) break ;;
+            esac
+          done
+          case "${#wiz_port}" in
+            [1-5]) ;;
+            *) continue ;;
+          esac
+          [ "${wiz_port}" -ge 1 ] 2>/dev/null && [ "${wiz_port}" -le 65535 ] 2>/dev/null || continue
+          case "${wiz_host}" in
+            # 向导只产出这两个精确字面值(luodaoyi 五轮:去掉宽泛 127.*,
+            # 恢复侧不得接受未经完整验证的任意回环段地址),据此重建配置
+            127.0.0.1|0.0.0.0) ;;
+            *) continue ;;
+          esac
+          WIZ_ADDR="${wiz_val}"
+          ;;
+        *)
+          # 任何额外记录(非 HTTP_ADDR 赋值行)都不可信:整文件作废
+          wiz_other=$((wiz_other + 1))
+          ;;
+      esac
+    done < "${WIZ_ENV}"
+    # 重复记录或夹带额外内容:签名不符(本套件 postinst 只写单行),整文件
+    # 按不可信处理,回落默认地址
+    if [ "${wiz_records}" -ne 1 ] || [ "${wiz_other}" -ne 0 ]; then
+      echo "$(date '+%Y-%m-%dT%H:%M:%S') ensure_cfg:暂存记录数=${wiz_records} 额外行=${wiz_other},非本套件 postinst 签名,整文件作废" >> "${STARTUP_LOG}" 2>/dev/null || true
+      WIZ_ADDR=""
+    fi
+  fi
+  # 原子提交(luodaoyi 四轮):受信目录内独占创建临时文件(noclobber),
+  # 完整写入并校验关键行,先设权限再经 publish_no_replace 原子 no-replace
+  # 提交;成功才消费暂存——失败保留原暂存、清残 tmp、记真实结果,下次启动
+  # 重试;已有有效配置永不被破坏。
+  final_addr="${WIZ_ADDR:-127.0.0.1:8123}"
+  # 临时文件在受信的目标目录(etc,与 CFG_FILE 同一文件系统)内独占创建
+  # (luodaoyi 五轮:noclobber 防并发残留),创建后验证权限为 0600
+  # (root-only);创建失败不静默——记真实结果,保留暂存待下次重试。
+  CFG_TMP=""
+  for _i in 1 2 3; do
+    _cand="${CFG_FILE}.tmp.$$-$_i"
+    if ( set -o noclobber; umask 077; : > "${_cand}" ) 2>/dev/null; then
+      CFG_TMP="${_cand}"
+      break
+    fi
+  done
+  if [ -n "${CFG_TMP}" ]; then
+    # 双保险:创建时 umask 077,提交前显式 chmod 并以其退出码为准
+    # (stat 读数在部分平台/文件系统上不可靠,chmod 失败才是真不可达)
+    if ! chmod 600 "${CFG_TMP}" 2>/dev/null; then
+      # 无法达到 root-only 权限:不接受该临时文件,放弃本轮(保留暂存)
+      rm -f "${CFG_TMP}" 2>/dev/null || true
+      CFG_TMP=""
+    fi
+  fi
+  if [ -z "${CFG_TMP}" ]; then
+    echo "$(date '+%Y-%m-%dT%H:%M:%S') ensure_cfg:临时文件创建失败或权限不可达,暂存保留待重试 (committed=0)" >> "${STARTUP_LOG}" 2>/dev/null || true
+    return 0
+  fi
+  committed=0
+  if {
+      echo "# tad-module（DSM 版）运行参数；修改后重启套件生效"
+      echo "# 桌面嵌入模式：只监听本机回环，由 DSM nginx 反代 /webman/3rdparty/tad-module/ 提供，鉴权走 DSM 登录"
+      echo "# 独立端口模式：0.0.0.0:端口 对外监听（启动时会自动生成 Basic 凭据，见 etc/initial-password.txt）"
+      echo "HTTP_ADDR=\"${final_addr}\""
+      echo "# it87 探测参数（仅当系统自带 it87 模块时生效，如 force_id=\"IT8620E\"）"
+      echo 'IT87_FORCE_ID=""'
+     } > "${CFG_TMP}" 2>/dev/null \
+     && grep -Fqx "HTTP_ADDR=\"${final_addr}\"" "${CFG_TMP}" \
+     && grep -Fqx 'IT87_FORCE_ID=""' "${CFG_TMP}"; then
+    # 原子 no-replace 发布(CodeRabbit R10:三处发布统一使用单一已验证
+    # 原语 publish_no_replace;权限在 tmp 上设好,发布后不再 chmod 终路径)
+    if publish_no_replace "${CFG_TMP}" "${CFG_FILE}"; then
+      committed=1
+    else
+      echo "$(date '+%Y-%m-%dT%H:%M:%S') ensure_cfg:cfg 已存在(竞争写入者先提交)、目录/symlink 占位或发布失败,不覆盖,暂存保留" >> "${STARTUP_LOG}" 2>/dev/null || true
+    fi
+  fi
+  if [ "${committed}" = "1" ]; then
+    # 提交成功才消费暂存(有向导选值时)
+    if [ -n "${WIZ_ADDR}" ]; then
+      rm -f "${WIZ_ENV}" 2>/dev/null || true
+    fi
+  else
+    # 写入/提交失败:清残缺临时文件,保留原暂存,下次启动重试自愈,记真实结果
+    rm -f "${CFG_TMP}" 2>/dev/null || true
+    echo "$(date '+%Y-%m-%dT%H:%M:%S') ensure_cfg:cfg 写入或提交失败,暂存保留待重试" >> "${STARTUP_LOG}" 2>/dev/null || true
+  fi
+  echo "$(date '+%Y-%m-%dT%H:%M:%S') ensure_cfg 自愈创建 cfg (HTTP_ADDR=${final_addr}, committed=${committed})" >> "${STARTUP_LOG}" 2>/dev/null || true
 }
 
 ensure_nginx() {
@@ -216,16 +447,39 @@ case "${1:-}" in
     [ -x "${BIN}" ] || exit 1
     mkdir -p "${PKG_VAR}"
     rm -f "${PIDFILE}"
-    ensure_power
+    # 先自愈运行参数再预检端口:ensure_cfg 可能按安装向导刚创建 cfg,
+    # 不重读会让预检与 serve 都用脚本顶部的旧默认端口
     ensure_cfg
-    ensure_it87
-    # 旧版默认值迁移：独立端口时代遗留的 ":8123" 改为回环绑定
+    if [ -f "${CFG_FILE}" ]; then
+      # shellcheck disable=SC1090
+      . "${CFG_FILE}" || true
+    fi
+    # 旧版默认值迁移:独立端口时代遗留的 ":8123"(空主机=通配语义)改为
+    # 回环绑定。必须在端口预检之前(CodeRabbit 三轮 Major:否则旧 cfg 为
+    # :8123 时预检按通配判定,LAN 独占监听会被误杀退出,迁移永远执行不到,
+    # 本可成功的升级启动被拦死);迁移后预检与 serve 用同一最终地址
     if [ "${HTTP_ADDR}" = ":8123" ]; then
       HTTP_ADDR="127.0.0.1:8123"
       if [ -f "${CFG_FILE}" ]; then
         sed -i "s|^HTTP_ADDR=.*|HTTP_ADDR=\"${HTTP_ADDR}\"|" "${CFG_FILE}" 2>/dev/null || true
       fi
     fi
+    # 端口占用预检:bind 失败是「无法启动」的高频根因(RR 引导/Docker 容器/
+    # 其他套件占用 8123),提前给出可操作提示而不是让守护进程默默退出
+    if port_in_use "${HTTP_ADDR}"; then
+      {
+        echo "$(date '+%Y-%m-%dT%H:%M:%S') 启动失败:${HTTP_ADDR} 已被其他进程占用"
+        echo "占用者(供排查):"
+        netstat -tlnp 2>/dev/null | grep ":${HTTP_ADDR##*:}[[:space:]]" || netstat -tln 2>/dev/null | grep ":${HTTP_ADDR##*:}[[:space:]]"
+        echo "处置:编辑 ${CFG_FILE} 把 HTTP_ADDR 改成其他端口(如 127.0.0.1:8231),并同步修改"
+        echo "      ${NGINX_CONF} 里 proxy_pass 的端口后重启套件;或停掉占用该端口的进程/容器"
+      } >> "${STARTUP_LOG}" 2>/dev/null || true
+      echo "启动失败:${HTTP_ADDR} 端口已被其他进程占用(常见于 Docker 容器映射或 RR 组件)。" >&2
+      echo "处置:改 ${CFG_FILE} 的 HTTP_ADDR 端口后重启套件。详细: ${STARTUP_LOG}" >&2
+      exit 1
+    fi
+    ensure_power
+    ensure_it87
     AUTH_ARGS=""
     if is_loopback_addr "${HTTP_ADDR}"; then
       ensure_nginx || true
@@ -252,14 +506,20 @@ case "${1:-}" in
     }
     printf '%s %s\n' "${pid}" "${identity}" > "${PIDFILE}"
     # 就绪探测：进程在启动窗口内退出（如 CPU 不支持）要报失败，
-    # 否则 DSM 会把套件标成已启动。
+    # 否则 DSM 会把套件标成已启动。失败原因同时落盘（DSM 弹窗只有笼统文案）。
     i=0
     while [ "${i}" -lt 8 ]; do
       sleep 1
       if ! kill -0 "$(daemon_pid)" 2>/dev/null; then
         rm -f "${PIDFILE}"
+        {
+          echo "$(date '+%Y-%m-%dT%H:%M:%S') 守护进程在就绪窗口内退出 (exit 探测第 ${i} 秒)"
+          echo "---- 守护进程日志尾部 ----"
+          tail -n 10 "${LOGFILE}" 2>/dev/null || true
+        } >> "${STARTUP_LOG}" 2>/dev/null || true
         echo "tad-module 在启动阶段退出，最近日志："
         tail -n 5 "${LOGFILE}" 2>/dev/null || true
+        echo "详细诊断: ${STARTUP_LOG}" >&2
         exit 1
       fi
       i=$((i + 1))

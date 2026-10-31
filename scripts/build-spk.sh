@@ -27,6 +27,15 @@ fi
 mkdir -p "${PROJECT_ROOT}/.cache/go-build" "${PROJECT_ROOT}/.cache/go-tmp" "${STAGE}"
 cd "${PROJECT_ROOT}"
 
+# 探测顺序:PATH 中的 go → 本机常见安装路径(/c/Users/<user>/sdk/go*,与
+# scripts/build.sh 的本地构建环境一致)→ docker 回落
+if ! command -v go >/dev/null 2>&1; then
+  for candidate in /c/Users/*/sdk/go*/bin; do
+    [ -x "${candidate}/go" ] && PATH="${candidate}:${PATH}" && break
+  done
+  export PATH
+fi
+
 if command -v go >/dev/null 2>&1; then
   export GOCACHE="${PROJECT_ROOT}/.cache/go-build" GOTMPDIR="${PROJECT_ROOT}/.cache/go-tmp"
   GO() { go "$@"; }
@@ -103,7 +112,36 @@ if ! tar tzvf "${STAGE}/root/package.tgz" | grep -E '^-r.x' | grep -q ' bin/tad-
   echo "==> 宿主 tar 丢了执行位（MSYS 常见），改用 docker 重打 package.tgz"
   rm -f "${STAGE}/root/package.tgz"
   MSYS_NO_PATHCONV=1 docker run --rm -v "${DOCKER_SRC}:/src" \
-    -w /src/.cache/spk-stage/payload golang:1.25 tar czf ../root/package.tgz bin ui app
+    -w /src/.cache/spk-stage/payload golang:1.25 tar czf ../root/package.tgz bin ui app || true
+fi
+# docker 回退后仍无执行位（Docker 不在线等），用 python tarfile 兜底：
+# 权限按规则显式设置——目录与 bin/ 下可执行 0755,其余 0644
+if ! tar tzvf "${STAGE}/root/package.tgz" 2>/dev/null | grep -E '^-r.x' | grep -q ' bin/tad-module$'; then
+  echo "==> docker 不可用,改用 python tarfile 重打 package.tgz（显式权限）"
+  rm -f "${STAGE}/root/package.tgz"
+  python - "${STAGE}/payload" "${STAGE}/root/package.tgz" <<'PYEOF'
+import os, stat, sys, tarfile
+payload, out = sys.argv[1], sys.argv[2]
+with tarfile.open(out, "w:gz") as tf:
+    for top in ("bin", "ui", "app"):
+        base = os.path.join(payload, top)
+        for root, dirs, files in os.walk(base):
+            for name in sorted(dirs):
+                p = os.path.join(root, name)
+                ti = tf.gettarinfo(p, arcname=os.path.relpath(p, payload))
+                ti.mode = 0o755
+                tf.addfile(ti)
+            for name in sorted(files):
+                p = os.path.join(root, name)
+                # Windows python 的 relpath/walk 产生反斜杠,归一后再匹配前缀
+                rel = os.path.relpath(p, payload).replace(os.sep, "/")
+                ti = tf.gettarinfo(p, arcname=rel)
+                ti.mode = 0o755 if rel.startswith("bin/") else 0o644
+                ti.uid = ti.gid = 0
+                with open(p, "rb") as f:
+                    tf.addfile(ti, f)
+print("python tarfile 打包完成")
+PYEOF
 fi
 tar tzvf "${STAGE}/root/package.tgz" | grep -E '^-r.x' | grep -q ' bin/tad-module$' || {
   echo "package.tgz 的 bin/tad-module 缺执行位" >&2
@@ -126,15 +164,24 @@ mv "${STAGE}/root/INFO.tmp" "${STAGE}/root/INFO"
 echo "checksum=\"${CHECKSUM_MD5}\"" >> "${STAGE}/root/INFO"
 cp -r "${PROJECT_ROOT}/synology/scripts" "${STAGE}/root/scripts"
 cp -r "${PROJECT_ROOT}/synology/conf" "${STAGE}/root/conf"
+cp -r "${PROJECT_ROOT}/synology/WIZARD_UIFILES" "${STAGE}/root/WIZARD_UIFILES"
 # 归一 LF：Windows 工作区可能带入 CRLF，DSM 的 sh 解析不了 \r
-find "${STAGE}/root/scripts" "${STAGE}/root/conf" -type f -exec sed -i 's/\r$//' {} +
+find "${STAGE}/root/scripts" "${STAGE}/root/conf" "${STAGE}/root/WIZARD_UIFILES" -type f -exec sed -i 's/\r$//' {} +
 chmod 755 "${STAGE}/root/scripts"/*
+# 安装向导 JSON 必须合法（DSM 按 JSON 渲染向导页，畸形会装不出来/空白）；
+# 显式 utf-8：Windows python 默认 cp936 读 ⚠️/中文会直接 UnicodeDecodeError
+for wf in "${STAGE}"/root/WIZARD_UIFILES/*uifile; do
+  python -c "import json,sys; json.load(open(sys.argv[1], encoding='utf-8'))" "${wf}" || {
+    echo "安装向导 JSON 非法: ${wf}" >&2
+    exit 1
+  }
+done
 cp "${PROJECT_ROOT}/app/ui/images/icon_64.png" "${STAGE}/root/PACKAGE_ICON.PNG"
 cp "${PROJECT_ROOT}/app/ui/images/icon_256.png" "${STAGE}/root/PACKAGE_ICON_256.PNG"
 
 echo "==> 打 SPK"
 tar cf "${PROJECT_ROOT}/${SPK_NAME}" -C "${STAGE}/root" \
-  INFO package.tgz scripts conf PACKAGE_ICON.PNG PACKAGE_ICON_256.PNG
+  INFO package.tgz scripts conf WIZARD_UIFILES PACKAGE_ICON.PNG PACKAGE_ICON_256.PNG
 # 生命周期脚本必须带执行位（同 MSYS 失效问题）
 for s in preinst postinst preuninst postuninst preupgrade postupgrade start-stop-status real-start-stop-status; do
   tar tvf "${PROJECT_ROOT}/${SPK_NAME}" | grep -E "^-r.x" | grep -q " scripts/${s}\$" || {
@@ -142,6 +189,10 @@ for s in preinst postinst preuninst postuninst preupgrade postupgrade start-stop
     exit 1
   }
 done
+tar tf "${PROJECT_ROOT}/${SPK_NAME}" | grep -q "^WIZARD_UIFILES/install_uifile$" || {
+  echo "SPK 内缺 WIZARD_UIFILES/install_uifile（安装向导）" >&2
+  exit 1
+}
 (cd "${PROJECT_ROOT}" && sha256sum "${SPK_NAME}" > "${SPK_NAME}.sha256")
 
 echo "==> 完成: ${PROJECT_ROOT}/${SPK_NAME}"

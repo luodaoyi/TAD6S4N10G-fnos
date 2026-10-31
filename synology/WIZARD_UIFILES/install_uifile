@@ -1,0 +1,55 @@
+[
+  {
+    "step_title": "⚠️本软件需要root授权",
+    "items": [
+      {
+        "desc": "<b>⚠️本软件需要root授权</b>：温度、功耗（RAPL）、风扇 PWM、SMART、GPIO 按键都是直接访问硬件的 root 通路。"
+      },
+      {
+        "desc": "DSM 7 禁止第三方套件直接以 root 运行，请先安装并激活 <b>SimplePermissionManager</b>（SPM）；安装本套件后还须在 SPM 界面的 <b>Package 标签勾选启用 tad-module</b>，否则套件无法启动（启动失败会写入 var/startup-debug.log）。"
+      },
+      {
+        "desc": "SPM：<a href=\"https://github.com/XPEnology-Community/SimplePermissionManager\" target=\"_blank\">github.com/XPEnology-Community/SimplePermissionManager</a>"
+      }
+    ]
+  },
+  {
+    "step_title": "访问方式与端口",
+    "items": [
+      {
+        "type": "singleselect",
+        "desc": "选择访问方式（安装后也可改 etc/tad-module.cfg 的 HTTP_ADDR）：",
+        "subitems": [
+          {
+            "key": "wizard_embed_mode",
+            "desc": "<b>桌面嵌入模式（推荐）</b>：仅监听本机回环，经 DSM 桌面图标访问，鉴权走 DSM 登录，不额外对外开放端口。",
+            "defaultValue": true
+          },
+          {
+            "key": "wizard_standalone_mode",
+            "desc": "<b>独立端口模式</b>：监听 0.0.0.0:端口，浏览器直接访问 http://NAS:端口 ，用自动生成的 Basic 凭据登录（未启用 TLS，凭据明文传输，仅建议受信内网使用）。",
+            "defaultValue": false
+          }
+        ]
+      },
+      {
+        "type": "textfield",
+        "desc": "服务端口（1-65535，建议 1024 以上；端口被其他程序占用时套件会启动失败，届时改这里或 cfg 后重启即可）：",
+        "subitems": [
+          {
+            "key": "wizard_port",
+            "desc": "端口号",
+            "defaultValue": "8123",
+            "validator": {
+              "allowBlank": false,
+              "regex": {
+                "expr": "/^0*(6553[0-5]|655[0-2][0-9]|65[0-4][0-9]{2}|6[0-4][0-9]{3}|[1-5][0-9]{4}|[1-9][0-9]{0,3})$/",
+                "errorText": "端口必须是 1-65535 之间的数字"
+              }
+            }
+          }
+        ]
+      }
+    ]
+  }
+]
