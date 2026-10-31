@@ -120,13 +120,16 @@ def check(root, commit_range=None):
         for _, reason in text_issues(name):
             errors.append(name + ': filename: ' + reason)
         path = root / name
-        if path.suffix.lower() in BINARY_SUFFIXES or path.is_dir():
-            continue
         try:
             # Read a symlink's tracked target, never follow it into unrelated files.
-            data = os.fsencode(os.readlink(path)) if path.is_symlink() else path.read_bytes()
-            if not path.is_symlink() and data.startswith((b'\x7fELF', b'\x89PNG\r\n\x1a\n', b'\xff\xd8\xff', b'\x00asm\x01\x00\x00\x00')):
+            if path.is_symlink():
+                data = os.fsencode(os.readlink(path))
+            elif path.suffix.lower() in BINARY_SUFFIXES or path.is_dir():
                 continue
+            else:
+                data = path.read_bytes()
+                if data.startswith((b'\x7fELF', b'\x89PNG\r\n\x1a\n', b'\xff\xd8\xff', b'\x00asm\x01\x00\x00\x00')):
+                    continue
             text = data.decode('utf-8-sig')
         except UnicodeDecodeError as exc:
             errors.append(f'{name}: invalid UTF-8 at byte {exc.start}')

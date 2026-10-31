@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Offline tests for the encoding gate; damaged examples are built at runtime."""
 import importlib.util
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -88,6 +89,27 @@ class EncodingCheck(unittest.TestCase):
             for data in [header[:4], header[:7], bytes([0, 97, 115, 109, 2, 0, 0, 0])]:
                 (root / 'module.wasm').write_bytes(data)
                 self.assertTrue(any('module.wasm' in issue for issue in encoding.check(root)[0]))
+
+    def test_symlink_targets_are_text_regardless_of_name_or_destination(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            def git(*args):
+                return subprocess.check_output(['git', '-C', tmp, *args], stderr=subprocess.DEVNULL)
+            git('init', '-q')
+            os.symlink(b'bad-' + bytes([0xff]), os.fsencode(root / 'link.png'))
+            damaged_directory = 'directory-' + chr(0xfffd)
+            (root / damaged_directory).mkdir()
+            (root / 'directory-link').symlink_to(damaged_directory)
+            (root / 'normal-directory').mkdir()
+            (root / 'normal-directory-link').symlink_to('normal-directory')
+            (root / 'normal.png').symlink_to('outside-this-repository')
+            git('add', '.')
+            git('-c', 'user.name=Encoding Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'test: symlink targets')
+            errors, checked, _ = encoding.check(root)
+            self.assertEqual(len(errors), 2)
+            self.assertTrue(any('link.png: invalid UTF-8' in issue for issue in errors))
+            self.assertTrue(any('directory-link:' in issue and 'replacement' in issue for issue in errors))
+            self.assertEqual(checked, 3, 'valid UTF-8 link targets are checked without following them')
 
     def test_tracked_bytes_names_binary_and_symlink(self):
         with tempfile.TemporaryDirectory() as tmp:
