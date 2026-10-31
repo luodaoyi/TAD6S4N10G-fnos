@@ -36,6 +36,12 @@ if [ -z "${SYNOPKG_PKGVAR:-}" ]; then
       ;;
   esac
 fi
+# 与薄壳 start-stop-status 写同一个诊断文件。此前本脚本只引用未定义该变量，
+# set -u 下端口占用预检一触发就死于 unbound variable，提示与日志全落空。
+# 必须在 PKG_VAR 的 @appdata 回退解析完之后再赋值——手动调用(无
+# SYNOPKG_PKGVAR)时目录可能已被回退改写，日志要落进最终运行目录
+# (luodaoyi review #40 第 4 条)。
+STARTUP_LOG="${PKG_VAR}/startup-debug.log"
 BIN="${PKGDEST}/bin/tad-module"
 WEBROOT="${PKGDEST}/ui/static"
 PIDFILE="${PKG_VAR}/tad-module.pid"
@@ -64,6 +70,46 @@ process_identity() {
   boot="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)" || return 1
   [ -n "${start}" ] && [ -n "${boot}" ] || return 1
   printf '%s %s\n' "${start}" "${boot}"
+}
+
+# port_in_use <host:port> 检测目标地址:端口是否真的无法 bind(端口预检)。
+# 地址感知(luodaoyi review #40 第 3 条):仅当监听地址与目标一致、或任一侧
+# 为通配(0.0.0.0/::/*/空)时才算冲突——其他进程只绑 LAN IP 的同端口时,
+# 回环监听本可共存,不误杀;v4-mapped(::ffff:)归一后比对。
+# netstat 缺失/无输出时返回 1(视为可用),退化为主流程自身 bind 失败报错——
+# 预检只是提前给出可操作提示,最终以实际 bind 为准。
+# 输出形如 "CONFLICT <监听地址:端口>" 的冲突行,退出码 0=冲突 1=可共存。
+port_in_use() {
+  want_port="${1##*:}"
+  want_addr="${1%:*}"
+  case "${want_addr}" in
+    localhost) want_addr="127.0.0.1" ;;
+    \[*\]) want_addr="${want_addr#\[}"; want_addr="${want_addr%\]}" ;;
+  esac
+  case "${want_addr}" in
+    ""|"*"|"0.0.0.0"|"::") want_wild=1 ;;
+    *) want_wild=0 ;;
+  esac
+  netstat -tln 2>/dev/null | awk -v wp="${want_port}" -v wa="${want_addr}" -v ww="${want_wild}" '
+    $1 == "tcp" || $1 == "tcp6" {
+      listen = 0
+      for (i = 5; i <= NF; i++) if ($i == "LISTEN") { listen = 1; break }
+      if (!listen) next
+      la = $4
+      if (la !~ /:/) next
+      # 端口 = 最后一个冒号之后;地址 = 之前(剥 [] 与 ::ffff: 前缀)
+      pos = 0
+      for (i = length(la); i >= 1; i--) if (substr(la, i, 1) == ":") { pos = i; break }
+      lport = substr(la, pos + 1)
+      laddr = substr(la, 1, pos - 1)
+      gsub(/[\[\]]/, "", laddr)
+      sub(/^::ffff:/, "", laddr)
+      if (lport != wp) next
+      if (laddr == "" || laddr == "*" || laddr == "0.0.0.0" || laddr == "::") { printf "CONFLICT %s\n", la; exit 0 }
+      if (ww == 1) { printf "CONFLICT %s\n", la; exit 0 }
+      if (laddr == wa) { printf "CONFLICT %s\n", la; exit 0 }
+    }
+  ' | grep -q "^CONFLICT" || return 1
 }
 
 daemon_pid() {
@@ -139,15 +185,28 @@ ensure_cfg() {
   if [ -f "${CFG_FILE}" ]; then
     return 0
   fi
+  # 安装向导选值寄存(postinst 写不进 etc 时暂存在 var):有则沿用,
+  # cfg 落盘成功即消费删除;写不进则保留,下次启动重试
+  WIZ_ADDR=""
+  WIZ_ENV="${PKG_VAR}/wizard-install.env"
+  if [ -f "${WIZ_ENV}" ]; then
+    # shellcheck disable=SC1090
+    . "${WIZ_ENV}" || true
+    WIZ_ADDR="${HTTP_ADDR:-}"
+  fi
   {
     echo "# tad-module（DSM 版）运行参数；修改后重启套件生效"
-    echo "# 默认桌面嵌入模式：只监听本机回环，由 DSM nginx 反代 /webman/3rdparty/tad-module/ 提供，鉴权走 DSM 登录"
-    echo "# 改成 0.0.0.0:8123 可独立端口访问（启动时会自动生成 Basic 凭据，见 etc/initial-password.txt）"
-    echo 'HTTP_ADDR="127.0.0.1:8123"'
+    echo "# 桌面嵌入模式：只监听本机回环，由 DSM nginx 反代 /webman/3rdparty/tad-module/ 提供，鉴权走 DSM 登录"
+    echo "# 独立端口模式：0.0.0.0:端口 对外监听（启动时会自动生成 Basic 凭据，见 etc/initial-password.txt）"
+    echo "HTTP_ADDR=\"${WIZ_ADDR:-127.0.0.1:8123}\""
     echo "# it87 探测参数（仅当系统自带 it87 模块时生效，如 force_id=\"IT8620E\"）"
     echo 'IT87_FORCE_ID=""'
   } > "${CFG_FILE}" 2>/dev/null || true
   chmod 600 "${CFG_FILE}" 2>/dev/null || true
+  if [ -n "${WIZ_ADDR}" ] && [ -f "${CFG_FILE}" ]; then
+    rm -f "${WIZ_ENV}" 2>/dev/null || true
+  fi
+  echo "$(date '+%Y-%m-%dT%H:%M:%S') ensure_cfg 自愈创建 cfg (HTTP_ADDR=${WIZ_ADDR:-127.0.0.1:8123})" >> "${STARTUP_LOG}" 2>/dev/null || true
 }
 
 ensure_nginx() {
@@ -216,8 +275,28 @@ case "${1:-}" in
     [ -x "${BIN}" ] || exit 1
     mkdir -p "${PKG_VAR}"
     rm -f "${PIDFILE}"
-    ensure_power
+    # 先自愈运行参数再预检端口:ensure_cfg 可能按安装向导刚创建 cfg,
+    # 不重读会让预检与 serve 都用脚本顶部的旧默认端口
     ensure_cfg
+    if [ -f "${CFG_FILE}" ]; then
+      # shellcheck disable=SC1090
+      . "${CFG_FILE}" || true
+    fi
+    # 端口占用预检:bind 失败是「无法启动」的高频根因(RR 引导/Docker 容器/
+    # 其他套件占用 8123),提前给出可操作提示而不是让守护进程默默退出
+    if port_in_use "${HTTP_ADDR}"; then
+      {
+        echo "$(date '+%Y-%m-%dT%H:%M:%S') 启动失败:${HTTP_ADDR} 已被其他进程占用"
+        echo "占用者(供排查):"
+        netstat -tlnp 2>/dev/null | grep ":${HTTP_ADDR##*:}[[:space:]]" || netstat -tln 2>/dev/null | grep ":${HTTP_ADDR##*:}[[:space:]]"
+        echo "处置:编辑 ${CFG_FILE} 把 HTTP_ADDR 改成其他端口(如 127.0.0.1:8231),并同步修改"
+        echo "      ${NGINX_CONF} 里 proxy_pass 的端口后重启套件;或停掉占用该端口的进程/容器"
+      } >> "${STARTUP_LOG}" 2>/dev/null || true
+      echo "启动失败:${HTTP_ADDR} 端口已被其他进程占用(常见于 Docker 容器映射或 RR 组件)。" >&2
+      echo "处置:改 ${CFG_FILE} 的 HTTP_ADDR 端口后重启套件。详细: ${STARTUP_LOG}" >&2
+      exit 1
+    fi
+    ensure_power
     ensure_it87
     # 旧版默认值迁移：独立端口时代遗留的 ":8123" 改为回环绑定
     if [ "${HTTP_ADDR}" = ":8123" ]; then
@@ -252,14 +331,20 @@ case "${1:-}" in
     }
     printf '%s %s\n' "${pid}" "${identity}" > "${PIDFILE}"
     # 就绪探测：进程在启动窗口内退出（如 CPU 不支持）要报失败，
-    # 否则 DSM 会把套件标成已启动。
+    # 否则 DSM 会把套件标成已启动。失败原因同时落盘（DSM 弹窗只有笼统文案）。
     i=0
     while [ "${i}" -lt 8 ]; do
       sleep 1
       if ! kill -0 "$(daemon_pid)" 2>/dev/null; then
         rm -f "${PIDFILE}"
+        {
+          echo "$(date '+%Y-%m-%dT%H:%M:%S') 守护进程在就绪窗口内退出 (exit 探测第 ${i} 秒)"
+          echo "---- 守护进程日志尾部 ----"
+          tail -n 10 "${LOGFILE}" 2>/dev/null || true
+        } >> "${STARTUP_LOG}" 2>/dev/null || true
         echo "tad-module 在启动阶段退出，最近日志："
         tail -n 5 "${LOGFILE}" 2>/dev/null || true
+        echo "详细诊断: ${STARTUP_LOG}" >&2
         exit 1
       fi
       i=$((i + 1))

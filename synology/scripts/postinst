@@ -98,19 +98,62 @@ log "auth step done"
 # 一律不碰 /usr/local；写不进时同样顺延（启动脚本会按需自愈）。
 log "cfg step: begin"
 CFG_FILE="${PKG_ETC}/tad-module.cfg"
+
+# 安装向导选值：DSM 7 的 WIZARD_UIFILES/install_uifile 把 subitems 的 key 作为
+# 环境变量传入安装脚本。singleselect 传 true/false（wizard_embed_mode /
+# wizard_standalone_mode），textfield 传端口号（wizard_port）。静默安装/升级
+# 时向导变量为空——一律回落默认嵌入模式 8123，行为与旧版一致。
+WIZ_PORT="${wizard_port:-8123}"
+case "${WIZ_PORT}" in
+  ""|*[!0-9]*) WIZ_PORT="8123" ;;
+esac
+# 规范化十进制(luodaoyi review #40 第 5 条):先剥前导零、限长 ≤5 位,
+# 再做范围校验——超长纯数字会让 test 的整数比较直接报错(条件语境按假处理),
+# 反而绕过回落逻辑。覆盖:前导零、超长数字、0、65535、65536、非数字。
+while :; do
+  case "${WIZ_PORT}" in
+    0[0-9]*) WIZ_PORT="${WIZ_PORT#0}" ;;
+    *) break ;;
+  esac
+done
+case "${#WIZ_PORT}" in
+  [1-5]) ;;
+  *) WIZ_PORT="8123" ;;
+esac
+if [ "${WIZ_PORT}" -lt 1 ] || [ "${WIZ_PORT}" -gt 65535 ]; then
+  log "向导端口 ${WIZ_PORT} 越界，回落 8123"
+  WIZ_PORT="8123"
+fi
+if [ "${wizard_standalone_mode:-false}" = "true" ]; then
+  WIZ_HTTP_ADDR="0.0.0.0:${WIZ_PORT}"
+else
+  WIZ_HTTP_ADDR="127.0.0.1:${WIZ_PORT}"
+fi
+log "wizard: embed=${wizard_embed_mode:-unset} standalone=${wizard_standalone_mode:-unset} port=${WIZ_PORT} -> HTTP_ADDR=${WIZ_HTTP_ADDR}"
+
 if [ ! -f "${CFG_FILE}" ]; then
   if {
     echo "# tad-module（DSM 版）运行参数；修改后重启套件生效"
-    echo "# 默认桌面嵌入模式：只监听本机回环，由 DSM nginx 反代 /webman/3rdparty/tad-module/ 提供，鉴权走 DSM 登录"
-    echo "# 改成 0.0.0.0:8123 可独立端口访问（启动时会自动生成 Basic 凭据，见 etc/initial-password.txt）"
-    echo 'HTTP_ADDR="127.0.0.1:8123"'
+    echo "# 桌面嵌入模式：只监听本机回环，由 DSM nginx 反代 /webman/3rdparty/tad-module/ 提供，鉴权走 DSM 登录"
+    echo "# 独立端口模式：0.0.0.0:端口 对外监听（启动时会自动生成 Basic 凭据，见 etc/initial-password.txt）"
+    echo "HTTP_ADDR=\"${WIZ_HTTP_ADDR}\""
     echo "# it87 探测参数（仅当系统自带 it87 模块时生效，如 force_id=\"IT8620E\"）"
     echo 'IT87_FORCE_ID=""'
   } > "${CFG_FILE}" 2>/dev/null; then
     chmod 600 "${CFG_FILE}" 2>/dev/null || true
+    log "cfg written: HTTP_ADDR=${WIZ_HTTP_ADDR}"
   else
-    log "cfg 不可写(root 属主?),首次启动由服务脚本自愈"
+    # etc 不可写（root 属主）时把向导选值寄存在 var（运行目录套件用户必可写），
+    # 首次 root 启动的 ensure_cfg 自愈时会读取应用——向导选的端口不能静默丢
+    if printf 'HTTP_ADDR="%s"\n' "${WIZ_HTTP_ADDR}" > "${PKG_VAR}/wizard-install.env" 2>/dev/null; then
+      chmod 600 "${PKG_VAR}/wizard-install.env" 2>/dev/null || true
+      log "cfg 不可写(root 属主?),向导选值暂存 var/wizard-install.env"
+    else
+      log "cfg 不可写(root 属主?),首次启动由服务脚本自愈为默认端口"
+    fi
   fi
+else
+  log "cfg 已存在(升级/重装),保留用户配置,不套用向导端口"
 fi
 log "cfg step done, postinst ok"
 
