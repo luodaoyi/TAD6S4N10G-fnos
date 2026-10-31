@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -17,6 +17,16 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate UTF-8 encoding
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python3 scripts/test-encoding.py
+          python3 scripts/check-encoding.py
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -75,7 +85,6 @@ jobs:
           TAD_SPK_VERSION="${VERSION}" bash scripts/build-spk.sh
           test -s "tad-module-v${VERSION}.spk"
           test -s "tad-module-v${VERSION}.spk.sha256"
-          echo "SPK_NAME=tad-module-v${VERSION}.spk" >> "${GITHUB_ENV}"
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
@@ -88,9 +97,8 @@ jobs:
             tad-module-v*.spk.sha256
           if-no-files-found: error
 
-      # GITHUB_TOKEN-created releases do not chain workflow_run/release
-      # listeners, so attach tank here atomically instead of relying on
-      # tank-build.yml's release:created trigger.
+      # Build tank without write permission; the tag-only release job publishes
+      # all assets together instead of chaining another release listener.
       - name: Build tank (linux/amd64, static)
         if: github.ref_type == 'tag'
         run: |
@@ -98,11 +106,59 @@ jobs:
             go build -trimpath -ldflags "-s -w" -o tank-linux-amd64 ./debian-tui/tank.go
           test -s tank-linux-amd64
 
-      - name: Publish GitHub Release
+      - name: Upload tank artifact
         if: github.ref_type == 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tank-${{ github.run_id }}
+          path: tank-linux-amd64
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: github.ref_type == 'tag' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # Only data from this successful tag build crosses into the write job.
+      # No checkout, source scripts, compiled binaries, or cache restore here.
+      - name: Download packages from this run
+        uses: actions/download-artifact@v4
+        with:
+          name: tad-module-${{ github.run_id }}
+          path: dist
+
+      - name: Download tank from this run
+        uses: actions/download-artifact@v4
+        with:
+          name: tank-${{ github.run_id }}
+          path: dist
+
+      - name: Verify release assets
+        working-directory: dist
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "${GITHUB_REF_NAME}" =~ ^v[0-9A-Za-z][0-9A-Za-z.+_-]*$ ]] || exit 1
+          SPK_NAME="tad-module-${GITHUB_REF_NAME}.spk"
+          for asset in tad-module.fpk tad-module.fpk.sha256 "${SPK_NAME}" "${SPK_NAME}.sha256" tank-linux-amd64; do
+            if [[ ! -f "${asset}" || -L "${asset}" || ! -s "${asset}" ]]; then
+              echo "Missing, empty, or symbolic-link release asset: ${asset}" >&2
+              exit 1
+            fi
+          done
+          sha256sum -c tad-module.fpk.sha256
+          sha256sum -c "${SPK_NAME}.sha256"
+
+      - name: Publish GitHub Release
+        working-directory: dist
         env:
+          GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
+          SPK_NAME="tad-module-${GITHUB_REF_NAME}.spk"
           if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
             # Preserve an existing prerelease until its assets have been verified.
             # Never replace existing assets silently.
