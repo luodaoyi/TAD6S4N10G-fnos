@@ -15,6 +15,29 @@ spec.loader.exec_module(encoding)
 
 
 class EncodingCheck(unittest.TestCase):
+    def test_index_paths_do_not_follow_parent_directory_symlinks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, outside = Path(tmp) / 'repo', Path(tmp) / 'outside'
+            root.mkdir()
+            encoding.git(root, 'init', '-q')
+            (root / 'directory').mkdir()
+            (root / 'directory/file.txt').write_text('正常中文', encoding='utf-8')
+            encoding.git(root, 'add', '.')
+            encoding.git(root, '-c', 'user.name=Encoding Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'test: nested file')
+            alternate = root / '.git/alternate-index'
+            alternate.write_bytes((root / '.git/index').read_bytes())
+            (root / 'directory').rename(outside)
+            (outside / 'file.txt').write_text(chr(0xfffd), encoding='utf-8')
+            (root / 'directory').symlink_to(outside, target_is_directory=True)
+            original_read = Path.read_bytes
+            def read_without_traversal(path):
+                self.assertNotEqual(path, root / 'directory/file.txt', 'must reject before reading through a directory symlink')
+                return original_read(path)
+            with patch.object(Path, 'read_bytes', read_without_traversal):
+                for index in [None, Path('.git/alternate-index')]:
+                    errors = encoding.check(root, index_file=index)[0]
+                    self.assertTrue(any('directory/file.txt:' in issue and 'directory symlink' in issue for issue in errors))
+
     def test_explicit_alternate_index_includes_its_tracked_files(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

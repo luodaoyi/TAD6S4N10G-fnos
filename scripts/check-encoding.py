@@ -128,6 +128,11 @@ def check(root, commit_range=None, index_file=None):
             errors.append(name + ': filename: ' + reason)
         path = root / name
         try:
+            # Inspect parents from the root outward, before following any link.
+            if any((root / parent).is_symlink()
+                   for parent in reversed(Path(name).parents) if parent != Path('.')):
+                errors.append(name + ': cannot inspect tracked path through directory symlink')
+                continue
             # Read a symlink's tracked target, never follow it into unrelated files.
             if path.is_symlink():
                 data = os.fsencode(os.readlink(path))
