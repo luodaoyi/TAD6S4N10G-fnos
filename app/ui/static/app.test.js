@@ -3430,3 +3430,82 @@ test('BIOS 在线检查重复触发只有一个轮询，任务刷新不提前启
   app.resolve('renderFirmwareJob')({ kind: 'bios', state: 'running', logs: [] });
   assert.equal(app.element('bios-online-check').disabled, true);
 });
+
+test('head bootstrap scripts are same-origin and ordered around the stylesheet', () => {
+  const html = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
+  const head = html.match(/<head>([\s\S]*?)<\/head>/)[1];
+  const scripts = [...head.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/g)];
+  assert.equal(scripts.length, 2);
+  const names = ['theme-boot.js', 'style-heal.js'];
+  scripts.forEach((script, index) => {
+    const src = script[1].match(/^ src="([a-z-]+\.js)\?v=[^"]+"$/);
+    assert.equal(src?.[1], names[index]);
+    assert.equal(script[2].trim(), '');
+    assert.ok(fs.statSync(path.join(__dirname, names[index])).isFile());
+  });
+  const stylesheet = head.indexOf('<link rel="stylesheet" href="styles.css?');
+  assert.ok(scripts[0].index < stylesheet && stylesheet < scripts[1].index);
+});
+
+test('external theme bootstrap keeps the parent and system theme fallbacks', () => {
+  const boot = fs.readFileSync(path.join(__dirname, 'theme-boot.js'), 'utf8');
+  for (const [stored, parent, system, expected] of [
+    ['light', 'dark', true, 'light'],
+    ['auto', 'dark', false, 'dark'],
+    ['invalid', 'invalid', true, 'dark'],
+    [null, 'inaccessible', false, 'light'],
+  ]) {
+    const document = {
+      documentElement: { dataset: {} },
+      querySelector() { return { setAttribute(name, value) { assert.equal(name, 'content'); this.value = value; document.color = value; } }; },
+    };
+    const window = {
+      get parent() {
+        if (parent === 'inaccessible') throw new Error('cross origin');
+        return { document: { body: { getAttribute: () => parent } } };
+      },
+      matchMedia: () => ({ matches: system }),
+    };
+    vm.runInNewContext(boot, { window, document, localStorage: { getItem: () => stored } });
+    assert.equal(document.documentElement.dataset.theme, expected);
+    assert.equal(document.color, expected === 'dark' ? '#141519' : '#f3f4f6');
+  }
+});
+
+test('external style bootstrap reloads stale CSS once and leaves healthy CSS untouched', async () => {
+  const boot = fs.readFileSync(path.join(__dirname, 'style-heal.js'), 'utf8');
+  for (const [css, alreadyHealed, reload] of [
+    ['/* old stylesheet */', false, true],
+    ['/* old stylesheet */', true, false],
+    ['--chart-grid-line: #fff;', false, false],
+  ]) {
+    const href = 'https://host.test/webman/3rdparty/tad-module/styles.css?v=version';
+    const link = { href, dataset: alreadyHealed ? { healed: '1' } : {} };
+    let calls = 0;
+    const fetch = async (url, options) => {
+      calls++;
+      assert.equal(url, href);
+      assert.equal(options.cache, 'reload');
+      return { text: async () => css };
+    };
+    vm.runInNewContext(boot, { window: { fetch }, fetch, document: { querySelector: () => link }, Date: { now: () => 123 } });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(calls, 1);
+    assert.equal(link.href, reload ? href.replace('version', '123') : href);
+  }
+});
+
+test('power status displays absent RAPL without replacing working readings', () => {
+  const app = loadAppContext();
+  const render = (status) => app.resolve('render')(status, true);
+  const text = (id) => app.element(id).textContent;
+  render({ supported: true, power_supported: false });
+  assert.equal(text('current-pl1'), '平台不支持 RAPL');
+  assert.equal(text('current-pl2'), '平台不支持 RAPL');
+  assert.equal(text('health'), '运行正常');
+  render({ power_supported: true, packages: [{ has_pl1: true, pl1_w: 15 }] });
+  assert.equal(text('current-pl1'), '15 W');
+  assert.equal(text('current-pl2'), '不可用');
+  render({});
+  assert.equal(text('current-pl1'), '不可用');
+});

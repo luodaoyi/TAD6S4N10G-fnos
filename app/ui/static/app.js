@@ -6907,8 +6907,9 @@ function render(status, keepInputs = false) {
     : 'CPU 核心最高';
   $('cpu-display-temperature').textContent = formatTemperature(cpuTemperature.display_c, cpuTemperature.available);
   $('package-temperature').textContent = formatTemperature(cpuTemperature.package_max_c, Number(cpuTemperature.package_sensors) > 0);
-  $('current-pl1').textContent = pkg.has_pl1 ? `${pkg.pl1_w} W` : '不可用';
-  $('current-pl2').textContent = pkg.has_pl2 ? `${pkg.pl2_w} W` : '不可用';
+  const powerUnavailable = status.power_supported === false ? '平台不支持 RAPL' : '不可用';
+  $('current-pl1').textContent = pkg.has_pl1 ? `${pkg.pl1_w} W` : powerUnavailable;
+  $('current-pl2').textContent = pkg.has_pl2 ? `${pkg.pl2_w} W` : powerUnavailable;
   renderFanRPMs(fanStatus);
   $('profile').textContent = status.profile?.display || '不支持';
   $('temperature-source').textContent = cpuTemperature.display_source === 'core_max_rr'

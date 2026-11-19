@@ -19,6 +19,9 @@ import (
 
 const stateVersion = 1
 
+// ErrNoRAPL is an absent platform capability, not a failed power write.
+var ErrNoRAPL = errors.New("no Intel RAPL package power zone was found")
+
 var ErrOriginalStateCPUMismatch = errors.New("original state CPU model does not match current CPU")
 
 type Profile struct {
@@ -209,6 +212,7 @@ type Status struct {
 	CPUModel          string               `json:"cpu_model"`
 	Profile           Profile              `json:"profile"`
 	Supported         bool                 `json:"supported"`
+	PowerSupported    bool                 `json:"power_supported"`
 	Config            Config               `json:"config"`
 	EffectiveMaxPL1W  int64                `json:"effective_max_pl1_w"`
 	EffectiveMaxPL2W  int64                `json:"effective_max_pl2_w"`
@@ -1023,10 +1027,20 @@ func (m *Manager) validateGlobalLocked(cfg Config) error {
 	if cfg.PL2W < cfg.PL1W || cfg.PL2W > profile.MaxPL2 {
 		return fmt.Errorf("PL2 must be at least PL1 and no more than %dW for %s", profile.MaxPL2, profile.Display)
 	}
+	if !cfg.Enabled {
+		return nil
+	}
 	packages, err := m.DiscoverPackages()
+	if errors.Is(err, ErrNoRAPL) {
+		return nil
+	}
 	if err != nil {
 		return err
 	}
+	return validatePowerPackages(cfg, packages)
+}
+
+func validatePowerPackages(cfg Config, packages []Package) error {
 	for _, pkg := range packages {
 		if pkg.Long == nil {
 			return fmt.Errorf("%s has no long_term RAPL constraint", pkg.Name)
@@ -1042,15 +1056,25 @@ func (m *Manager) validateGlobalLocked(cfg Config) error {
 }
 
 func (m *Manager) DiscoverPackages() ([]Package, error) {
-	patterns := []string{
-		m.rooted("/sys/devices/virtual/powercap/intel-rapl/intel-rapl:*"),
-		m.rooted("/sys/class/powercap/intel-rapl:*"),
+	roots := []string{
+		m.rooted("/sys/devices/virtual/powercap/intel-rapl"),
+		m.rooted("/sys/class/powercap"),
 	}
 	seen := make(map[string]bool)
 	var packages []Package
-	for _, pattern := range patterns {
-		paths, _ := filepath.Glob(pattern)
-		for _, path := range paths {
+	for _, root := range roots {
+		entries, err := os.ReadDir(root)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read RAPL capability directory %s: %w", root, err)
+		}
+		for _, entry := range entries {
+			if !strings.HasPrefix(entry.Name(), "intel-rapl:") {
+				continue
+			}
+			path := filepath.Join(root, entry.Name())
 			resolved, err := filepath.EvalSymlinks(path)
 			if err != nil {
 				resolved = path
@@ -1059,7 +1083,10 @@ func (m *Manager) DiscoverPackages() ([]Package, error) {
 				continue
 			}
 			name, err := readTrim(filepath.Join(path, "name"))
-			if err != nil || !strings.HasPrefix(name, "package-") {
+			if err != nil {
+				return nil, fmt.Errorf("read RAPL zone %s: %w", path, err)
+			}
+			if !strings.HasPrefix(name, "package-") {
 				continue
 			}
 			pkg := Package{Path: path, Name: name}
@@ -1088,7 +1115,7 @@ func (m *Manager) DiscoverPackages() ([]Package, error) {
 		}
 	}
 	if len(packages) == 0 {
-		return nil, errors.New("no Intel RAPL package power zone was found")
+		return nil, ErrNoRAPL
 	}
 	sort.Slice(packages, func(i, j int) bool { return packages[i].Name < packages[j].Name })
 	return packages, nil
@@ -1109,7 +1136,15 @@ func (m *Manager) applyLocked(cfg Config) error {
 
 func (m *Manager) applyPowerLocked(cfg Config) error {
 	packages, err := m.DiscoverPackages()
+	if errors.Is(err, ErrNoRAPL) {
+		return nil
+	}
 	if err != nil {
+		return err
+	}
+	// Validate this exact discovery snapshot: sysfs may change after the
+	// earlier config validation (for example while a driver is loading).
+	if err := validatePowerPackages(cfg, packages); err != nil {
 		return err
 	}
 	if err := m.captureOriginalLocked(packages); err != nil {
@@ -1322,9 +1357,12 @@ func (m *Manager) Status() Status {
 	}
 	status.Serial = m.serialStatusLocked(cfg.Serials)
 	packages, err := m.DiscoverPackages()
-	if err != nil {
+	if errors.Is(err, ErrNoRAPL) {
+		// No RAPL is a normal capability downgrade, independent of CPU support.
+	} else if err != nil {
 		status.LastError = combineError(status.LastError, err)
 	} else {
+		status.PowerSupported = true
 		status.EffectiveMaxPL1W = profile.MaxPL1
 		status.EffectiveMaxPL2W = profile.MaxPL2
 		for _, pkg := range packages {
