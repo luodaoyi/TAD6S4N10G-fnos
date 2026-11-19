@@ -8,25 +8,55 @@
 #
 # 用户前置流程：安装并「激活」SPM → 安装本套件 → SPM 的 Package 标签勾选
 # 启用 tad-module → 启动本套件。
+#
+# 诊断（PR#39 后新增，DSM 7.2.1 用户反馈启动失败排查）：所有失败路径都会把
+# 原因与运行上下文写入套件 var 目录的 startup-debug.log——DSM 套件中心的
+# 失败弹窗只有笼统文案，stderr 会被吞掉，这个文件是排障的事实来源。
 set -eu
 
 PKG="tad-module"
 HERE="$(CDPATH= cd -- "$(dirname "$0")" && pwd)"
 REAL="${HERE}/real-start-stop-status"
 
+# 日志位置：DSM 调用时 SYNOPKG_PKGVAR 指向运行数据目录（套件用户可写）；
+# 手动调用时按 /var/packages/<pkg>/var 惯例推导（只为记录，失败不影响主流程）。
+PKG_VAR_LOG="${SYNOPKG_PKGVAR:-/var/packages/${PKG}/var}"
+STARTUP_LOG="${PKG_VAR_LOG}/startup-debug.log"
+
+log() {
+  mkdir -p "${PKG_VAR_LOG}" 2>/dev/null || true
+  echo "$(date '+%Y-%m-%dT%H:%M:%S') [start-stop-status] $*" >> "${STARTUP_LOG}" 2>/dev/null || true
+}
+
 if [ "$(id -u)" = "0" ]; then
+  log "action=$1 uid=0 → 直接执行 real 脚本"
   exec sh "${REAL}" "$@"
 fi
 
-SPM_EXEC="/usr/local/bin/spm-exec"
+# TAD_SPM_EXEC 仅测试注入用(luodaoyi review #40:隔离测试 mock spm-exec);
+# 生产路径恒为 SPM 的 setuid 入口
+SPM_EXEC="${TAD_SPM_EXEC:-/usr/local/bin/spm-exec}"
+log "action=$1 uid=$(id -u) spm-exec=$([ -x "${SPM_EXEC}" ] && echo present || echo missing) SYNOPKG_PKGDEST=${SYNOPKG_PKGDEST:-unset} SYNOPKG_PKGVAR=${SYNOPKG_PKGVAR:-unset}"
+
 if [ ! -x "${SPM_EXEC}" ]; then
-  echo "本套件需要 root 权限（功耗/风扇/GPIO/SMART 硬件通路），而 DSM 7 禁止第三方套件直接以 root 运行。" >&2
+  log "失败:spm-exec 不存在——SPM 未安装或未启用提权入口"
+  echo "⚠️本软件需要root授权：功耗/风扇/GPIO/SMART 是硬件 root 通路，而 DSM 7 禁止第三方套件直接以 root 运行。" >&2
   echo "请按顺序操作：" >&2
   echo "  1. 套件中心安装 SimplePermissionManager 并打开其界面点 Active 激活" >&2
   echo "     （https://github.com/XPEnology-Community/SimplePermissionManager）" >&2
   echo "  2. 在 SPM 界面的 Package 标签勾选启用 ${PKG}" >&2
   echo "  3. 回到套件中心启动本套件" >&2
+  echo "详细诊断: ${STARTUP_LOG}" >&2
   exit 1
 fi
 
-exec "${SPM_EXEC}" sh "${REAL}" "$@"
+# 不用 exec：spm-exec 拒绝授权（Package 未勾选/uid 变化）时退出码非 0，
+# 把拒绝事实落盘——这是 7.2.1 反馈「启动失败」最高频的原因。
+# set -e 下直接顺序调用会在非零退出时立即终止，rc=$? 与日志都执行不到
+# （luodaoyi review #40 第 2 条）：用 || rc=$? 在条件语境捕获原退出码，
+# 拒绝时日志确实落盘、退出码原样透传给 DSM。
+log "经 spm-exec 提权转发（如失败,通常为 SPM Package 标签未勾选本套件）"
+rc=0
+"${SPM_EXEC}" sh "${REAL}" "$@" || rc=$?
+log "spm-exec 返回 ${rc}"
+exit ${rc}

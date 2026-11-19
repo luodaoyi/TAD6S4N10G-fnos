@@ -58,6 +58,20 @@ GPIO 按键、SMART 读取都是 root 硬件通路。SPM 提供 setuid 入口 `s
 套件信息页）提示需要 root → 检查 SPM 已激活、且 Package 标签已勾选
 tad-module；换端口/参数见下节「运行参数」。
 
+## 安装向导（root 提示 + 端口）
+
+安装时会弹出两步向导（`WIZARD_UIFILES/install_uifile`，DSM 7 原生支持安装时
+手动设置）：
+
+1. **⚠️本软件需要root授权**——功耗/风扇/GPIO/SMART 都是硬件 root 通路，
+   DSM 7 下须经 SPM 提权；这一步就是前置条件的最后提醒，装完再想起 SPM
+   是启动失败的最常见原因。
+2. **访问方式与端口**——可选「桌面嵌入模式（推荐，仅回环 + DSM 登录鉴权）」
+   或「独立端口模式（0.0.0.0 对外监听，自动生成 Basic 凭据）」，并填写端口号
+   （默认 8123）。选值在 postinst 落盘到 `etc/tad-module.cfg` 的 `HTTP_ADDR`；
+   升级时向导不再出现，已有 cfg 一律保留。端口被占用时启动会被预检拦下并在
+   `var/startup-debug.log` 给出处置提示（改 cfg 端口后重启套件即可）。
+
 ## root 提权的实现方式
 
 - `conf/privilege` 声明 `run-as: package`——DSM 以套件专属用户运行服务脚本；
