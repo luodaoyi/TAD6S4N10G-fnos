@@ -115,3 +115,55 @@ func TestRAPLCapabilityKeepsHardwareLimits(t *testing.T) {
 		t.Fatalf("invalid apply wrote power: %d %v", got, err)
 	}
 }
+
+func TestApplyRevalidatesNewRAPLSnapshot(t *testing.T) {
+	for _, missingLong := range []bool{true, false} {
+		m, cfg := noRAPLManager(t)
+		cfg.Enabled = true
+		if err := m.Validate(cfg); err != nil {
+			t.Fatal(err)
+		}
+		dir := m.rooted("/sys/class/powercap/intel-rapl:0")
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "name"), []byte("package-0"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if !missingLong {
+			for name, value := range map[string]string{"constraint_0_name": "long_term", "constraint_0_power_limit_uw": "15000000", "constraint_0_max_power_uw": "10000000"} {
+				if err := os.WriteFile(filepath.Join(dir, name), []byte(value), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		state := OriginalState{Version: stateVersion, CPUModel: "Intel(R) Core(TM) i3-N305", Packages: []OriginalPackage{{Name: "package-0", LongUW: 15000000}}}
+		if err := writeJSONAtomic(m.StatePath, state, 0600); err != nil {
+			t.Fatal(err)
+		}
+		err := m.applyPowerLocked(cfg)
+		if err == nil {
+			t.Fatal("newly appeared invalid RAPL snapshot accepted")
+		}
+		if missingLong && !strings.Contains(err.Error(), "no long_term") {
+			t.Fatalf("wrong error: %v", err)
+		}
+		if !missingLong && !strings.Contains(err.Error(), "hardware long-term maximum") {
+			t.Fatalf("wrong error: %v", err)
+		}
+	}
+}
+
+func TestRAPLDiscoveryDirectoryErrorsAreNotAbsence(t *testing.T) {
+	m, _ := noRAPLManager(t)
+	parent := m.rooted("/sys/class")
+	if err := os.MkdirAll(parent, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(parent, "powercap"), []byte("not a directory"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.DiscoverPackages(); err == nil || errors.Is(err, ErrNoRAPL) {
+		t.Fatalf("directory I/O failure hidden: %v", err)
+	}
+}

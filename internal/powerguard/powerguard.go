@@ -1037,6 +1037,10 @@ func (m *Manager) validateGlobalLocked(cfg Config) error {
 	if err != nil {
 		return err
 	}
+	return validatePowerPackages(cfg, packages)
+}
+
+func validatePowerPackages(cfg Config, packages []Package) error {
 	for _, pkg := range packages {
 		if pkg.Long == nil {
 			return fmt.Errorf("%s has no long_term RAPL constraint", pkg.Name)
@@ -1052,15 +1056,25 @@ func (m *Manager) validateGlobalLocked(cfg Config) error {
 }
 
 func (m *Manager) DiscoverPackages() ([]Package, error) {
-	patterns := []string{
-		m.rooted("/sys/devices/virtual/powercap/intel-rapl/intel-rapl:*"),
-		m.rooted("/sys/class/powercap/intel-rapl:*"),
+	roots := []string{
+		m.rooted("/sys/devices/virtual/powercap/intel-rapl"),
+		m.rooted("/sys/class/powercap"),
 	}
 	seen := make(map[string]bool)
 	var packages []Package
-	for _, pattern := range patterns {
-		paths, _ := filepath.Glob(pattern)
-		for _, path := range paths {
+	for _, root := range roots {
+		entries, err := os.ReadDir(root)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read RAPL capability directory %s: %w", root, err)
+		}
+		for _, entry := range entries {
+			if !strings.HasPrefix(entry.Name(), "intel-rapl:") {
+				continue
+			}
+			path := filepath.Join(root, entry.Name())
 			resolved, err := filepath.EvalSymlinks(path)
 			if err != nil {
 				resolved = path
@@ -1126,6 +1140,11 @@ func (m *Manager) applyPowerLocked(cfg Config) error {
 		return nil
 	}
 	if err != nil {
+		return err
+	}
+	// Validate this exact discovery snapshot: sysfs may change after the
+	// earlier config validation (for example while a driver is loading).
+	if err := validatePowerPackages(cfg, packages); err != nil {
 		return err
 	}
 	if err := m.captureOriginalLocked(packages); err != nil {
