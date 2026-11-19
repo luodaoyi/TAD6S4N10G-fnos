@@ -5,50 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#f3f4f6">
   <title>TAD6S4N模块</title>
-  <script>
-    // 首帧引导：与 app.js currentThemeMode() 同口径归一化存储值（非法值归
-    // auto），跟随档优先读 fnOS 父窗口 body[theme-mode]（同源内嵌时），
-    // 不可读再退 prefers-color-scheme，避免首帧闪错色。
-    // theme-color 与 styles.css 的 --bg 同值：手机浏览器地址栏等宿主外壳
-    // 取该色，跟随明暗同步，深色页面下不再顶条闪白。
-    (function () {
-      function parentThemeMode() {
-        try {
-          var parent = window.parent;
-          if (parent === window || !parent.document || !parent.document.body) return '';
-          var mode = (parent.document.body.getAttribute('theme-mode') || '').trim().toLowerCase();
-          return mode === 'dark' || mode === 'light' ? mode : '';
-        } catch (error) { return ''; /* 父窗口跨域不可读 */ }
-      }
-      try {
-        var mode = localStorage.getItem('tad-theme');
-        if (mode !== 'dark' && mode !== 'light' && mode !== 'auto') mode = 'auto';
-        var theme = mode;
-        if (mode === 'auto') {
-          theme = parentThemeMode() || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
-        }
-        document.documentElement.dataset.theme = theme;
-        var themeColor = document.querySelector('meta[name="theme-color"]');
-        if (themeColor) themeColor.setAttribute('content', theme === 'dark' ? '#141519' : '#f3f4f6');
-      } catch (error) { /* localStorage 不可用时跟随系统 */ }
-    })();
-  </script>
+  <script src="theme-boot.js?v=0.10.76"></script>
   <link rel="stylesheet" href="styles.css?v=0.10.76">
-  <script>
-    // 样式自愈：升级包后浏览器可能仍持有带长缓存的远古样式表（无 CSS 变量，
-    // 表现为图表坐标线消失、文字变黑、主题切换无反应）。绕过缓存拉取服务端
-    // 现行 styles.css，缺少主题变量标记则把引用换成一次性地址强制刷新。
-    (function () {
-      if (!window.fetch) return;
-      var link = document.querySelector('link[rel="stylesheet"][href*="styles.css"]');
-      if (!link) return;
-      fetch(link.href, { cache: 'reload' }).then(function (res) { return res.text(); }).then(function (text) {
-        if (text.indexOf('chart-grid-line') !== -1 || link.dataset.healed === '1') return;
-        link.dataset.healed = '1';
-        link.href = link.href.replace(/([?&])v=[^&]*/, '$1v=' + Date.now());
-      }).catch(function () { /* 网络失败时保持现状 */ });
-    })();
-  </script>
+  <script src="style-heal.js?v=0.10.76"></script>
 </head>
 <body>
   <main class="shell">

@@ -82,7 +82,7 @@ chmod 755 "${STAGE}/payload/bin/tad-module"
 # 静态资源打时间戳进包，不改动工作区文件（build.sh 是改完再还原，这里直接改暂存副本）
 mkdir -p "${STAGE}/payload/ui"
 cp -r "${PROJECT_ROOT}/app/ui/static" "${STAGE}/payload/ui/static"
-sed -i "s/styles\.css?v=[^\"]*/styles.css?v=${CACHE_VERSION}/g; s/app\.js?v=[^\"]*/app\.js?v=${CACHE_VERSION}/g" \
+sed -i "s/styles\.css?v=[^\"]*/styles.css?v=${CACHE_VERSION}/g; s/app\.js?v=[^\"]*/app\.js?v=${CACHE_VERSION}/g; s/theme-boot\.js?v=[^\"]*/theme-boot.js?v=${CACHE_VERSION}/g; s/style-heal\.js?v=[^\"]*/style-heal.js?v=${CACHE_VERSION}/g" \
   "${STAGE}/payload/ui/static/index.html"
 # DSM 桌面应用注册（app/config 框架应用型 + 多尺寸图标；spksrc/SPM 同机制）
 mkdir -p "${STAGE}/payload/app/images"

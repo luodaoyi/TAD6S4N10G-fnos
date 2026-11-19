@@ -21,7 +21,7 @@ CACHE_VERSION="${VERSION}"
 if [[ "${VERSION}" =~ ^0\.0\.[0-9]+$ ]]; then
   CACHE_VERSION="${VERSION}-$(date -u +%Y%m%d%H%M%S)"
 fi
-sed -i "s/styles\.css?v=[^\"]*/styles.css?v=${CACHE_VERSION}/g; s/app\.js?v=[^\"]*/app.js?v=${CACHE_VERSION}/g" "${INDEX_HTML}"
+sed -i "s/styles\.css?v=[^\"]*/styles.css?v=${CACHE_VERSION}/g; s/app\.js?v=[^\"]*/app.js?v=${CACHE_VERSION}/g; s/theme-boot\.js?v=[^\"]*/theme-boot.js?v=${CACHE_VERSION}/g; s/style-heal\.js?v=[^\"]*/style-heal.js?v=${CACHE_VERSION}/g" "${INDEX_HTML}"
 
 mkdir -p "${PROJECT_ROOT}/app/bin" "${PROJECT_ROOT}/app/ui/images" "${PROJECT_ROOT}/.cache/go-build" "${PROJECT_ROOT}/.cache/go-tmp"
 
