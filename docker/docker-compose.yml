@@ -1,0 +1,33 @@
+services:
+  tad-module:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        GOPROXY: "https://proxy.golang.org,direct"   # 代理设置，不需要可删除
+    image: tad-module:local
+    container_name: tad-module
+    restart: unless-stopped
+    privileged: true
+    ports:
+      - "8123:8123"
+    volumes:
+      - tad-data:/data
+      - /sys:/sys:rw
+      - /dev:/dev:rw
+      - /proc:/proc:rw
+    environment:
+      - TAD_USERNAME=admin
+
+  # 一次性编译 it87.ko（显式 --profile build 才运行，不常驻）
+  it87-build:
+    image: buildpack-deps:bookworm
+    profiles: ["build"]
+    working_dir: /src
+    command: make KERNEL_BUILD=/usr/src/linux-headers IT87_CFLAGS="-Wno-error -Wno-implicit-fallthrough"
+    volumes:
+      - /usr/src/linux-headers:/usr/src/linux-headers:ro   # 内核头文件目录，按需修改
+      - ../app/it87-src:/src
+
+volumes:
+  tad-data:

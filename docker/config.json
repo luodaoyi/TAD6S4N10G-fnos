@@ -1,0 +1,30 @@
+{
+  "enabled": false,
+  "pl1_w": 6,
+  "pl2_w": 15,
+  "reapply_seconds": 30,
+  "fan": {
+    "enabled": false
+  },
+  "gpio": {
+    "version": 1,
+    "enabled": true,
+    "storage_notify": true,
+    "feedback": true,
+    "power_chime": true,
+    "buttons": [
+      {
+        "id": "copy",
+        "actions": { "short": "none", "hold_3s": "none", "hold_9s": "none", "hold_15s": "none" }
+      },
+      {
+        "id": "network",
+        "actions": { "short": "refresh_sdcard", "hold_3s": "none", "hold_9s": "none", "hold_15s": "none" }
+      },
+      {
+        "id": "rear_reset",
+        "actions": { "short": "none", "hold_3s": "none", "hold_9s": "none", "hold_15s": "none" }
+      }
+    ]
+  }
+}
