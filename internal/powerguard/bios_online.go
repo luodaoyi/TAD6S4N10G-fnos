@@ -379,21 +379,14 @@ func (m *Manager) StartBIOSOnlineCheck() bool {
 	m.biosOnline = biosOnlineCache{status: status}
 	m.firmwareMu.Unlock()
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
-		defer cancel()
-		m.CheckBIOSOnline(ctx)
-		// 清标志与最终快照发布在同一锁段:保证观察者看到 Checking=false
-		// 时必然已可见 biosOnlineRunning=false,否则「结束后应允许再次
-		// 启动」存在窗口——CheckBIOSOnline 先 publish 完结快照,defer 再
-		// 清标志,观察者恰在两步之间重试会被误拒(此前 CI 偶发)。
 		defer func() {
 			m.firmwareMu.Lock()
-			final := m.biosOnline.status
-			final.Checking = false
-			m.biosOnline = biosOnlineCache{status: final}
 			m.biosOnlineRunning = false
 			m.firmwareMu.Unlock()
 		}()
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+		defer cancel()
+		m.CheckBIOSOnline(ctx)
 	}()
 	return true
 }
