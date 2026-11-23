@@ -212,11 +212,11 @@ cp "$FAKE_ELF" app/bin/tad-module
         except (OSError, sp.TimeoutExpired):
             return None
 
-    @staticmethod
-    def _postinst_env(work):
+    @classmethod
+    def _postinst_env(cls, work):
         # luodaoyi review #40 二轮第 2 条:postinst 测试绝不继承宿主 PATH——
-        # 沙箱 bin/ 里放记录型替身(modprobe/grep/tr/head),被调用即留痕,
-        # 绝不碰宿主内核模块或 /proc、/dev/urandom。
+        # 沙箱 bin-stubs/ 里放记录型替身(modprobe/grep/tr/head),被调用即
+        # 留痕,绝不碰宿主内核模块或 /proc、/dev/urandom。
         stubs = work / 'bin-stubs'
         stubs.mkdir(parents=True, exist_ok=True)
         log = work / 'host-calls.log'
@@ -242,6 +242,16 @@ cp "$FAKE_ELF" app/bin/tad-module
                         dst.chmod(0o755)
                     except OSError:
                         pass
+        # R12:发布走后端 publish 子命令——真实构建的 linux/amd64 二进制放
+        # PKGDEST/bin(BIN 解析位置);非 linux 宿主无法执行目标平台 ELF,
+        # 调用方按 sys.platform 门控 skip(CI Linux 实跑)。
+        binpath = cls._ensure_publish_binary()
+        if binpath:
+            bin_dst = work / 'bin/tad-module'
+            bin_dst.parent.mkdir(parents=True, exist_ok=True)
+            if not bin_dst.exists():
+                shutil.copyfile(binpath, bin_dst)
+                bin_dst.chmod(0o755)
         return {
             'PATH': str(stubs) + ':' + '/bin:/usr/bin',
             'TAD_HOST_CALLS': str(log),
