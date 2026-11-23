@@ -50,9 +50,7 @@ CFG="${PKG_ETC}/config.json"
 AUTH="${PKG_ETC}/web-auth.json"
 PROXY_TOKEN="${PKG_ETC}/proxy-token"
 BASE_PATH="/webman/3rdparty/${PKG}"
-# 反代配置目录可用环境变量覆盖(隔离测试注入临时目录,luodaoyi R13);
-# 生产不设该变量,恒走 DSM 标准路径
-NGINX_CONF_DIR="${TAD_NGINX_CONF_DIR:-/usr/local/etc/nginx/conf.d}"
+NGINX_CONF_DIR="/usr/local/etc/nginx/conf.d"
 # 真机教训（SA6400/RR）：DSM 的 nginx 按模式 conf.d/dsm.*.conf 收纳 server 块内
 # 规则，文件名不带 dsm. 前缀不会被加载；location 必须带 ^~（正则优先级更高，
 # DSM 有 ~ /api/ 与 ~* \.css|.js 的全局规则会截胡页面资源与 API 路径）

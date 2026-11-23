@@ -414,7 +414,8 @@ printf '%s' "$STARTUP_LOG"
         if not Path('/proc/self/stat').exists():
             self.skipTest('/proc 不可用(Windows 本机),CI Linux 覆盖')
         for idx, (cfg_addr, netstat_line, expect_pass, final_addr) in enumerate(scenarios):
-            with self.subTest(cfg=cfg_addr, netstat=netstat_line),                     tempfile.TemporaryDirectory() as tmp:
+            with self.subTest(cfg=cfg_addr, netstat=netstat_line), \
+                 tempfile.TemporaryDirectory() as tmp:
                 work = Path(tmp)
                 (work / 'etc').mkdir()
                 (work / 'var').mkdir()
@@ -422,12 +423,27 @@ printf '%s' "$STARTUP_LOG"
                 pkg_bin.mkdir()
                 cfg_text = 'HTTP_ADDR="' + cfg_addr + '"\nIT87_FORCE_ID=""\n'
                 (work / 'etc/tad-module.cfg').write_text(cfg_text)
-                (work / 'functions').write_text(
-                    self._definitions(self.REAL.read_text()))
+                # luodaoyi R14:生产脚本目录常量必须固定——测试用脚本副本,
+                # 只 sed 替换 NGINX_CONF_DIR 唯一常量行到私有临时目录并校验
+                # 恰替换一处;其余逻辑仍走真实 start,生产文件不动。
+                real_text = self.REAL.read_text()
+                old_line = 'NGINX_CONF_DIR="/usr/local/etc/nginx/conf.d"'
+                new_line = 'NGINX_CONF_DIR="' + self._shpath(work / 'nginx-conf.d') + '"'
+                self.assertEqual(real_text.count(old_line), 1,
+                                 '生产脚本 NGINX_CONF_DIR 常量行必须恰有一处')
+                script_copy = work / 'real-start-stop-status-test'
+                script_copy.write_text(real_text.replace(old_line, new_line, 1))
+                script_copy.chmod(0o755)
+                # 替换校验:副本里不得再残留生产目录常量,且新常量恰一处
+                copy_text = script_copy.read_text()
+                self.assertNotIn(old_line, copy_text)
+                self.assertEqual(copy_text.count(new_line), 1)
+                (work / 'functions').write_text(self._definitions(real_text))
                 # 假守护进程必须是真实 ELF:daemon_pid 校验 /proc/<pid>/exe
                 # 等于 BIN 且 cmdline 第 2 段为 serve——sh 脚本的 exe 是解释
-                # 器,过不了校验(此前就绪探测从未真实通过)。10 行 C:记录
-                # --http 参数后常驻。
+                # 器,过不了校验(此前就绪探测从未真实通过)。记录 --http 参数
+                # 后常驻;luodaoyi R14:自限寿命(alarm 120s 到点自杀),即使
+                # 测试崩溃/未执行清理也不会留下进程。
                 mock_src = work / 'mock-daemon.c'
                 mock_src.write_text(r'''
 #include <stdio.h>
@@ -435,6 +451,7 @@ printf '%s' "$STARTUP_LOG"
 #include <string.h>
 #include <unistd.h>
 int main(int argc, char **argv) {
+    alarm(120);
     const char *cap = getenv("CAPTURE");
     for (int i = 1; i < argc - 1; i++) {
         if (strcmp(argv[i], "--http") == 0 && cap) {
@@ -461,15 +478,12 @@ int main(int argc, char **argv) {
                            SYNOPKG_PKGETC=self._shpath(work / 'etc'),
                            SYNOPKG_PKGVAR=self._shpath(work / 'var'),
                            TAD_NETSTAT_OUT=netstat_line,
-                           TAD_NGINX_CONF_DIR=self._shpath(work / 'nginx-conf.d'),
                            CAPTURE=str(work / 'captured-http'))
                 stub_env = self._postinst_env(work)
-                # netstat/nginx 替身:生产脚本按 PATH 调 netstat -tln 与
+                # netstat/nginx 替身:副本脚本按 PATH 调 netstat -tln 与
                 # nginx(ensure_nginx 的 -t/reload);输出由环境变量注入。
-                # luodaoyi R13:正向场景原来会摸宿主 /usr/local 的 nginx
-                # 配置目录并可能 reload 系统 nginx——配置目录经
-                # TAD_NGINX_CONF_DIR 指进临时目录,nginx 本体替身化,
-                # 宿主系统副作用全隔离
+                # luodaoyi R14:nginx 配置目录已由脚本副本的常量替换指进
+                # 私有临时目录,nginx 本体替身化,宿主系统副作用全隔离
                 stubs = work / 'bin-stubs'
                 netstat_stub = stubs / 'netstat'
                 netstat_stub.write_text('#!/bin/sh\ncase "$1" in -tlnp|-tln) printf \'%s\\n\' "$TAD_NETSTAT_OUT" ;; esac\nexit 0\n')
@@ -482,42 +496,73 @@ int main(int argc, char **argv) {
                 systemctl_stub.write_text('#!/bin/sh\nexit 0\n')
                 systemctl_stub.chmod(0o755)
                 run_env = {**env, **stub_env}
-                # 直接调用生产脚本(经脚本自身的 start 分支);mock daemon
-                # 常驻记录 --http;预检拦截场景脚本 exit 1(预期)
-                proc = subprocess.run(['sh', str(self.REAL), 'start'], env=run_env,
-                                      capture_output=True, text=True, timeout=30)
-                capture = (work / 'captured-http').read_text() if (work / 'captured-http').exists() else ''
-                if expect_pass:
-                    if proc.returncode != 0:
-                        startup_log = (work / 'var/startup-debug.log').read_text() if (work / 'var/startup-debug.log').exists() else ''
-                        self.fail(f'场景{idx}: 正向场景应放行,rc={proc.returncode} stderr={proc.stderr!r} log={startup_log[-500:]!r}')
-                    self.assertEqual(capture, final_addr,
-                                     f'场景{idx}: serve 应收到迁移后地址 {final_addr},实际 {capture!r}')
-                    self.assertTrue(
-                        (work / 'etc/tad-module.cfg').read_text().startswith('HTTP_ADDR="' + final_addr + '"'),
-                        f'场景{idx}: 迁移应写回 cfg')
-                else:
-                    # luodaoyi R13:负向场景三重断言——退出码 1、诊断落盘、
-                    # 无守护进程启动(不能只靠"没捕获到参数")
-                    self.assertEqual(proc.returncode, 1,
-                                     f'场景{idx}: 预检应拦截 exit 1,实际 rc={proc.returncode} capture={capture!r}')
-                    self.assertEqual(capture, '',
-                                     f'场景{idx}: 预检应拦截,daemon 不得收到 --http,实际 {capture!r}')
-                    startup_log = (work / 'var/startup-debug.log').read_text() if (work / 'var/startup-debug.log').exists() else ''
-                    self.assertIn('已被其他进程占用', startup_log,
-                                  f'场景{idx}: 预检诊断必须落盘,日志={startup_log!r}')
-                    self.assertIn(final_addr, startup_log,
-                                  f'场景{idx}: 诊断须含冲突地址 {final_addr}')
-                    pidfile = work / 'var' / 'tad-module.pid'
-                    self.assertFalse(pidfile.exists(),
-                                     f'场景{idx}: 拦截场景不得留下 PID 文件')
-                    self.assertFalse((work / 'var' / 'tad-module.log').exists(),
-                                     f'场景{idx}: 拦截场景守护进程不得启动')
-                # 清理 mock daemon(常驻 sleep 60)
+                # 直接调用副本脚本(经脚本自身的 start 分支);mock daemon
+                # 自限寿命(alarm 120s)+finally 按 PID 回执清理
                 pidfile = work / 'var' / 'tad-module.pid'
-                if pidfile.exists():
-                    pid = pidfile.read_text().split()[0]
-                    subprocess.run(['kill', pid], capture_output=True)
+                receipt = work / 'mock-daemon.pids'
+                proc = None
+                try:
+                    proc = subprocess.run(['sh', str(script_copy), 'start'], env=run_env,
+                                          capture_output=True, text=True, timeout=30)
+                    # PID 回执:启动完成立即快照(业务 stop/清理可能删 PIDFILE)
+                    if pidfile.exists():
+                        try:
+                            receipt.write_text(pidfile.read_text().split()[0] + '\n')
+                        except (IndexError, ValueError, OSError):
+                            pass
+                    capture = (work / 'captured-http').read_text() if (work / 'captured-http').exists() else ''
+                    if expect_pass:
+                        if proc.returncode != 0:
+                            startup_log = (work / 'var/startup-debug.log').read_text() if (work / 'var/startup-debug.log').exists() else ''
+                            self.fail(f'场景{idx}: 正向场景应放行,rc={proc.returncode} stderr={proc.stderr!r} log={startup_log[-500:]!r}')
+                        self.assertEqual(capture, final_addr,
+                                         f'场景{idx}: serve 应收到迁移后地址 {final_addr},实际 {capture!r}')
+                        self.assertTrue(
+                            (work / 'etc/tad-module.cfg').read_text().startswith('HTTP_ADDR="' + final_addr + '"'),
+                            f'场景{idx}: 迁移应写回 cfg')
+                    else:
+                        # luodaoyi R13:负向场景三重断言——退出码 1、诊断落盘、
+                        # 无守护进程启动(不能只靠"没捕获到参数")
+                        self.assertEqual(proc.returncode, 1,
+                                         f'场景{idx}: 预检应拦截 exit 1,实际 rc={proc.returncode} capture={capture!r}')
+                        self.assertEqual(capture, '',
+                                         f'场景{idx}: 预检应拦截,daemon 不得收到 --http,实际 {capture!r}')
+                        startup_log = (work / 'var/startup-debug.log').read_text() if (work / 'var/startup-debug.log').exists() else ''
+                        self.assertIn('已被其他进程占用', startup_log,
+                                      f'场景{idx}: 预检诊断必须落盘,日志={startup_log!r}')
+                        self.assertIn(final_addr, startup_log,
+                                      f'场景{idx}: 诊断须含冲突地址 {final_addr}')
+                        self.assertFalse(pidfile.exists(),
+                                         f'场景{idx}: 拦截场景不得留下 PID 文件')
+                        self.assertFalse((work / 'var' / 'tad-module.log').exists(),
+                                         f'场景{idx}: 拦截场景守护进程不得启动')
+                finally:
+                    # luodaoyi R14:按 PID 回执独立清理——即使断言失败、
+                    # subprocess 超时或业务代码已删 PID 文件,也不留进程。
+                    # PID 回执 = start 成功时立即读出并存独立文件(业务
+                    # 可能 rm PIDFILE);再叠加 PIDFILE 兜底与 bin/ 同目录
+                    # 扫描(cmdline 含本 tmp 路径的一律杀)。
+                    pids = set()
+                    if receipt.exists():
+                        pids.update(receipt.read_text().split())
+                    if pidfile.exists():
+                        try:
+                            pids.add(pidfile.read_text().split()[0])
+                        except (IndexError, ValueError):
+                            pass
+                    for p in list(pids):
+                        subprocess.run(['kill', p], capture_output=True)
+                    # 兜底:进程表扫描——cmdline 引用本 tmp 的残留 mock
+                    try:
+                        scan = subprocess.run(['sh', '-c',
+                            'for d in /proc/[0-9]*; do '
+                            'case "$(tr "\\000" " " < "$d/cmdline" 2>/dev/null)" in '
+                            '*"' + self._shpath(pkg_bin) + '"*) echo "${d#/proc/}" ;; esac; done'],
+                            capture_output=True, text=True, timeout=10)
+                        for p in scan.stdout.split():
+                            subprocess.run(['kill', p], capture_output=True)
+                    except (OSError, subprocess.SubprocessError):
+                        pass
 
     def test_postinst_wizard_port_normalization(self):
         # 发布走后端 publish 子命令(ln 回退已删),linux 二进制是前提:
