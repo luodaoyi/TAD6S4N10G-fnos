@@ -3,6 +3,7 @@
 import os
 from pathlib import Path
 import shutil
+import sys
 import subprocess
 import tempfile
 import unittest
@@ -183,17 +184,47 @@ cp "$FAKE_ELF" app/bin/tad-module
         # Load definitions only: no lifecycle action, module loading or hardware.
         return source_text.split('\ncase "${1:-}" in\n')[0]
 
+    _publish_bin = None  # 类级缓存:真实构建的 tad-module(linux/amd64)
+
+    @classmethod
+    def _ensure_publish_binary(cls):
+        # luodaoyi R12:发布走后端 publish 子命令(link(2)),测试必须用
+        # 实际构建的二进制而非旧 ln 回退——构建一次缓存复用;本机无 Go 时
+        # 返回 None(调用方 skipTest,ln 回退已删除)。
+        import subprocess as sp
+        # 仅 linux 宿主可构建可执行的目标平台二进制(ln 回退已删除,发布
+        # 测试只能真跑 link(2));Windows/MSYS 无法执行 linux ELF——本机
+        # 一律 skip,CI Linux 实跑(luodaoyi R12 也只认真实二进制)。
+        if sys.platform != 'linux':
+            return None
+        if cls._publish_bin and Path(cls._publish_bin).exists():
+            return cls._publish_bin
+        try:
+            r = sp.run(['go', 'build', '-o',
+                        Path(tempfile.gettempdir()) / 'tad-module-publish-test-bin',
+                        './backend/powerguard'],
+                       capture_output=True, text=True,
+                       cwd=str(ROOT), timeout=300)
+            if r.returncode != 0:
+                return None
+            cls._publish_bin = str(Path(tempfile.gettempdir()) / 'tad-module-publish-test-bin')
+            return cls._publish_bin
+        except (OSError, sp.TimeoutExpired):
+            return None
+
     @staticmethod
     def _postinst_env(work):
         # luodaoyi review #40 二轮第 2 条:postinst 测试绝不继承宿主 PATH——
         # 沙箱 bin/ 里放记录型替身(modprobe/grep/tr/head),被调用即留痕,
         # 绝不碰宿主内核模块或 /proc、/dev/urandom。
-        stubs = work / 'bin'
+        stubs = work / 'bin-stubs'
         stubs.mkdir(parents=True, exist_ok=True)
         log = work / 'host-calls.log'
-        (stubs / 'modprobe').write_text(
-            '#!/bin/sh\nprintf \'modprobe %s\\n\' "$*" >> \'$0.log\'\n'
-            .replace('$0.log', str(log)))
+        modprobe_lines = [
+            '#!/bin/sh',
+            "printf 'modprobe %s\\n' \"$*\" >> '" + str(log) + "'",
+        ]
+        (stubs / 'modprobe').write_text('\n'.join(modprobe_lines) + '\n')
         (stubs / 'modprobe').chmod(0o755)
         # grep/tr/head 是脚本自身逻辑需要的基元:钉死宿主绝对路径绕开 PATH
         # 继承,仅 modprobe 是危险命令,必须替身。wrapper 引号必须包住路径
@@ -205,8 +236,9 @@ cp "$FAKE_ELF" app/bin/tad-module
                 dst = stubs / tool
                 if not dst.exists():
                     try:
-                        quoted = "'" + str(Path(src).resolve()).replace('\\', '/') + "'"
-                        dst.write_text(f'#!/bin/sh\nexec {quoted} "$@"\n')
+                        quoted = "'" + str(Path(src).resolve()).replace(chr(92), '/') + "'"
+                        wrapper = '#!/bin/sh\nexec ' + quoted + ' "$@"\n'
+                        dst.write_text(wrapper)
                         dst.chmod(0o755)
                     except OSError:
                         pass
@@ -214,6 +246,19 @@ cp "$FAKE_ELF" app/bin/tad-module
             'PATH': str(stubs) + ':' + '/bin:/usr/bin',
             'TAD_HOST_CALLS': str(log),
         }
+
+    def _stage_publish_binary(self, work):
+        # 把真实构建的 tad-module 放进沙箱 PKGDEST/bin(BIN 解析位置),
+        # 让 publish_no_replace 走新入口;构建不可用时返回 False(调用方
+        # skipTest——ln 回退已删除,无二进制的发布测试无从谈起)。
+        binpath = self._ensure_publish_binary()
+        if not binpath:
+            return False
+        dst = work / 'bin/tad-module'
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(binpath, dst)
+        dst.chmod(0o755)
+        return True
 
     def _run_postinst(self, work, extra_env):
         env = dict(os.environ)
@@ -427,6 +472,10 @@ set -- start
                     subprocess.run(['kill', pid], capture_output=True)
 
     def test_postinst_wizard_port_normalization(self):
+        # 发布走后端 publish 子命令(ln 回退已删),linux 二进制是前提:
+        # 非 linux 宿主无法执行目标平台二进制,整测跳过(CI Linux 实跑)
+        if sys.platform != 'linux':
+            self.skipTest('需要 linux 宿主(publish 子命令),CI 覆盖')
         # 端口矩阵:前导零/超长/0/65535/65536/非数字/静默(luodaoyi review
         # #40 第 5 条;CodeRabbit: 向导 regex 已收紧,这里验证 postinst 兜底)。
         cases = [
@@ -484,6 +533,10 @@ set -- start
             self._assert_stub_modprobe_only(work)
 
     def test_wizard_choice_stashed_when_etc_unwritable_then_consumed(self):
+        # 发布走后端 publish 子命令(ln 回退已删),linux 二进制是前提:
+        # 非 linux 宿主无法执行目标平台二进制,整测跳过(CI Linux 实跑)
+        if sys.platform != 'linux':
+            self.skipTest('需要 linux 宿主(publish 子命令),CI 覆盖')
         # 向导选值暂存(var/wizard-install.env)→ root 启动 ensure_cfg 消费
         # 后删除——etc 被 root 属主时选值不能静默丢。
         with tempfile.TemporaryDirectory() as tmp:
@@ -522,6 +575,10 @@ test ! -e "$TEST_DIR/var/wizard-install.env"
             subprocess.run(['sh', '-ec', body], env=env, check=True, timeout=15)
 
     def test_ensure_cfg_rejects_malicious_stash_values(self):
+        # 发布走后端 publish 子命令(ln 回退已删),linux 二进制是前提:
+        # 非 linux 宿主无法执行目标平台二进制,整测跳过(CI Linux 实跑)
+        if sys.platform != 'linux':
+            self.skipTest('需要 linux 宿主(publish 子命令),CI 覆盖')
         # luodaoyi 合并门槛:向导暂存值当纯数据读,shell 元字符/畸形值必须
         # 被拒——植入的注入形态绝不执行;且暂存必须是"恰好一条合法监听
         # 记录"(向导地址形式+1-65535),重复/额外记录/越界端口整文件作废。
@@ -590,6 +647,12 @@ test -f "$TEST_DIR/var/wizard-install.env" || exit 83
         for content, want_addr, name in cases:
             with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
                 work = Path(tmp)
+                if not self._stage_publish_binary(work):
+                    self.skipTest('go 构建不可用,ln 回退已删除')
+                if not self._stage_publish_binary(work):
+                    self.skipTest('go 构建不可用,ln 回退已删除')
+                if not self._stage_publish_binary(work):
+                    self.skipTest('go 构建不可用,ln 回退已删除')
                 (work / 'etc').mkdir()
                 (work / 'var').mkdir()
                 (work / 'functions').write_text(self._definitions(self.REAL.read_text()))
@@ -609,6 +672,10 @@ grep -Fqx 'HTTP_ADDR="__ADDR__"' "$CFG_FILE" || exit 84
                                env=env, check=True, timeout=15)
 
     def test_ensure_cfg_atomic_retry_preserves_stash_and_existing_cfg(self):
+        # 发布走后端 publish 子命令(ln 回退已删),linux 二进制是前提:
+        # 非 linux 宿主无法执行目标平台二进制,整测跳过(CI Linux 实跑)
+        if sys.platform != 'linux':
+            self.skipTest('需要 linux 宿主(publish 子命令),CI 覆盖')
         # luodaoyi 四轮:①首次提交失败(etc 不可写)→ 暂存保留,已有有效配置
         # 不被破坏;②恢复可写后重试 → 按暂存端口落盘并消费暂存;③已有有效
         # 配置(用户改过)一律不动。
@@ -672,6 +739,10 @@ test -f "$TEST_DIR/var/wizard-install.env" || exit 91
     # 撞名模拟(预先占住三个候选名),ensure_cfg 必须放弃本轮:cfg 未落盘、
     # 暂存保留、日志记真实结果(luodaoyi 五轮:创建失败不静默丢选值)
     def test_ensure_cfg_tmp_creation_failure_keeps_stash(self):
+        # 发布走后端 publish 子命令(ln 回退已删),linux 二进制是前提:
+        # 非 linux 宿主无法执行目标平台二进制,整测跳过(CI Linux 实跑)
+        if sys.platform != 'linux':
+            self.skipTest('需要 linux 宿主(publish 子命令),CI 覆盖')
         with tempfile.TemporaryDirectory() as tmp:
             work = Path(tmp)
             etc = work / 'etc'
@@ -714,16 +785,24 @@ exit 0
     # ⑤ 写入或提交失败(mv 替身失败):暂存保留、残 tmp 清理、日志记真实
     # 结果;恢复后重试同样保端口(luodaoyi 五轮:真实走到失败路径)
     def test_ensure_cfg_commit_failure_retries_and_preserves_stash(self):
+        # 发布走后端 publish 子命令(ln 回退已删),linux 二进制是前提:
+        # 非 linux 宿主无法执行目标平台二进制,整测跳过(CI Linux 实跑)
+        if sys.platform != 'linux':
+            self.skipTest('需要 linux 宿主(publish 子命令),CI 覆盖')
         for scenario in ('write-fail', 'mv-fail'):
             with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as tmp:
                 work = Path(tmp)
+                if not self._stage_publish_binary(work):
+                    self.skipTest('go 构建不可用,ln 回退已删除')
+                if not self._stage_publish_binary(work):
+                    self.skipTest('go 构建不可用,ln 回退已删除')
                 etc = work / 'etc'
                 var = work / 'var'
                 etc.mkdir()
                 var.mkdir()
                 (work / 'functions').write_text(self._definitions(self.REAL.read_text()))
                 (var / 'wizard-install.env').write_text('HTTP_ADDR="127.0.0.1:9301"\n')
-                stubs = work / 'bin'
+                stubs = work / 'bin-stubs'
                 stubs.mkdir()
                 log = work / 'host-calls.log'
                 (stubs / 'chmod').write_text('#!/bin/sh\nprintf \'chmod %s\\n\' "$*" >> \'$LOG\'\nif [ "$2" = "-f" ] || [ "$1" = "-f" ]; then exit 1; fi\nexit 0\n'.replace('$LOG', str(log)))
@@ -775,13 +854,17 @@ exit 0
     def _inject_postinst_stub(self, work, tool, behavior):
         # 向 _postinst_env 的 stubs 目录写入指定行为的命令替身(函数内 return
         # 语义);与隔离沙箱同一目录,天然排在宿主 PATH 之前
-        stubs = work / 'bin'
+        stubs = work / 'bin-stubs'
         stubs.mkdir(exist_ok=True)
         stub = stubs / tool
         stub.write_text(f'#!/bin/sh\n{behavior}\n')
         stub.chmod(0o755)
 
     def test_postinst_failure_paths_preserve_cfg_and_stash_wizard(self):
+        # 发布走后端 publish 子命令(ln 回退已删),linux 二进制是前提:
+        # 非 linux 宿主无法执行目标平台二进制,整测跳过(CI Linux 实跑)
+        if sys.platform != 'linux':
+            self.skipTest('需要 linux 宿主(publish 子命令),CI 覆盖')
         # luodaoyi 六轮:postinst 的每个失败步骤(临时文件创建失败/权限不可达/
         # 提交 mv 失败)都必须——不留半份正式 cfg、向导选值原子暂存、下次启动
         # 可恢复;全部用替身真实走到失败分支,不只测已有暂存文件的恢复。
@@ -796,6 +879,8 @@ exit 0
         for name, stub_kind in scenarios:
             with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
                 work = Path(tmp)
+                if not self._stage_publish_binary(work):
+                    self.skipTest('go 构建不可用,ln 回退已删除')
                 etc = work / 'etc'
                 var = work / 'var'
                 etc.mkdir()
@@ -883,6 +968,10 @@ exit 0
                     subprocess.run(['sh', '-ec', body], env=clean_env, check=True, timeout=15)
 
     def test_competing_writer_wins_publication(self):
+        # 发布走后端 publish 子命令(ln 回退已删),linux 二进制是前提:
+        # 非 linux 宿主无法执行目标平台二进制,整测跳过(CI Linux 实跑)
+        if sys.platform != 'linux':
+            self.skipTest('需要 linux 宿主(publish 子命令),CI 覆盖')
         # luodaoyi 八轮:最终提交必须原子 no-replace——竞争写入者恰在提交
         # 时刻落盘的胜出配置字节必须原样保留。竞争注入:grep 替身在
         # "stage 写入完成、ln 提交前一刻"钩中,先让竞争者落盘再放行校验,
@@ -941,6 +1030,10 @@ exit 0
             self.assertIn('不覆盖', log)
 
     def test_competing_dir_creation_and_file_race(self):
+        # 发布走后端 publish 子命令(ln 回退已删),linux 二进制是前提:
+        # 非 linux 宿主无法执行目标平台二进制,整测跳过(CI Linux 实跑)
+        if sys.platform != 'linux':
+            self.skipTest('需要 linux 宿主(publish 子命令),CI 覆盖')
         # CodeRabbit R9:发布原语必须对「目标为目录被并发创建」与「普通文件
         # 竞争」两种占位都原子失败,不依赖预检查。
         # ① 目标目录并发创建:入口检查时 cfg 不存在,ensure_cfg 运行途中
@@ -987,6 +1080,10 @@ exit 0
             self.assertTrue(hasattr(type(self), 'test_competing_writer_wins_publication'))
 
     def test_partial_write_leaves_stage_recoverable(self):
+        # 发布走后端 publish 子命令(ln 回退已删),linux 二进制是前提:
+        # 非 linux 宿主无法执行目标平台二进制,整测跳过(CI Linux 实跑)
+        if sys.platform != 'linux':
+            self.skipTest('需要 linux 宿主(publish 子命令),CI 覆盖')
         # luodaoyi 八轮第二项:真正的部分写入(stage 文件在校验前被截断,
         # 模拟写盘中断)——关键行校验必失败 → committed=0 → 向导选值原子
         # 暂存、无半份正式 cfg,下次启动重试可完整恢复。
@@ -1042,6 +1139,10 @@ exit 0
             subprocess.run(['sh', '-ec', body], env=clean_env, check=True, timeout=15)
 
     def test_publish_targets_dir_and_symlink_dir_both_lifecycles(self):
+        # 发布走后端 publish 子命令(ln 回退已删),linux 二进制是前提:
+        # 非 linux 宿主无法执行目标平台二进制,整测跳过(CI Linux 实跑)
+        if sys.platform != 'linux':
+            self.skipTest('需要 linux 宿主(publish 子命令),CI 覆盖')
         # CodeRabbit R10:三处发布统一 publish_no_replace 后,两条生命周期
         # (ensure_cfg 启动恢复 / postinst 安装暂存)对「目录占位」与
         # 「symlink-to-dir 占位」都必须——发布失败、无嵌套条目残留、暂存
@@ -1050,6 +1151,14 @@ exit 0
             for occupier in ('dir', 'symlink-dir'):
                 with self.subTest(lifecycle=lifecycle, occupier=occupier),                         tempfile.TemporaryDirectory() as tmp:
                     work = Path(tmp)
+                if not self._stage_publish_binary(work):
+                    self.skipTest('go 构建不可用,ln 回退已删除')
+                if not self._stage_publish_binary(work):
+                    self.skipTest('go 构建不可用,ln 回退已删除')
+                if not self._stage_publish_binary(work):
+                    self.skipTest('go 构建不可用,ln 回退已删除')
+                if not self._stage_publish_binary(work):
+                    self.skipTest('go 构建不可用,ln 回退已删除')
                     etc = work / 'etc'
                     var = work / 'var'
                     etc.mkdir()

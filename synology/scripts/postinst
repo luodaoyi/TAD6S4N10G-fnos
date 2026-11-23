@@ -32,22 +32,17 @@ log() {
 # 失败回退:安装阶段二进制缺失/不可执行时回落 ln+结果验证+移入清理的
 # shell 组合,行为弱化但可用,并如实留痕。
 publish_no_replace() {
-  _pub_stage="$1"
+    _pub_stage="$1"
   _pub_dst="$2"
-  if [ -x "${BIN}" ]; then
-    "${BIN}" publish "${_pub_stage}" "${_pub_dst}" 2>/dev/null
-    return $?
+  # luodaoyi R12:去掉 ln 回退(同 real-start-stop-status);安装阶段 helper
+  # 不可用(异常安装态)时安全地不发布,保留已有配置与可恢复暂存,原因
+  # 写入 postinst-debug.log。
+  if [ ! -x "${BIN}" ]; then
+    log "publish_no_replace:${BIN} 不可执行,安全不发布(helper 缺失),保留已有配置与暂存"
+    return 1
   fi
-  _pub_rc=1
-  if ln "${_pub_stage}" "${_pub_dst}" 2>/dev/null; then
-    if [ -f "${_pub_dst}" ]; then
-      rm -f "${_pub_stage}" 2>/dev/null || true
-      _pub_rc=0
-    else
-      rm -f "${_pub_dst}/$(basename "${_pub_stage}")" 2>/dev/null || true
-    fi
-  fi
-  return "${_pub_rc}"
+  "${BIN}" publish "${_pub_stage}" "${_pub_dst}" 2>/dev/null
+  return $?
 }
 
 # 目录可能由 DSM/历史 root 操作创建而归属 root（本脚本以套件用户运行）：
