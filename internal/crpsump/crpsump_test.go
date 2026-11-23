@@ -1173,13 +1173,14 @@ func TestEnergyShutdownAfterInFlightSample(t *testing.T) {
 	energySampleTick = func(ctx context.Context) <-chan time.Time { return tick1 }
 	defer func() { energySampleTick = oldTick }()
 
-	var sampleMu sync.Mutex
-	var sampledPin float64 = -1
+	// 同步屏障: 观察回调卡住采样中途 (Sample 未提交), 测试显式放行后才继续。
+	// 这样「stop 等待期间采样仍在途」是确定的, 而非碰运气的时间窗。
+	sampleEnter := make(chan struct{})   // 采样进入观察点
+	sampleRelease := make(chan struct{}) // 测试放行提交
 	oldHook := energySampleHook
 	energySampleHook = func(pin float64, dt time.Duration) {
-		sampleMu.Lock()
-		sampledPin = pin
-		sampleMu.Unlock()
+		sampleEnter <- struct{}{}
+		<-sampleRelease
 	}
 	defer func() { energySampleHook = oldHook }()
 
@@ -1206,24 +1207,34 @@ func TestEnergyShutdownAfterInFlightSample(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "energy.json")
 	e, stop := StartEnergy(b, path, ctx)
 
-	// 等待非零在途采样真实发生 (观察点), 而不是假定时序
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		sampleMu.Lock()
-		p := sampledPin
-		sampleMu.Unlock()
-		if p == 100 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("5s 内未观察到非零采样: 采样循环未按替身时钟运行 (最后 pin=%v)", p)
-		}
-		time.Sleep(5 * time.Millisecond)
+	// 等非零采样到达观察点 (Sample 已调用但被屏障卡住, 未提交)
+	select {
+	case <-sampleEnter:
+	case <-time.After(5 * time.Second):
+		t.Fatal("5s 内采样未到达观察点: 采样循环未按替身时钟运行")
 	}
 
-	// 宿主退出序列 (生产入口 newCRPSExitCallback 的三步语义): cancel -> join -> Save
-	cancel()
-	stop()
+	// 屏障持有期间 (采样未提交) 触发退出序列: stop 必须阻塞等采样完成
+	exitDone := make(chan struct{})
+	go func() {
+		cancel()
+		stop() // 生产回调的 join 步
+		close(exitDone)
+	}()
+	select {
+	case <-exitDone:
+		t.Fatal("采样未提交时 stop 就返回了: 采样器过早退出 (join 无效)")
+	case <-time.After(100 * time.Millisecond):
+		// 预期: stop 仍阻塞在 join
+	}
+
+	// 放行采样提交, join 应随即完成
+	close(sampleRelease)
+	select {
+	case <-exitDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("采样提交后 stop 未在 5s 内返回")
+	}
 	e.Save()
 
 	if _, err := os.Stat(path); err != nil {
@@ -1232,5 +1243,108 @@ func TestEnergyShutdownAfterInFlightSample(t *testing.T) {
 	data, _ := os.ReadFile(path)
 	if !strings.Contains(string(data), `"last_pin_w": 100`) {
 		t.Fatalf("energy.json 应含在途采样的 100W 读数: %s", data)
+	}
+}
+
+// ---------------- 服务生命周期延迟诊断 ----------------
+
+// fakeNow 便于断言 Logf 输出 (log 内容不可直接断言, 用 fanRpm 读回次数代替)
+
+// 回归 (review 五轮): RPM 诊断延迟读回必须用服务生命周期 ctx —— POST 返回后
+// 请求 ctx 取消不得影响诊断; 重复 POST 合并为单个延迟任务; 服务 ctx 取消后
+// 不再发起读回。隔离的 HTTP 应答测试 (httptest, 不碰真机)。
+func TestFanAutoDiagUsesLifecycleCtx(t *testing.T) {
+	stubAdmin(t, true)
+	stubPortAvailable(t, true)
+	b := NewBus("Pin19", "Pin20", false)
+	mock := newMockPIO()
+	mock.readMask[GPPins["Pin20"].Port] = 0
+	b.pio = mock
+	if ok, _ := b.reconfigure(nil, nil); !ok {
+		t.Fatal("reconfigure 失败")
+	}
+	srv := &AppServer{Bus: b}
+	lifecycle, lifecycleCancel := context.WithCancel(context.Background())
+	defer lifecycleCancel()
+	srv.LifecycleCtx = lifecycle
+	h := srv.APIHandler()
+
+	// 计数 fanRpm 读回 (诊断读回会产生 READ_FAN1 事务)。bitbang 事务难以精确
+	// 计数, 用写计数近似: 读回发生在延迟任务中, POST 返回后仍增长即证明
+	// 诊断未被请求 ctx 取消。
+	post := func() {
+		req := httptest.NewRequest(http.MethodPost, "/api/crps/fan", strings.NewReader(`{"mode":"auto","pct":10}`))
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("POST /fan -> %d: %s", rec.Code, rec.Body.String())
+		}
+	}
+
+	// READ_FAN1 观察点: 诊断读回必经 fanRpm。快照刷新 (doPost 的 1.2s 延迟
+	// refresh 与 StartStatusRefresher) 不在本测试启动, 故读回即诊断。
+	diagReads := make(chan string, 64)
+	oldOverride2 := readWordOverride.Load()
+	setReadWordOverride(func(b *Bus, cmd byte) *uint16 {
+		if cmd == Cmd["READ_FAN1"] {
+			select {
+			case diagReads <- "read":
+			default:
+			}
+		}
+		return nil
+	})
+	defer func() {
+		if oldOverride2 == nil {
+			readWordOverride.Store(nil)
+		} else {
+			readWordOverride.Store(oldOverride2)
+		}
+	}()
+
+	post() // 第一个 POST: 返回后注册延迟诊断
+	writes1 := mock.writeCount()
+	time.Sleep(150 * time.Millisecond)
+	post() // 第二个 POST: 应合并进同一延迟任务, 不另起 goroutine
+	// 等诊断延迟 (3s) 过去, 服务 ctx 仍存活: 读回必须发生 (POST 已返回,
+	// 证明延迟任务未被请求 ctx 取消)
+	deadline := time.Now().Add(6 * time.Second)
+	for {
+		select {
+		case <-diagReads:
+			goto diagSeen
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("POST 返回后 6s 内诊断读回未发生: 延迟任务被请求 ctx 取消")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+diagSeen:
+	_ = writes1
+
+	// 服务取消后: 等第一段任务全部收尾, 再验证取消后的新任务不读回
+	// 等第一段所有延迟任务自然收尾 (含 POST2 合并任务的读回), 避免它们污染取消段观察
+	time.Sleep(autoFanDiagDelay + time.Second)
+
+	// 取消服务 ctx, 等在途 goroutine (快照刷新 1.2s) 全部退出
+	lifecycleCancel()
+	time.Sleep(1500 * time.Millisecond)
+	readCount := func() int {
+		n := 0
+		for {
+			select {
+			case <-diagReads:
+				n++
+			default:
+				return n
+			}
+		}
+	}
+	base := readCount()
+	post() // 取消后注册的延迟任务必须直接退出, 不发读回
+	time.Sleep(autoFanDiagDelay + time.Second)
+	if readCount() > base {
+		t.Fatal("服务取消后仍有诊断读回")
 	}
 }

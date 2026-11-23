@@ -604,7 +604,7 @@ func initCrps(logger *log.Logger, cfgPath string, ctx context.Context, cancel co
 	crpsump.StartStatusRefresher(bus, ctx) // 状态快照后台刷新: CRPS 页面首开即有数据
 	crpsump.LogStartup(bus, sclPin, sdaPin)
 	logger.Printf("crps module enabled config=%s energy=%s", cfgPath, filepath.Join(filepath.Dir(cfgPath), "energy.json"))
-	srv := &crpsump.AppServer{Bus: bus, ConfigPath: cfgPath}
+	srv := &crpsump.AppServer{Bus: bus, ConfigPath: cfgPath, LifecycleCtx: ctx}
 	// 收敛的退出流程, 自包含不依赖 defer 顺序: 取消 ctx -> 等采样 goroutine 退出 ->
 	// 最终 Save。服务器启动失败 (未收到信号、cancel 未被 defer 执行) 时同样正确:
 	// 回调自己先取消再等待, 不会卡死, 最终快照必定落盘。
