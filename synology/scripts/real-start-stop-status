@@ -59,9 +59,14 @@ NGINX_CONF="${NGINX_CONF_DIR}/dsm.${PKG}.conf"
 HTTP_ADDR="127.0.0.1:8123"
 IT87_FORCE_ID=""
 CFG_FILE="${PKG_ETC}/tad-module.cfg"
+# luodaoyi R18:按「是否确实已经读取」判断(start 分支据此决定是否补读),
+# 不以文件存在性二次判断——配置在顶部检查之后、进入 start 之前由另一
+# 写入方发布时(竞争窗口),未读标志仍为 0,start 会正确补读。
+_cfg_read_done=0
 if [ -f "${CFG_FILE}" ]; then
   # shellcheck disable=SC1090
   . "${CFG_FILE}" || true
+  _cfg_read_done=1
 fi
 
 # PID 可能跨重启残留或被复用；同时验证进程、启动 tick 和本次 boot。
@@ -435,18 +440,25 @@ case "${1:-}" in
     mkdir -p "${PKG_VAR}"
     rm -f "${PIDFILE}"
     # 自愈运行参数再预检端口。已有配置只在脚本顶部读过一次(luodaoyi R17:
-    # 二次 source 会把非幂等语句执行两遍);这里仅当启动前未读取且
-    # ensure_cfg 刚新建了 cfg 时才补读——向导端口要进预检与 serve。
-    if [ ! -f "${CFG_FILE}" ]; then
-      _cfg_read_done=0
-      ensure_cfg
-      if [ -f "${CFG_FILE}" ]; then
-        # shellcheck disable=SC1090
-        . "${CFG_FILE}" || true
-        _cfg_read_done=1
-      fi
-    else
+    # 二次 source 会把非幂等语句执行两遍);这里按「是否已读」标志补读:
+    # 顶部检查后竞争发布的配置、或 ensure_cfg 刚新建的配置,都要进预检
+    # 与 serve;顶部已读的配置不再读。
+    ensure_cfg
+    if [ "${_cfg_read_done}" = "0" ] && [ -f "${CFG_FILE}" ]; then
+      # shellcheck disable=SC1090
+      . "${CFG_FILE}" || true
       _cfg_read_done=1
+    fi
+    # luodaoyi R18:启动前未读取到有效配置、且存在有效向导暂存但本次
+    # 提交失败时——绝不能报启动成功却悄悄绑定默认地址。保留暂存(下次
+    # start 重试)并给出失败原因退出。ensure_cfg 只在提交失败时保留暂存
+    # (成功会消费),此处以「暂存仍存在且本次未读到新配置」为判据。
+    if [ "${_cfg_read_done}" = "0" ] && [ -f "${PKG_VAR}/wizard-install.env" ]; then
+      {
+        echo "$(date '+%Y-%m-%dT%H:%M:%S') 启动失败:向导暂存存在但配置提交失败,拒绝以默认地址静默启动;暂存已保留,下次 start 重试"
+      } >> "${STARTUP_LOG}" 2>/dev/null || true
+      echo "启动失败:向导端口暂存存在但配置提交失败,已保留暂存待重试;详细: ${STARTUP_LOG}" >&2
+      exit 1
     fi
     # 旧版默认值迁移:独立端口时代遗留的 ":8123"(空主机=通配语义)改为
     # 回环绑定。必须在端口预检之前(CodeRabbit 三轮 Major:否则旧 cfg 为

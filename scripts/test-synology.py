@@ -392,6 +392,76 @@ printf '%s' "$STARTUP_LOG"
             self.assertIn('AMBIGUOUS :::8123', log)
             self.assertIn('bindv6only', log)
 
+    _mock_daemon_bin = None  # 类级缓存:编译一次复用(R18③:带 QUIT 协作退出)
+
+    @classmethod
+    def _build_mock_daemon(cls, dest):
+        # 真实 ELF mock daemon:记录 --http 参数到 $CAPTURE;轮询 $QUIT
+        # 私有通知文件,看到即删文件作退出回执(luodaoyi R15);alarm(120)
+        # 仅兜底。所有 start 测试统一用此 mock——只 pause() 的变体不会
+        # 回执,测试结束后会留进程等满 alarm。
+        dest = Path(dest)
+        if cls._mock_daemon_bin and Path(cls._mock_daemon_bin).exists():
+            shutil.copyfile(cls._mock_daemon_bin, dest)
+            dest.chmod(0o755)
+            return dest
+        src = dest.parent / ('mock-daemon-' + str(abs(hash(str(dest))))[:8] + '.c')
+        src.write_text(r'''
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+    /* 非 serve 子命令(publish/init 等脚本内部调用)立即退出,不常驻 */
+    if (argc < 2 || strcmp(argv[1], "serve") != 0) {
+        if (argc >= 2 && strcmp(argv[1], "publish") == 0 && argc >= 4) {
+            /* 模拟真实 publish 语义:目标已存在即失败(EEXIST) */
+            return access(argv[3], F_OK) == 0 ? 17 : 0;
+        }
+        return 0;
+    }
+    alarm(120);
+    const char *cap = getenv("CAPTURE");
+    const char *quit = getenv("QUIT");
+    for (int i = 1; i < argc - 1; i++) {
+        if (strcmp(argv[i], "--http") == 0 && cap) {
+            FILE *f = fopen(cap, "w");
+            if (f) { fputs(argv[i + 1], f); fclose(f); }
+        }
+    }
+    for (;;) {
+        if (quit && access(quit, F_OK) == 0) {
+            unlink(quit);   /* 删除通知文件 = 退出回执 */
+            return 0;
+        }
+        usleep(50000);      /* 50ms 轮询 */
+    }
+}
+''')
+        cc = shutil.which('cc') or shutil.which('gcc')
+        if not cc:
+            raise RuntimeError('容器无 C 编译器,mock daemon 需要 ELF')
+        import subprocess as _sp
+        r = _sp.run([cc, '-o', str(dest), str(src)],
+                    capture_output=True, text=True, timeout=60)
+        if r.returncode != 0:
+            raise RuntimeError(f'mock daemon 编译失败: {r.stderr[-300:]}')
+        dest.chmod(0o755)
+        cls._mock_daemon_bin = str(dest)
+        return dest
+
+    @staticmethod
+    def _quit_wait_mock(quit_file, pidfile):
+        # finally 清理:QUIT 通知+有界等待回执,不发信号不扫进程表
+        try:
+            if pidfile.exists():
+                quit_file.write_text('')
+                deadline = time.monotonic() + 5.0
+                while quit_file.exists() and time.monotonic() < deadline:
+                    time.sleep(0.05)
+        except OSError:
+            pass
+
     def test_existing_cfg_sourced_once_per_start(self):
         # luodaoyi R17:已有配置在一次启动中只读一次——脚本顶部已 source
         # CFG_FILE,start 的 ensure_cfg 之后不得再 source(非幂等语句会被
@@ -421,29 +491,8 @@ printf '%s' "$STARTUP_LOG"
             )
             (work / 'etc/tad-module.cfg').write_text(cfg_text)
             rm_marker.write_text('')  # 首次 source 会删掉它
-            # mock daemon ELF(同 start 迁移测试,alarm 自限+QUIT 协作退出)
-            mock_src = work / 'mock-daemon.c'
-            mock_src.write_text(r'''
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-int main(int argc, char **argv) {
-    alarm(120);
-    (void)argc; (void)argv;
-    for (;;) pause();
-    return 0;
-}
-''')
-            mock_bin = pkg_bin / 'tad-module'
-            cc = shutil.which('cc') or shutil.which('gcc')
-            if not cc:
-                self.skipTest('容器无 C 编译器,mock daemon 需要 ELF')
-            r = subprocess.run([cc, '-o', str(mock_bin), str(mock_src)],
-                               capture_output=True, text=True, timeout=60)
-            if r.returncode != 0:
-                self.fail(f'mock daemon 编译失败: {r.stderr[-300:]}')
-            mock_bin.chmod(0o755)
+            # mock daemon ELF(R18③:统一 QUIT 协作 mock)
+            self._build_mock_daemon(pkg_bin / 'tad-module')
             # 脚本副本:只替换 NGINX_CONF_DIR 常量进私有目录(R14 手法)
             real_text = self.REAL.read_text()
             old_line = 'NGINX_CONF_DIR="/usr/local/etc/nginx/conf.d"'
@@ -479,15 +528,148 @@ int main(int argc, char **argv) {
                 self.assertEqual(counter.read_text().strip(), '1',
                                  f'已有配置必须只 source 一次,实际 counter={counter.read_text().strip()}')
             finally:
-                # R15 手法:QUIT 通知协作退出,不发信号不扫进程表
+                self._quit_wait_mock(quit_file, pidfile)
+
+    def test_cfg_published_in_race_window_is_read_before_serve(self):
+        # luodaoyi R18①:配置在脚本顶部检查之后、ensure_cfg 期间由竞争者
+        # 发布(顶部未读,_cfg_read_done=0)——start 必须补读并以配置地址
+        # 启动,不得跳过读取以默认地址静默启动。grep 钩子在 ensure_cfg 的
+        # 校验点触发:先让竞争者发布正式 cfg(带竞争地址),再放行校验,
+        # 本方提交 EEXIST 失败但竞争配置已存在 → 补读分支读到竞争地址。
+        if not Path('/proc/self/stat').exists():
+            self.skipTest('/proc 不可用(Windows 本机),CI Linux 覆盖')
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            (work / 'etc').mkdir()
+            (work / 'var').mkdir()
+            pkg_bin = work / 'bin'
+            pkg_bin.mkdir()
+            self._build_mock_daemon(pkg_bin / 'tad-module')
+            # 竞争配置:grep 钩子触发时发布,地址与默认不同以验证补读生效
+            race_addr = '127.0.0.1:8321'
+            race_cfg = (work / 'etc/race.cfg')
+            race_cfg.write_text(f'HTTP_ADDR="{race_addr}"\nIT87_FORCE_ID=""\n')
+            real_text = self.REAL.read_text()
+            old_line = 'NGINX_CONF_DIR="/usr/local/etc/nginx/conf.d"'
+            new_line = 'NGINX_CONF_DIR="' + self._shpath(work / 'nginx-conf.d') + '"'
+            self.assertEqual(real_text.count(old_line), 1)
+            script_copy = work / 'real-start-stop-status-test'
+            script_copy.write_text(real_text.replace(old_line, new_line, 1))
+            script_copy.chmod(0o755)
+            stub_env = self._postinst_env(work)
+            stubs = work / 'bin-stubs'
+            # grep 钩子:$3 为 cfg tmp 时竞争发布(仅在真实 cfg 尚不存在时,
+            # 防两次校验调用重入),再放行真身
+            real_grep = shutil.which('grep')
+            qg = "'" + str(Path(real_grep).resolve()).replace(chr(92), '/') + "'"
+            qrace = "'" + self._shpath(race_cfg) + "'"
+            qdst = "'" + self._shpath(work / 'etc/tad-module.cfg') + "'"
+            stub_body = ('case "$3" in *tad-module.cfg.tmp*) '
+                         f'[ -e {qdst} ] || cp {qrace} {qdst} ;; esac' + chr(10) +
+                         f'exec {qg} "$@"')
+            self._inject_postinst_stub(work, 'grep', stub_body)
+            for name, body_text in (('netstat', '#!/bin/sh\nexit 0\n'),
+                                    ('nginx', '#!/bin/sh\nexit 0\n'),
+                                    ('systemctl', '#!/bin/sh\nexit 0\n')):
+                p = stubs / name
+                p.write_text(body_text)
+                p.chmod(0o755)
+            quit_file = work / 'mock-daemon.quit'
+            env = dict(os.environ, TEST_DIR=self._shpath(tmp),
+                       SYNOPKG_PKGDEST=self._shpath(tmp),
+                       SYNOPKG_PKGETC=self._shpath(work / 'etc'),
+                       SYNOPKG_PKGVAR=self._shpath(work / 'var'),
+                       CAPTURE=str(work / 'captured-http'))
+            run_env = {**env, **stub_env}
+            pidfile = work / 'var' / 'tad-module.pid'
+            try:
+                proc = subprocess.run(['sh', str(script_copy), 'start'], env=run_env,
+                                      capture_output=True, text=True, timeout=30)
+                self.assertEqual(proc.returncode, 0,
+                                 f'竞争发布场景应放行,rc={proc.returncode} stderr={proc.stderr[-300:]!r}')
+                capture = (work / 'captured-http').read_text() if (work / 'captured-http').exists() else ''
+                self.assertEqual(capture, race_addr,
+                                 f'serve 必须收到竞争配置地址 {race_addr},实际 {capture!r}')
+            finally:
+                self._quit_wait_mock(quit_file, pidfile)
+
+    def test_stash_commit_failure_fails_start_keeps_stash(self):
+        # luodaoyi R18②:有有效向导暂存、无正式配置且提交失败时——不能
+        # 报启动成功却悄悄绑定默认地址:启动 daemon 前报失败原因退出 1、
+        # 暂存保留(下次 start 重试)。提交失败用目标过滤 publish 包装器
+        # 注入(R16 手法,证明发布被调用却失败);无暂存/已有配置场景保持
+        # 默认行为(由既有用例覆盖)。
+        if not Path('/proc/self/stat').exists():
+            self.skipTest('/proc 不可用(Windows 本机),CI Linux 覆盖')
+        for scenario in ('commit-fail-with-stash', 'no-stash-default-ok'):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as tmp:
+                work = Path(tmp)
+                (work / 'etc').mkdir()
+                (work / 'var').mkdir()
+                pkg_bin = work / 'bin'
+                pkg_bin.mkdir()
+                self._build_mock_daemon(pkg_bin / 'tad-module')
+                if scenario == 'commit-fail-with-stash':
+                    (work / 'var/wizard-install.env').write_text(
+                        'HTTP_ADDR="127.0.0.1:9402"\n')
+                    # 目标过滤包装器:配置提交永远失败(publish 被调用)
+                    real = pkg_bin / '.tad-module.real'
+                    shutil.move(str(pkg_bin / 'tad-module'), str(real))
+                    qreal = "'" + self._shpath(real) + "'"
+                    wrapper = (
+                        '#!/bin/sh\n'
+                        'if [ "$1" = "publish" ] && [ $# -ge 3 ]; then\n'
+                        '  case "$3" in *tad-module.cfg) exit 1 ;; esac\n'
+                        'fi\n'
+                        f'exec {qreal} "$@"\n'
+                    )
+                    (pkg_bin / 'tad-module').write_text(wrapper)
+                    (pkg_bin / 'tad-module').chmod(0o755)
+                real_text = self.REAL.read_text()
+                old_line = 'NGINX_CONF_DIR="/usr/local/etc/nginx/conf.d"'
+                new_line = 'NGINX_CONF_DIR="' + self._shpath(work / 'nginx-conf.d') + '"'
+                self.assertEqual(real_text.count(old_line), 1)
+                script_copy = work / 'real-start-stop-status-test'
+                script_copy.write_text(real_text.replace(old_line, new_line, 1))
+                script_copy.chmod(0o755)
+                stub_env = self._postinst_env(work)
+                stubs = work / 'bin-stubs'
+                for name in ('netstat', 'nginx', 'systemctl'):
+                    p = stubs / name
+                    p.write_text('#!/bin/sh\nexit 0\n')
+                    p.chmod(0o755)
+                quit_file = work / 'mock-daemon.quit'
+                env = dict(os.environ, TEST_DIR=self._shpath(tmp),
+                           SYNOPKG_PKGDEST=self._shpath(tmp),
+                           SYNOPKG_PKGETC=self._shpath(work / 'etc'),
+                           SYNOPKG_PKGVAR=self._shpath(work / 'var'),
+                           CAPTURE=str(work / 'captured-http'))
+                run_env = {**env, **stub_env}
+                pidfile = work / 'var' / 'tad-module.pid'
                 try:
-                    if pidfile.exists():
-                        quit_file.write_text('')
-                        deadline = time.monotonic() + 5.0
-                        while quit_file.exists() and time.monotonic() < deadline:
-                            time.sleep(0.05)
-                except OSError:
-                    pass
+                    proc = subprocess.run(['sh', str(script_copy), 'start'], env=run_env,
+                                          capture_output=True, text=True, timeout=30)
+                    if scenario == 'commit-fail-with-stash':
+                        self.assertEqual(proc.returncode, 1,
+                                         f'提交失败+暂存场景必须 exit 1,rc={proc.returncode} stderr={proc.stderr[-200:]!r}')
+                        self.assertFalse(pidfile.exists(),
+                                         '提交失败场景不得启动 daemon')
+                        self.assertFalse((work / 'captured-http').exists(),
+                                         '提交失败场景 daemon 不得收到 --http')
+                        stash = work / 'var/wizard-install.env'
+                        self.assertTrue(stash.is_file(), '暂存必须保留待重试')
+                        self.assertIn('HTTP_ADDR="127.0.0.1:9402"', stash.read_text())
+                        log = (work / 'var/startup-debug.log').read_text() if (work / 'var/startup-debug.log').exists() else ''
+                        self.assertIn('配置提交失败', log,
+                                      f'失败原因必须落盘,日志={log[-400:]!r}')
+                    else:
+                        self.assertEqual(proc.returncode, 0,
+                                         f'无暂存默认行为应放行,rc={proc.returncode} stderr={proc.stderr[-300:]!r}')
+                        capture = (work / 'captured-http').read_text() if (work / 'captured-http').exists() else ''
+                        self.assertEqual(capture, '127.0.0.1:8123',
+                                         f'无暂存走默认地址启动,实际 {capture!r}')
+                finally:
+                    self._quit_wait_mock(quit_file, pidfile)
 
     def test_start_migrates_legacy_addr_before_precheck(self):
         # luodaoyi 三轮 + CodeRabbit R10 Minor:旧 cfg ":8123" 的迁移必须
