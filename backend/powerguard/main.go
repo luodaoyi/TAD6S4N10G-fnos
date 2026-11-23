@@ -252,10 +252,10 @@ func serve(args []string) error {
 	// CRPS PMBus 监控板块 (crpsump)：可选功能，硬件缺失/未配置时仅 CRPS 页面降级，
 	// 主功能照常——与 history 同样的失败哲学。配置走独立 crps.json（与主配置同目录），
 	// 耗电统计 energy.json 同目录落盘，退出时保存。
-	crpsHandler, crpsEnergySave := initCrps(logger, filepath.Join(filepath.Dir(*config), "crps.json"), ctx)
+	crpsHandler, crpsEnergySave := initCrps(logger, filepath.Join(filepath.Dir(*config), "crps.json"), ctx, cancel)
 	if crpsEnergySave != nil {
-		// CRPS 退出落盘 (ctx.Done 与 server 错误两条路径均覆盖): defer 顺序保证先
-		// cancel (255 行 defer cancel 之上) -> 采样 goroutine join -> 最终 Save。
+		// CRPS 退出落盘: 回调自包含 (cancel -> join 采样 -> Save), 与 defer 顺序
+		// 无关, server 启动失败 (信号未到) 与正常退出两条路径均正确。
 		defer crpsEnergySave()
 	}
 	go func() {
@@ -572,7 +572,7 @@ func usage() {
 // 耗电统计落盘 <cfgPath 同目录>/energy.json。NewBus 对非法引脚名内部回退默认值、
 // 硬件不可达在请求时降级为 no-gpio，因此本函数不返回错误，CRPS 始终挂载。
 // 日志沿用 crpsump 自有的 /tmp/psu-monitor.log (自带按大小轮转)，不并入主日志。
-func initCrps(logger *log.Logger, cfgPath string, ctx context.Context) (http.Handler, func()) {
+func initCrps(logger *log.Logger, cfgPath string, ctx context.Context, cancel context.CancelFunc) (http.Handler, func()) {
 	sclPin, sdaPin := crpsump.DefaultSCL, crpsump.DefaultSDA
 	configured := false
 	if data, err := os.ReadFile(cfgPath); err == nil {
@@ -605,9 +605,11 @@ func initCrps(logger *log.Logger, cfgPath string, ctx context.Context) (http.Han
 	crpsump.LogStartup(bus, sclPin, sdaPin)
 	logger.Printf("crps module enabled config=%s energy=%s", cfgPath, filepath.Join(filepath.Dir(cfgPath), "energy.json"))
 	srv := &crpsump.AppServer{Bus: bus, ConfigPath: cfgPath}
-	// 退出落盘顺序: 先 cancel ctx -> energyStop 等采样 goroutine 退出 -> 最终 Save。
-	// 保证最终快照落盘后不会再有采样写入 (server 启动失败与正常退出两条路径都走这)。
+	// 收敛的退出流程, 自包含不依赖 defer 顺序: 取消 ctx -> 等采样 goroutine 退出 ->
+	// 最终 Save。服务器启动失败 (未收到信号、cancel 未被 defer 执行) 时同样正确:
+	// 回调自己先取消再等待, 不会卡死, 最终快照必定落盘。
 	return srv.APIHandler(), func() {
+		cancel()
 		energyStop()
 		energy.Save()
 	}

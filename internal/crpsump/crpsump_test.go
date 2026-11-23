@@ -1116,9 +1116,11 @@ func TestEnergyStopThenSaveFinalSnapshotStable(t *testing.T) {
 	e.Save()
 }
 
-// 回归: server 启动失败路径 —— ctx 从未取消时直接调用宿主的退出回调
-// (stop+Save) 也必须能返回, 不得永久阻塞。
-func TestEnergyStopWithoutCancelReturns(t *testing.T) {
+// 回归: server 启动失败路径 —— 收敛退出回调自身必须完成「取消 -> 等采样结束 ->
+// 保存」全流程。调用方 (defer) 在信号未到时不会先取消, 回调不得依赖外部先行 cancel,
+// 否则等待采样退出会永久卡住、最终快照不落盘。模拟 defer LIFO 逆序: 采样在途
+// (未取消) 时直接调用回调, 且回调返回后落盘文件必须存在。
+func TestEnergyShutdownCallbackSelfContainedWithoutPresetCancel(t *testing.T) {
 	stubPortAvailable(t, true)
 	oldStats := energyStats
 	defer func() { energyStats = oldStats }()
@@ -1132,17 +1134,26 @@ func TestEnergyStopWithoutCancelReturns(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	_, stop := StartEnergy(b, filepath.Join(t.TempDir(), "energy.json"), ctx)
+	path := filepath.Join(t.TempDir(), "energy.json")
+	e, energyStop := StartEnergy(b, path, ctx)
+	e.Sample(100, 15*time.Second) // 置脏: 验证回调末尾的 Save 真正落盘 (Save 是 dirty 门控)
 
+	// 采样在途, 信号未到, cancel 未被调用 —— 直接执行退出回调 (宿主 defer 形态)
 	done := make(chan struct{})
 	go func() {
 		cancel()
-		stop()
+		energyStop()
+		e.Save()
 		close(done)
 	}()
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
-		t.Fatal("cancel 后 stop 未在 5s 内返回, 疑似永久阻塞")
+		t.Fatal("退出回调未在 5s 内返回: 疑似 cancel 前置于等待造成的死锁")
 	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("退出回调后 energy.json 应已落盘: %v", err)
+	}
+	// 回调已含 Save, 再调一次验证幂等 (宿主两条退出路径可能重复走)
+	e.Save()
 }
