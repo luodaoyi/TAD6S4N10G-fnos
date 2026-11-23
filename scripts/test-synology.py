@@ -6,6 +6,7 @@ import shutil
 import sys
 import subprocess
 import tempfile
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -442,8 +443,10 @@ printf '%s' "$STARTUP_LOG"
                 # 假守护进程必须是真实 ELF:daemon_pid 校验 /proc/<pid>/exe
                 # 等于 BIN 且 cmdline 第 2 段为 serve——sh 脚本的 exe 是解释
                 # 器,过不了校验(此前就绪探测从未真实通过)。记录 --http 参数
-                # 后常驻;luodaoyi R14:自限寿命(alarm 120s 到点自杀),即使
-                # 测试崩溃/未执行清理也不会留下进程。
+                # 后常驻;退出机制(luodaoyi R15):轮询本用例私有目录的退出
+                # 通知文件($QUIT),看到即删文件作回执并退出——finally 只发
+                # 通知+有界等待回执,不向任何 PID 发信号、不扫进程表;
+                # alarm(120) 仅兜底(测试崩溃等极端情形)。
                 mock_src = work / 'mock-daemon.c'
                 mock_src.write_text(r'''
 #include <stdio.h>
@@ -453,14 +456,20 @@ printf '%s' "$STARTUP_LOG"
 int main(int argc, char **argv) {
     alarm(120);
     const char *cap = getenv("CAPTURE");
+    const char *quit = getenv("QUIT");
     for (int i = 1; i < argc - 1; i++) {
         if (strcmp(argv[i], "--http") == 0 && cap) {
             FILE *f = fopen(cap, "w");
             if (f) { fputs(argv[i + 1], f); fclose(f); }
         }
     }
-    for (;;) pause();
-    return 0;
+    for (;;) {
+        if (quit && access(quit, F_OK) == 0) {
+            unlink(quit);   /* 删除通知文件 = 退出回执 */
+            return 0;
+        }
+        usleep(50000);      /* 50ms 轮询 */
+    }
 }
 ''')
                 mock_bin = pkg_bin / 'tad-module'
@@ -478,7 +487,8 @@ int main(int argc, char **argv) {
                            SYNOPKG_PKGETC=self._shpath(work / 'etc'),
                            SYNOPKG_PKGVAR=self._shpath(work / 'var'),
                            TAD_NETSTAT_OUT=netstat_line,
-                           CAPTURE=str(work / 'captured-http'))
+                           CAPTURE=str(work / 'captured-http'),
+                           QUIT=str(work / 'mock-daemon.quit'))
                 stub_env = self._postinst_env(work)
                 # netstat/nginx 替身:副本脚本按 PATH 调 netstat -tln 与
                 # nginx(ensure_nginx 的 -t/reload);输出由环境变量注入。
@@ -497,19 +507,12 @@ int main(int argc, char **argv) {
                 systemctl_stub.chmod(0o755)
                 run_env = {**env, **stub_env}
                 # 直接调用副本脚本(经脚本自身的 start 分支);mock daemon
-                # 自限寿命(alarm 120s)+finally 按 PID 回执清理
+                # 自限寿命(alarm 120s)+finally 退出通知协作清理
                 pidfile = work / 'var' / 'tad-module.pid'
-                receipt = work / 'mock-daemon.pids'
                 proc = None
                 try:
                     proc = subprocess.run(['sh', str(script_copy), 'start'], env=run_env,
                                           capture_output=True, text=True, timeout=30)
-                    # PID 回执:启动完成立即快照(业务 stop/清理可能删 PIDFILE)
-                    if pidfile.exists():
-                        try:
-                            receipt.write_text(pidfile.read_text().split()[0] + '\n')
-                        except (IndexError, ValueError, OSError):
-                            pass
                     capture = (work / 'captured-http').read_text() if (work / 'captured-http').exists() else ''
                     if expect_pass:
                         if proc.returncode != 0:
@@ -537,31 +540,23 @@ int main(int argc, char **argv) {
                         self.assertFalse((work / 'var' / 'tad-module.log').exists(),
                                          f'场景{idx}: 拦截场景守护进程不得启动')
                 finally:
-                    # luodaoyi R14:按 PID 回执独立清理——即使断言失败、
-                    # subprocess 超时或业务代码已删 PID 文件,也不留进程。
-                    # PID 回执 = start 成功时立即读出并存独立文件(业务
-                    # 可能 rm PIDFILE);再叠加 PIDFILE 兜底与 bin/ 同目录
-                    # 扫描(cmdline 含本 tmp 路径的一律杀)。
-                    pids = set()
-                    if receipt.exists():
-                        pids.update(receipt.read_text().split())
-                    if pidfile.exists():
-                        try:
-                            pids.add(pidfile.read_text().split()[0])
-                        except (IndexError, ValueError):
-                            pass
-                    for p in list(pids):
-                        subprocess.run(['kill', p], capture_output=True)
-                    # 兜底:进程表扫描——cmdline 引用本 tmp 的残留 mock
+                    # luodaoyi R15:退出通知协作清理——向本用例私有目录写
+                    # 通知文件,mock 看到即删文件作回执并退出;finally 有界
+                    # 等待回执,不向任何 PID 发信号、不扫全机进程表(裸 PID
+                    # 复用/子串匹配都可能误伤宿主进程)。alarm(120) 仅兜底
+                    # 测试崩溃等极端情形。仅正向场景等待(负向场景 daemon
+                    # 未启动,无回执可等;alarm 兜底覆盖一切意外)。
+                    quit_file = work / 'mock-daemon.quit'
                     try:
-                        scan = subprocess.run(['sh', '-c',
-                            'for d in /proc/[0-9]*; do '
-                            'case "$(tr "\\000" " " < "$d/cmdline" 2>/dev/null)" in '
-                            '*"' + self._shpath(pkg_bin) + '"*) echo "${d#/proc/}" ;; esac; done'],
-                            capture_output=True, text=True, timeout=10)
-                        for p in scan.stdout.split():
-                            subprocess.run(['kill', p], capture_output=True)
-                    except (OSError, subprocess.SubprocessError):
+                        if expect_pass and pidfile.exists():
+                            quit_file.write_text('')
+                            # 有界等待退出回执(通知文件被 mock 删除)
+                            deadline = time.monotonic() + 5.0
+                            while quit_file.exists() and time.monotonic() < deadline:
+                                time.sleep(0.05)
+                            self.assertFalse(quit_file.exists(),
+                                             'mock daemon 未在 5 秒内确认退出回执(alarm 兜底仍会自杀)')
+                    except OSError:
                         pass
 
     def test_postinst_wizard_port_normalization(self):
