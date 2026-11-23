@@ -1356,6 +1356,148 @@ exit 0
                                         f'{lifecycle}/{occupier}: 暂存必须存在')
                         self.assertIn('HTTP_ADDR="127.0.0.1:9801"', stash.read_text())
 
+    def test_publish_target_symlink_to_regular_file_both_lifecycles(self):
+        # luodaoyi R16 合并前负向验收①:目标=指向普通文件的符号链接——
+        # 实际构建的 publish 调用必须失败,链接本身与被指向文件都不变。
+        # 注意 shell 语义:[ -f symlink-to-file ] 为真,故 ensure_cfg/
+        # postinst 会把它视作"已有配置"短路跳过发布(同样是"不覆盖"语义,
+        # victim 不变即达标);publish 原语本身的 EEXIST 失败由 direct 层
+        # 用实际二进制直测。
+        if sys.platform != 'linux':
+            self.skipTest('需要 linux 宿主(publish 子命令),CI 覆盖')
+        for lifecycle in ('direct', 'shell-short-circuit'):
+            with self.subTest(lifecycle=lifecycle), tempfile.TemporaryDirectory() as tmp:
+                work = Path(tmp)
+                if not self._stage_publish_binary(work):
+                    self.fail('发布二进制构建失败(ln 回退已删除,无 helper 无从验证)')
+                etc = work / 'etc'
+                var = work / 'var'
+                etc.mkdir()
+                var.mkdir()
+                (work / 'functions').write_text(self._definitions(self.REAL.read_text()))
+                # 占位:target 文件 + 指向它的 symlink(即 CFG_FILE 形态)。
+                # victim 内容须是合法 shell(REAL 顶层会 source CFG_FILE,
+                # 真机 cfg 本就是 key=value; victim 非 shell 内容会让
+                # source 报 127 干扰断言)——用注释行占位字节。
+                victim = etc / 'victim'
+                victim.write_text('# victim-bytes-must-not-change\n')
+                (etc / 'tad-module.cfg').symlink_to(victim)
+                stage = etc / 'stage-file'
+                stage.write_text('HTTP_ADDR="127.0.0.1:9901"\n')
+                if lifecycle == 'direct':
+                    # 原语直测:publish 对文件 symlink 目标必须失败(EEXIST),
+                    # 链接与被指向文件字节都不变
+                    env = dict(os.environ, SYNOPKG_PKGDEST=self._shpath(tmp),
+                               SYNOPKG_PKGETC=self._shpath(etc),
+                               SYNOPKG_PKGVAR=self._shpath(var))
+                    r = subprocess.run([str(work / 'bin/tad-module'), 'publish',
+                                        str(stage), str(etc / 'tad-module.cfg')],
+                                       env=env, capture_output=True, timeout=15)
+                    self.assertNotEqual(r.returncode, 0,
+                                        'direct: publish 对文件 symlink 目标必须失败')
+                    self.assertTrue((etc / 'tad-module.cfg').is_symlink(),
+                                    'direct: 链接形态不得被替换')
+                    self.assertEqual(victim.read_text(), '# victim-bytes-must-not-change\n',
+                                     'direct: 被指向文件不得被改写')
+                else:
+                    # shell 路径:ensure_cfg 视 symlink-to-file 为已有配置
+                    # 短路——不发布、victim 不变、暂存保留待消费
+                    (var / 'wizard-install.env').write_text('HTTP_ADDR="127.0.0.1:9901"\n')
+                    env = dict(os.environ, TEST_DIR=self._shpath(tmp),
+                               SYNOPKG_PKGDEST=self._shpath(tmp),
+                               SYNOPKG_PKGETC=self._shpath(etc),
+                               SYNOPKG_PKGVAR=self._shpath(var))
+                    body = (
+                        '. "$TEST_DIR/functions"\n'
+                        'CFG_FILE="$TEST_DIR/etc/tad-module.cfg"\n'
+                        'STARTUP_LOG="$TEST_DIR/var/startup-debug.log"\n'
+                        'ensure_cfg\n'
+                        'exit 0\n'
+                    )
+                    subprocess.run(['sh', '-ec', body], env=env,
+                                   check=True, timeout=15)
+                    self.assertTrue((etc / 'tad-module.cfg').is_symlink(),
+                                    'shell: 链接形态不得被替换')
+                    self.assertEqual(victim.read_text(), '# victim-bytes-must-not-change\n',
+                                     'shell: 被指向文件不得被改写')
+                    self.assertTrue((var / 'wizard-install.env').is_file(),
+                                    'shell: 暂存必须保留(重试语义)')
+                    # 无残 tmp
+                    leftovers = [p.name for p in etc.iterdir() if '.tmp.' in p.name]
+                    self.assertEqual(leftovers, [], 'shell: 残留临时文件')
+
+    def test_publish_helper_missing_or_not_executable_safe_no_publish(self):
+        # luodaoyi R16 合并前负向验收②:发布 helper 缺失/不可执行——独立
+        # fixture 走实际 shell 路径(publish_no_replace 的 [ -x "${BIN}" ]
+        # 分支):未发布、不覆盖已有配置、不丢可恢复暂存、原因落日志。
+        # 拦截已启动的 publish 返回失败 ≠ 本场景:必须在进入 publish 调用
+        # 之前被 [ -x ] 分支拦下。
+        if sys.platform != 'linux':
+            self.skipTest('需要 linux 宿主(publish 子命令),CI 覆盖')
+        for lifecycle in ('ensure-cfg', 'postinst'):
+            for kind in ('missing', 'not-executable'):
+                with self.subTest(lifecycle=lifecycle, kind=kind), \
+                     tempfile.TemporaryDirectory() as tmp:
+                    work = Path(tmp)
+                    if not self._stage_publish_binary(work):
+                        self.fail('发布二进制构建失败(ln 回退已删除,无 helper 无从验证)')
+                    etc = work / 'etc'
+                    var = work / 'var'
+                    etc.mkdir()
+                    var.mkdir()
+                    (work / 'functions').write_text(self._definitions(self.REAL.read_text()))
+                    # 关键:cfg 必须不存在(已有 cfg 会让 ensure_cfg/postinst
+                    # 走"已有配置"短路分支,根本不调 publish_no_replace,[ -x ]
+                    # 拦截分支就测不到)——用「暂存待消费」驱动发布尝试,再被
+                    # helper 缺失/不可执行拦下。
+                    (var / 'wizard-install.env').write_text('HTTP_ADDR="127.0.0.1:9902"\n')
+                    # 破坏 helper:缺失=删 BIN;不可执行=剥执行位
+                    # (必须在 _postinst_env 之后——它会重新 stage 二进制)
+                    def _break_helper():
+                        bin_path = work / 'bin' / 'tad-module'
+                        if kind == 'missing':
+                            bin_path.unlink()
+                        else:
+                            bin_path.chmod(0o644)
+                    _break_helper()
+                    if lifecycle == 'ensure-cfg':
+                        env = dict(os.environ, TEST_DIR=self._shpath(tmp),
+                                   SYNOPKG_PKGDEST=self._shpath(tmp),
+                                   SYNOPKG_PKGETC=self._shpath(etc),
+                                   SYNOPKG_PKGVAR=self._shpath(var))
+                        body = (
+                            '. "$TEST_DIR/functions"\n'
+                            'CFG_FILE="$TEST_DIR/etc/tad-module.cfg"\n'
+                            'STARTUP_LOG="$TEST_DIR/var/startup-debug.log"\n'
+                            'ensure_cfg\n'
+                            'test ! -e "$CFG_FILE" || exit 116\n'
+                            'exit 0\n'
+                        )
+                        subprocess.run(['sh', '-ec', body], env=env,
+                                       check=True, timeout=15)
+                        log_path = var / 'startup-debug.log'
+                    else:
+                        env = dict(os.environ, SYNOPKG_PKGDEST=self._shpath(tmp),
+                                   SYNOPKG_PKGETC=self._shpath(etc),
+                                   SYNOPKG_PKGVAR=self._shpath(var),
+                                   wizard_port='9902')
+                        stub_env = self._postinst_env(work)
+                        _break_helper()
+                        subprocess.run(['sh', str(self.POSTINST)],
+                                       env={**env, **stub_env},
+                                       check=True, timeout=30, capture_output=True)
+                        log_path = var / 'postinst-debug.log'
+                    # 三态:无正式 cfg(未发布)、暂存保留(可恢复)、原因落日志
+                    self.assertFalse((etc / 'tad-module.cfg').exists(),
+                                     f'{lifecycle}/{kind}: 未发布,不得有正式 cfg')
+                    stash = var / 'wizard-install.env'
+                    self.assertTrue(stash.is_file(),
+                                    f'{lifecycle}/{kind}: 可恢复暂存不得丢失')
+                    self.assertIn('HTTP_ADDR="127.0.0.1:9902"', stash.read_text())
+                    log = log_path.read_text() if log_path.exists() else ''
+                    self.assertIn('不可执行', log,
+                                  f'{lifecycle}/{kind}: 原因必须落日志,日志={log!r}')
+
     def test_wrapper_captures_spm_exec_rejection(self):
         # set -e 下 spm-exec 非零退出必须仍记录返回码,退出码原样透传
         # (luodaoyi review #40 第 2 条)。
