@@ -424,57 +424,95 @@ printf '%s' "$STARTUP_LOG"
                 (work / 'etc/tad-module.cfg').write_text(cfg_text)
                 (work / 'functions').write_text(
                     self._definitions(self.REAL.read_text()))
-                # 假守护进程常驻:记录收到的 --http 地址后 sleep(保持进程存活,
-                # 让就绪窗口的 kill -0 真实通过);测试收尾 kill
-                mock_lines = [
-                    '#!/bin/sh',
-                    '_prev=',
-                    'for _a in "$@"; do',
-                    '  case "$_prev" in --http) printf "%s" "$_a" > "$CAPTURE" ;; esac',
-                    '  _prev=$_a',
-                    'done',
-                    'sleep 60',
-                    'exit 0',
-                ]
+                # 假守护进程必须是真实 ELF:daemon_pid 校验 /proc/<pid>/exe
+                # 等于 BIN 且 cmdline 第 2 段为 serve——sh 脚本的 exe 是解释
+                # 器,过不了校验(此前就绪探测从未真实通过)。10 行 C:记录
+                # --http 参数后常驻。
+                mock_src = work / 'mock-daemon.c'
+                mock_src.write_text(r'''
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+    const char *cap = getenv("CAPTURE");
+    for (int i = 1; i < argc - 1; i++) {
+        if (strcmp(argv[i], "--http") == 0 && cap) {
+            FILE *f = fopen(cap, "w");
+            if (f) { fputs(argv[i + 1], f); fclose(f); }
+        }
+    }
+    for (;;) pause();
+    return 0;
+}
+''')
                 mock_bin = pkg_bin / 'tad-module'
-                mock_bin.write_text('\n'.join(mock_lines) + '\n')
+                cc = shutil.which('cc') or shutil.which('gcc')
+                if not cc:
+                    self.skipTest('容器无 C 编译器,mock daemon 需要 ELF')
+                import subprocess as _sp
+                _r = _sp.run([cc, '-o', str(mock_bin), str(mock_src)],
+                             capture_output=True, text=True, timeout=60)
+                if _r.returncode != 0:
+                    self.fail(f'mock daemon 编译失败: {_r.stderr[-300:]}')
                 mock_bin.chmod(0o755)
                 env = dict(os.environ, TEST_DIR=self._shpath(tmp),
                            SYNOPKG_PKGDEST=self._shpath(tmp),
                            SYNOPKG_PKGETC=self._shpath(work / 'etc'),
                            SYNOPKG_PKGVAR=self._shpath(work / 'var'),
                            TAD_NETSTAT_OUT=netstat_line,
+                           TAD_NGINX_CONF_DIR=self._shpath(work / 'nginx-conf.d'),
                            CAPTURE=str(work / 'captured-http'))
                 stub_env = self._postinst_env(work)
-                # netstat 替身:生产脚本按 PATH 调 netstat -tln,输出由
-                # TAD_NETSTAT_OUT 注入(此前写在 body 的函数覆盖从未送达
-                # 独立 sh 进程——预检因此全放行,3 场景误判)
+                # netstat/nginx 替身:生产脚本按 PATH 调 netstat -tln 与
+                # nginx(ensure_nginx 的 -t/reload);输出由环境变量注入。
+                # luodaoyi R13:正向场景原来会摸宿主 /usr/local 的 nginx
+                # 配置目录并可能 reload 系统 nginx——配置目录经
+                # TAD_NGINX_CONF_DIR 指进临时目录,nginx 本体替身化,
+                # 宿主系统副作用全隔离
                 stubs = work / 'bin-stubs'
                 netstat_stub = stubs / 'netstat'
                 netstat_stub.write_text('#!/bin/sh\ncase "$1" in -tlnp|-tln) printf \'%s\\n\' "$TAD_NETSTAT_OUT" ;; esac\nexit 0\n')
                 netstat_stub.chmod(0o755)
+                nginx_stub = stubs / 'nginx'
+                nginx_stub.write_text('#!/bin/sh\nprintf \'nginx %s\\n\' "$*" >> "$TAD_HOST_CALLS"\nexit 0\n')
+                nginx_stub.chmod(0o755)
+                # ensure_nginx 的 reload 走 systemctl:容器无 systemd,替身放行
+                systemctl_stub = stubs / 'systemctl'
+                systemctl_stub.write_text('#!/bin/sh\nexit 0\n')
+                systemctl_stub.chmod(0o755)
                 run_env = {**env, **stub_env}
                 # 直接调用生产脚本(经脚本自身的 start 分支);mock daemon
                 # 常驻记录 --http;预检拦截场景脚本 exit 1(预期)
-                try:
-                    subprocess.run(['sh', str(self.REAL), 'start'], env=run_env,
-                                   capture_output=True, text=True, timeout=30)
-                except subprocess.CalledProcessError as e:
-                    # 预检拦截场景 exit 1 是预期;其余失败才算错误
-                    if expect_pass:
-                        raise
+                proc = subprocess.run(['sh', str(self.REAL), 'start'], env=run_env,
+                                      capture_output=True, text=True, timeout=30)
                 capture = (work / 'captured-http').read_text() if (work / 'captured-http').exists() else ''
                 if expect_pass:
+                    if proc.returncode != 0:
+                        startup_log = (work / 'var/startup-debug.log').read_text() if (work / 'var/startup-debug.log').exists() else ''
+                        self.fail(f'场景{idx}: 正向场景应放行,rc={proc.returncode} stderr={proc.stderr!r} log={startup_log[-500:]!r}')
                     self.assertEqual(capture, final_addr,
                                      f'场景{idx}: serve 应收到迁移后地址 {final_addr},实际 {capture!r}')
                     self.assertTrue(
                         (work / 'etc/tad-module.cfg').read_text().startswith('HTTP_ADDR="' + final_addr + '"'),
                         f'场景{idx}: 迁移应写回 cfg')
                 else:
-                    # 预检拦截:mock daemon 不得收到 --http(未启动),
-                    # 用 TAD_NETSTAT_OUT 标记位断言拦截确实发生
+                    # luodaoyi R13:负向场景三重断言——退出码 1、诊断落盘、
+                    # 无守护进程启动(不能只靠"没捕获到参数")
+                    self.assertEqual(proc.returncode, 1,
+                                     f'场景{idx}: 预检应拦截 exit 1,实际 rc={proc.returncode} capture={capture!r}')
                     self.assertEqual(capture, '',
-                                     f'场景{idx}: 预检应拦截,实际 daemon 收到 {capture!r}')
+                                     f'场景{idx}: 预检应拦截,daemon 不得收到 --http,实际 {capture!r}')
+                    startup_log = (work / 'var/startup-debug.log').read_text() if (work / 'var/startup-debug.log').exists() else ''
+                    self.assertIn('已被其他进程占用', startup_log,
+                                  f'场景{idx}: 预检诊断必须落盘,日志={startup_log!r}')
+                    self.assertIn(final_addr, startup_log,
+                                  f'场景{idx}: 诊断须含冲突地址 {final_addr}')
+                    pidfile = work / 'var' / 'tad-module.pid'
+                    self.assertFalse(pidfile.exists(),
+                                     f'场景{idx}: 拦截场景不得留下 PID 文件')
+                    self.assertFalse((work / 'var' / 'tad-module.log').exists(),
+                                     f'场景{idx}: 拦截场景守护进程不得启动')
                 # 清理 mock daemon(常驻 sleep 60)
                 pidfile = work / 'var' / 'tad-module.pid'
                 if pidfile.exists():
@@ -811,28 +849,22 @@ exit 0
             with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as tmp:
                 work = Path(tmp)
                 if not self._stage_publish_binary(work):
-                    self.skipTest('go 构建不可用,ln 回退已删除')
+                    self.fail('发布二进制构建失败(ln 回退已删除,无 helper 无从验证)')
                 etc = work / 'etc'
                 var = work / 'var'
                 etc.mkdir()
                 var.mkdir()
                 (work / 'functions').write_text(self._definitions(self.REAL.read_text()))
                 (var / 'wizard-install.env').write_text('HTTP_ADDR="127.0.0.1:9301"\n')
-                # R12:提交原语是 ${BIN} publish(link(2)),shell 的 ln/mv
-                # 替身不再能拦截发布——失败注入改为 chmod 替身(权限不可达
-                # → publish_no_replace 前置检查放弃本轮,语义与生产一致:
-                # 无 cfg、暂存保留、无残 tmp);恢复段用干净 PATH 重跑,
-                # 断言按暂存端口落盘并消费。
-                # 注:publish_no_replace 的权限检查只读 [ -x "${BIN}" ],
-                # 不走 chmod;要让「chmod 600 tmp」失败生效需在 ensure_cfg
-                # 的 chmod 调用上注入。chmod 替身拒绝一切 chmod →
-                # ensure_cfg 判「权限不可达」放弃本轮(保留暂存)。
-                stub_env = self._postinst_env(work)
-                self._inject_postinst_stub(work, 'chmod', 'return 1')
+                # luodaoyi R13:失败注入用目标过滤的 publish 包装器——仅
+                # 配置提交失败一次,其余转交真实二进制,证明「publish 已被
+                # 调用却失败后暂存保留」;恢复段先还原真身再重试
+                restore = self._wrap_publish_filter(work, 'tad-module.cfg')
                 env = dict(os.environ, TEST_DIR=self._shpath(tmp),
                            SYNOPKG_PKGDEST=self._shpath(tmp),
                            SYNOPKG_PKGETC=self._shpath(etc),
                            SYNOPKG_PKGVAR=self._shpath(var))
+                stub_env = self._postinst_env(work)
                 body = r"""
 . "$TEST_DIR/functions"
 CFG_FILE="$TEST_DIR/etc/tad-module.cfg"
@@ -844,8 +876,9 @@ test ! -e "$TEST_DIR/pwned-sentinel" || exit 99
 exit 0
 """
                 body_env = {**env, **stub_env}
-                body_env.setdefault('TEST_DIR', env.get('TEST_DIR', self._shpath(tmp)))
                 subprocess.run(['sh', '-ec', body], env=body_env, check=True, timeout=15)
+                # 恢复真实二进制重试:按暂存端口落盘并消费
+                restore()
                 # 恢复真实 PATH 重试:按暂存端口落盘并消费
                 body_retry = r"""
 . "$TEST_DIR/functions"
@@ -872,6 +905,29 @@ exit 0
         stub = stubs / tool
         stub.write_text(f'#!/bin/sh\n{behavior}\n')
         stub.chmod(0o755)
+
+    def _wrap_publish_filter(self, work, dest_suffix):
+        # luodaoyi R13:失败注入不再拦 chmod(那只证明权限失败,证明不了
+        # 「publish 已被调用却失败后暂存仍保留」)——把 PKGDEST/bin 下的
+        # 真实二进制改名 .real,原位放同路径包装器:仅当 publish 的目标
+        # 以 dest_suffix 结尾时失败一次(模拟 link(2) EEXIST),其余调用
+        # 全部转交真实二进制。返回恢复函数(测完/重试前还原真身)。
+        bin_dst = work / 'bin/tad-module'
+        real = work / 'bin/.tad-module.real'
+        shutil.move(str(bin_dst), str(real))
+        qreal = "'" + self._shpath(real) + "'"
+        wrapper = (
+            '#!/bin/sh\n'
+            'if [ "$1" = "publish" ] && [ $# -ge 3 ]; then\n'
+            '  case "$3" in\n'
+            '    *' + dest_suffix + ') exit 1 ;;\n'
+            '  esac\n'
+            'fi\n'
+            f'exec {qreal} "$@"\n'
+        )
+        bin_dst.write_text(wrapper)
+        bin_dst.chmod(0o755)
+        return lambda: (bin_dst.unlink(missing_ok=True), real.exists() and shutil.move(str(real), str(bin_dst)))
 
     def test_postinst_failure_paths_preserve_cfg_and_stash_wizard(self):
         # 发布走后端 publish 子命令(ln 回退已删),linux 二进制是前提:
@@ -921,11 +977,12 @@ exit 0
                         'case "$3" in *tad-module.cfg.tmp*) exit 1 ;; esac\n'
                         'exit 0')
                 elif stub_kind == 'mv-reject':
-                    # R12:提交原语是 ${BIN} publish(link(2)),shell 的 ln
-                    # 替身拦不到发布——失败注入改为 chmod 替身(权限不可达
-                    # →ensure_cfg/postinst 都在发布前放弃本轮),语义等价:
-                    # 无 cfg、暂存保留、无残 tmp
-                    self._inject_postinst_stub(work, 'chmod', 'return 1')
+                    # luodaoyi R13:拦 chmod 只证明权限失败;这里用目标过滤
+                    # 的 publish 包装器——仅配置提交(目标 tad-module.cfg)
+                    # 失败一次,其余调用(含暂存发布)转交真实二进制,证明
+                    # 「publish 已被调用却失败后暂存仍保留」
+                    restore = self._wrap_publish_filter(work, 'tad-module.cfg')
+                    self._publish_restore = restore
                 run_env = {**env, **stub_env}
                 subprocess.run(['sh', str(self.POSTINST)], env=run_env,
                                check=True, timeout=30, capture_output=True)
@@ -939,11 +996,12 @@ exit 0
                 self.assertFalse((etc / 'tad-module.cfg').exists(),
                                  f'{name}: 不得留下正式 cfg')
                 # 向导选值原子暂存,下次启动可恢复。
-                # chmod 替身场景(含 mv-reject,同为 chmod 注入):替身连暂存
-                # 的 chmod 600 也拒,按权限前置检查语义暂存同样不可达——无
-                # cfg、无暂存、日志如实记录;grep 拆分场景暂存必须完整
+                # chmod 替身场景:替身连暂存的 chmod 600 也拒,按权限前置
+                # 检查语义暂存同样不可达——无 cfg、无暂存、日志如实记录;
+                # mv-reject(publish 被调用但 EEXIST 失败)与 grep 拆分场景
+                # 暂存必须完整——这正是「发布失败不丢选值」要证明的
                 stash = var / 'wizard-install.env'
-                if stub_kind in ('chmod-reject', 'mv-reject'):
+                if stub_kind == 'chmod-reject':
                     self.assertFalse(stash.exists(),
                                      f'{name}: chmod 替身下暂存同样不可达')
                 else:
@@ -956,9 +1014,12 @@ exit 0
                 leftovers = [p.name for p in etc.iterdir() if '.tmp.' in p.name]
                 self.assertEqual(leftovers, [], f'{name}: 残留临时文件 {leftovers}')
                 # 下次启动恢复:ensure_cfg 按暂存端口落盘并消费
-                # (chmod 类场景暂存未写成,跳过恢复断言)
+                # (chmod-reject 场景暂存未写成,跳过恢复断言;
+                #  mv-reject 恢复前先还原真实二进制,否则发布仍被拦)
                 (work / 'functions').write_text(self._definitions(self.REAL.read_text()))
-                if stub_kind not in ('chmod-reject', 'mv-reject'):
+                if stub_kind == 'mv-reject':
+                    self._publish_restore()
+                if stub_kind != 'chmod-reject':
                     body = (
                         '. "$TEST_DIR/functions"\n'
                         'CFG_FILE="$TEST_DIR/etc/tad-module.cfg"\n'
@@ -1156,18 +1217,15 @@ exit 0
         # (ensure_cfg 启动恢复 / postinst 安装暂存)对「目录占位」与
         # 「symlink-to-dir 占位」都必须——发布失败、无嵌套条目残留、暂存
         # 不丢;普通文件竞争仍失败(既有用例覆盖)。
+        # luodaoyi R13:helper 与断言必须在每个 subTest 的 with 块内实际
+        # 执行;CI 上构建失败要明确失败,不得静默跳过。
         for lifecycle in ('ensure-cfg', 'postinst'):
             for occupier in ('dir', 'symlink-dir'):
-                with self.subTest(lifecycle=lifecycle, occupier=occupier),                         tempfile.TemporaryDirectory() as tmp:
+                with self.subTest(lifecycle=lifecycle, occupier=occupier), \
+                     tempfile.TemporaryDirectory() as tmp:
                     work = Path(tmp)
-                if not self._stage_publish_binary(work):
-                    self.skipTest('go 构建不可用,ln 回退已删除')
-                if not self._stage_publish_binary(work):
-                    self.skipTest('go 构建不可用,ln 回退已删除')
-                if not self._stage_publish_binary(work):
-                    self.skipTest('go 构建不可用,ln 回退已删除')
-                if not self._stage_publish_binary(work):
-                    self.skipTest('go 构建不可用,ln 回退已删除')
+                    if not self._stage_publish_binary(work):
+                        self.fail('发布二进制构建失败(ln 回退已删除,无 helper 无从验证)')
                     etc = work / 'etc'
                     var = work / 'var'
                     etc.mkdir()
@@ -1184,6 +1242,7 @@ exit 0
                                SYNOPKG_PKGETC=self._shpath(etc),
                                SYNOPKG_PKGVAR=self._shpath(var),
                                wizard_port='9801')
+                    stub_env = self._postinst_env(work)
                     if lifecycle == 'ensure-cfg':
                         body = (
                             '. "$TEST_DIR/functions"\n'
@@ -1194,14 +1253,6 @@ exit 0
                             'test -f "$TEST_DIR/var/wizard-install.env" || exit 115\n'
                             'exit 0\n'
                         )
-                        run_env = {k: v for k, v in env.items() if k != 'PATH'}
-                        run_env['PATH'] = '/bin:/usr/bin'
-                        run_env['TEST_DIR'] = env['TEST_DIR']
-                    else:
-                        body = ''
-                        pass
-                    stub_env = self._postinst_env(work)
-                    if lifecycle == 'ensure-cfg':
                         # 占位在 ensure_cfg 运行途中创建:grep 替身钩子在
                         # stage 写完、发布未执行时竞争占位
                         real_grep = shutil.which('grep')
@@ -1226,15 +1277,16 @@ exit 0
                         # 无嵌套条目:占位目录内不得有误入的 stage 链接
                         if occupier == 'dir':
                             nested = list((etc / 'tad-module.cfg').iterdir())
-                            self.assertEqual(nested, [],
-                                             f'{lifecycle}/{occupier}: 嵌套条目 {nested}')
                         else:
                             nested = list((etc / 'real.d').iterdir())
-                            self.assertEqual(nested, [],
-                                             f'{lifecycle}/{occupier}: 嵌套条目 {nested}')
+                        self.assertEqual(nested, [],
+                                         f'{lifecycle}/{occupier}: 嵌套条目 {nested}')
+                        # 暂存不消费(发布失败,重试语义)
+                        self.assertTrue((var / 'wizard-install.env').is_file(),
+                                        f'{lifecycle}/{occupier}: 暂存必须保留')
                     else:
                         # postinst 生命周期:占位先建好,postinst 内部 publish
-                        # 时 ln 必失败;用 PATH 内真身(无替身)验证原语本身
+                        # 时 link(2) 必失败;用 PATH 内真身(无替身)验证原语本身
                         if occupier == 'dir':
                             (etc / 'tad-module.cfg').mkdir()
                         else:
@@ -1245,7 +1297,6 @@ exit 0
                             except OSError:
                                 # Windows 无 symlink 特权:CI Linux 覆盖本场景
                                 self.skipTest('symlink 需要特权(Windows 限制)')
-                        stub_env = self._postinst_env(work)
                         run_env = {**env, **stub_env}
                         subprocess.run(['sh', str(self.POSTINST)], env=run_env,
                                        check=True, timeout=30, capture_output=True)
