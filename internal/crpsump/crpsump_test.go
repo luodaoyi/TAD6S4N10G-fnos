@@ -668,6 +668,7 @@ func TestAutoDetectRestoreConfiguredRestoresOriginalPins(t *testing.T) {
 //  1. switchPin 恢复原引脚失败 (failOutb 全写失败) -> "恢复原引脚失败"
 //  2. switchPin 成功但 busReset 末尾 sdaRelease 端口写失败 -> "总线复位失败",
 //     SDA 滞留输出须保留在 driven 追踪; 故障清除后重试应释放并消除错误。
+//
 // 复位末尾的释放与 initDirs 的 SDA 置输入写同一值 (Pin20: 0xCD 寄存器清 bit0
 // => sioWrite 数据口 0x2F 写 0x06), 用 failOnNth 跳过 initDirs 那次精确打击复位末尾。
 func TestAutoDetectRestoreConfiguredFailurePropagates(t *testing.T) {

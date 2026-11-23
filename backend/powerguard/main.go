@@ -252,7 +252,7 @@ func serve(args []string) error {
 	// CRPS PMBus 监控板块 (crpsump)：可选功能，硬件缺失/未配置时仅 CRPS 页面降级，
 	// 主功能照常——与 history 同样的失败哲学。配置走独立 crps.json（与主配置同目录），
 	// 耗电统计 energy.json 同目录落盘，退出时保存。
-	crpsHandler, crpsEnergySave := initCrps(logger, filepath.Join(filepath.Dir(*config), "crps.json"))
+	crpsHandler, crpsEnergySave := initCrps(logger, filepath.Join(filepath.Dir(*config), "crps.json"), ctx)
 	if crpsEnergySave != nil {
 		defer crpsEnergySave() // CRPS 耗电统计退出落盘 (ctx.Done 与 server 错误两条路径均覆盖)
 	}
@@ -491,6 +491,17 @@ func gpioLoop(ctx context.Context, manager *powerguard.Manager, logger *log.Logg
 	var config powerguard.GPIOConfig
 	var nextConfigLoad time.Time
 	var lastLoggedError string
+	var lastLoggedErrorAt time.Time
+	// logGPIOError 按「同错误文本 1 分钟内只记一次」去重: 字符串比较只能压住同一
+	// 错误, 两种错误交替出现 (如 open/poll 轮流失败) 时原逻辑会每次都刷屏。
+	logGPIOError := func(stage string, err error) {
+		now := time.Now()
+		if err.Error() != lastLoggedError || now.Sub(lastLoggedErrorAt) >= time.Minute {
+			logger.Printf("gpio %s failed: %v", stage, err)
+			lastLoggedError = err.Error()
+			lastLoggedErrorAt = now
+		}
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -499,10 +510,7 @@ func gpioLoop(ctx context.Context, manager *powerguard.Manager, logger *log.Logg
 			if !now.Before(nextConfigLoad) {
 				cfg, err := manager.LoadOrCreateConfig()
 				if err != nil {
-					if err.Error() != lastLoggedError {
-						logger.Printf("gpio config failed: %v", err)
-						lastLoggedError = err.Error()
-					}
+					logGPIOError("config", err)
 					nextConfigLoad = now.Add(time.Second)
 					continue
 				}
@@ -523,19 +531,13 @@ func gpioLoop(ctx context.Context, manager *powerguard.Manager, logger *log.Logg
 				port, err = os.Open(manager.GPIOPortPath())
 				if err != nil {
 					manager.ResetGPIO(true, false, err)
-					if err.Error() != lastLoggedError {
-						logger.Printf("gpio open failed: %v", err)
-						lastLoggedError = err.Error()
-					}
+					logGPIOError("open", err)
 					continue
 				}
 			}
 			events, err := manager.PollGPIO(config, port, now)
 			if err != nil {
-				if err.Error() != lastLoggedError {
-					logger.Printf("gpio poll failed: %v", err)
-					lastLoggedError = err.Error()
-				}
+				logGPIOError("poll", err)
 				_ = port.Close()
 				port = nil
 				continue
@@ -573,7 +575,7 @@ func usage() {
 // 耗电统计落盘 <cfgPath 同目录>/energy.json。NewBus 对非法引脚名内部回退默认值、
 // 硬件不可达在请求时降级为 no-gpio，因此本函数不返回错误，CRPS 始终挂载。
 // 日志沿用 crpsump 自有的 /tmp/psu-monitor.log (自带按大小轮转)，不并入主日志。
-func initCrps(logger *log.Logger, cfgPath string) (http.Handler, func()) {
+func initCrps(logger *log.Logger, cfgPath string, ctx context.Context) (http.Handler, func()) {
 	sclPin, sdaPin := crpsump.DefaultSCL, crpsump.DefaultSDA
 	configured := false
 	if data, err := os.ReadFile(cfgPath); err == nil {
@@ -601,8 +603,8 @@ func initCrps(logger *log.Logger, cfgPath string) (http.Handler, func()) {
 	// 日志放到 crps.json 同目录 (宿主状态目录), 不使用全局可写的 /tmp
 	crpsump.LogPath = filepath.Join(filepath.Dir(cfgPath), "crps.log")
 	bus := crpsump.NewBus(sclPin, sdaPin, configured)
-	energy := crpsump.StartEnergy(bus, filepath.Join(filepath.Dir(cfgPath), "energy.json"))
-	crpsump.StartStatusRefresher(bus) // 状态快照后台刷新: CRPS 页面首开即有数据
+	energy := crpsump.StartEnergy(bus, filepath.Join(filepath.Dir(cfgPath), "energy.json"), ctx)
+	crpsump.StartStatusRefresher(bus, ctx) // 状态快照后台刷新: CRPS 页面首开即有数据
 	crpsump.LogStartup(bus, sclPin, sdaPin)
 	logger.Printf("crps module enabled config=%s energy=%s", cfgPath, filepath.Join(filepath.Dir(cfgPath), "energy.json"))
 	srv := &crpsump.AppServer{Bus: bus, ConfigPath: cfgPath}

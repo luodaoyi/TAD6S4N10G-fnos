@@ -46,12 +46,20 @@ func refreshStatusSnapshot(bus *Bus) {
 	}
 }
 
-// StartStatusRefresher 启动状态快照后台刷新循环 (两个入口各调一次)
-func StartStatusRefresher(bus *Bus) {
+// StartStatusRefresher 启动状态快照后台刷新循环 (两个入口各调一次)。
+// ctx 取消后循环退出，避免 goroutine 泄漏。
+func StartStatusRefresher(bus *Bus, ctx context.Context) {
 	go func() {
 		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
 			refreshStatusSnapshot(bus)
-			time.Sleep(StatusRefreshInterval)
+			if !sleepCtx(ctx, StatusRefreshInterval) {
+				return
+			}
 		}
 	}()
 }

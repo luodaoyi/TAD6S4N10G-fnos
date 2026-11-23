@@ -1,6 +1,7 @@
 package crpsump
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"sort"
@@ -242,13 +243,15 @@ func (e *EnergyStats) save() error {
 
 // energySampler 后台采样循环: 每 EnergySampleInterval 读一次 PIN 并积分, 周期落盘。
 // 与前端轮询共用总线 (mutex 串行化), 每周期只多 1 次 readWord, 开销可忽略。
-func energySampler(bus *Bus) {
+func energySampler(ctx context.Context, bus *Bus) {
 	last := time.Now()
 	save := time.NewTicker(EnergySaveInterval)
 	defer save.Stop()
 	Logf("耗电统计采样已启动: 每 %s 采样 READ_PIN, 每 %s 落盘", EnergySampleInterval, EnergySaveInterval)
 	for {
 		select {
+		case <-ctx.Done():
+			return
 		case <-save.C:
 			energyStats.Save()
 		case <-time.After(EnergySampleInterval):
@@ -266,9 +269,9 @@ func energySampler(bus *Bus) {
 }
 
 // StartEnergy 初始化全局耗电统计并启动后台采样循环 (backend 入口调用),
-// 返回实例供退出前落盘。
-func StartEnergy(bus *Bus, path string) *EnergyStats {
+// 返回实例供退出前落盘。ctx 取消后采样循环退出 (save ticker 由 defer 停止)。
+func StartEnergy(bus *Bus, path string, ctx context.Context) *EnergyStats {
 	energyStats = NewEnergy(path)
-	go energySampler(bus)
+	go energySampler(ctx, bus)
 	return energyStats
 }

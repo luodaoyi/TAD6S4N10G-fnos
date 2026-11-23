@@ -115,6 +115,10 @@ var Cmd = map[string]byte{
 //                 (sclName/sdaName/sclCfg/sdaCfg/ok)。任何访问底层 GPIO 的操作必须先持有 mu,
 //                 保证切换引脚瞬间不会有正在进行的传输半途换针脚。
 //   - stateMu   : 保护非 I/O 状态字段 (configured / fanMode / readable 缓存)。
+//   - 跨锁快照   : readAll 等读方先取 stateMu 的 configured/fanMode, 再取 mu 做 I/O 并看 ok。
+//                 两次加锁之间状态可能已变, 得到的可能是半新半旧快照——这是有意接受的
+//                 良性竞态: 最坏情况晚一轮反映切换 (auto/manual 切换本身有固件迟滞),
+//                 换取 I/O 锁不承担状态读。不要基于跨锁一致性做写决策。
 //   - 方向缓存   : sclOut/sdaOut 记录 SIO 方向寄存器缓存, 只在方向真正变化时写 SIO,
 //                 避免每次位操作都完整走一遍 enter/exit (项目惯例要求的性能优化)。
 
@@ -894,8 +898,10 @@ func (b *Bus) setFan(ctx context.Context, mode string, pct int) bool {
 		return ok
 	}
 	b.setFanMode("auto")
+	// 复用调用方 ctx: 随请求取消而非 context.Background(), 避免每次切换都留下
+	// 一个固定 3s 的后台 goroutine (被刷时无上界)。
 	go func() {
-		if !sleepCtx(context.Background(), 3*time.Second) {
+		if !sleepCtx(ctx, 3*time.Second) {
 			return
 		}
 		rpm := b.fanRpm()
