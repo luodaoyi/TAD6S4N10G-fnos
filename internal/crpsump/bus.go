@@ -50,6 +50,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -108,6 +109,9 @@ var Cmd = map[string]byte{
 	"MFR_REVISION":  0x9b,
 }
 
+// autoFanDiagDelay 切回自动后的 RPM 读回延迟: 固件调速有迟滞, 立即读是旧值。
+const autoFanDiagDelay = 3 * time.Second
+
 // ---------------- PMBus bitbang 总线 ----------------
 //
 // 并发模型:
@@ -140,6 +144,13 @@ type Bus struct {
 	fanMode    string
 	lastOK     bool // readable() TTL 缓存
 	lastTs     int64
+	// 切回自动的延迟 RPM 诊断合并状态 (mu 保护): pending 非 nil 表示已有延迟任务
+	// 在跑, 重复请求只更新 pendingBaseline, 不另起 goroutine。
+	autoFanDiag struct {
+		mu              sync.Mutex
+		pending         chan struct{}
+		pendingBaseline *float64
+	}
 }
 
 // NewBus 创建 GPIO bitbang PMBus 总线: 校验引脚名, configured 时初始化方向寄存器。
@@ -703,8 +714,24 @@ func (b *Bus) i2cReadByte(ack bool) int {
 
 // ---- 事务 (自带加锁) ----
 
+// readWordOverride 单测替身: 非 nil 时 readWord 直接返回其结果, 不走 bitbang
+// (mock 总线所有位读同一口值, 无法表达非零 word; 该接缝让测试注入真实非零采样)。
+// atomic 访问: 延迟快照 goroutine 可能跨测试存续, 测试恢复替身时不得与在途读竞争。
+var readWordOverride atomic.Pointer[func(b *Bus, cmd byte) *uint16]
+
+func setReadWordOverride(fn func(b *Bus, cmd byte) *uint16) {
+	if fn == nil {
+		readWordOverride.Store(nil)
+		return
+	}
+	readWordOverride.Store(&fn)
+}
+
 // readWord 读一个 word (从设备先发低字节), 返回 nil 表示失败 (含端口写失败)
 func (b *Bus) readWord(cmd byte) *uint16 {
+	if fn := readWordOverride.Load(); fn != nil {
+		return (*fn)(b, cmd)
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.ioErr = nil
@@ -898,15 +925,33 @@ func (b *Bus) setFan(ctx context.Context, mode string, pct int) bool {
 		return ok
 	}
 	b.setFanMode("auto")
-	// 复用调用方 ctx: 随请求取消而非 context.Background(), 避免每次切换都留下
-	// 一个固定 3s 的后台 goroutine (被刷时无上界)。
-	go func() {
-		if !sleepCtx(ctx, 3*time.Second) {
-			return
-		}
-		rpm := b.fanRpm()
-		Logf("切回自动: 写 FAN_COMMAND_1=10%% -> FAN=%s (手动基线=%s)", ptrStr(rpm), ptrStr(baseline))
-	}()
+	// 延迟 RPM 诊断由服务生命周期管理 (ctx), 不用请求 ctx —— 请求一返回就取消,
+	// 诊断日志永远发不出。多次快速切回自动时合并成单个延迟任务 (只记最后一次
+	// baseline), 不为每次请求留无界 goroutine。
+	b.autoFanDiag.mu.Lock()
+	b.autoFanDiag.pendingBaseline = baseline
+	if b.autoFanDiag.pending == nil {
+		done := make(chan struct{})
+		b.autoFanDiag.pending = done
+		b.autoFanDiag.mu.Unlock()
+		go func() {
+			defer close(done)
+			if !sleepCtx(ctx, autoFanDiagDelay) {
+				b.autoFanDiag.mu.Lock()
+				b.autoFanDiag.pending = nil
+				b.autoFanDiag.mu.Unlock()
+				return
+			}
+			b.autoFanDiag.mu.Lock()
+			base := b.autoFanDiag.pendingBaseline
+			b.autoFanDiag.pending = nil
+			b.autoFanDiag.mu.Unlock()
+			rpm := b.fanRpm()
+			Logf("切回自动: 写 FAN_COMMAND_1=10%% -> FAN=%s (手动基线=%s)", ptrStr(rpm), ptrStr(base))
+		}()
+		return ok
+	}
+	b.autoFanDiag.mu.Unlock()
 	return ok
 }
 

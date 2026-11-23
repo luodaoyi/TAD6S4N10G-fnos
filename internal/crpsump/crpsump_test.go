@@ -1148,3 +1148,89 @@ func TestEnergyStopJoinsInFlightSamplerWithoutPresetCancel(t *testing.T) {
 		t.Fatal("stop 未在 5s 内 join 采样 goroutine, 疑似永久阻塞")
 	}
 }
+
+// 回归 (review 四轮): 替身覆盖「有真实采样在途」的退出路径 —— 可控时钟让采样
+// 循环真正跑完一次 Sample (非零 dt 积分), 观察点确认采样发生在途, 随后取消->
+// stop->最终 Save, 断言 energy.json 落盘且内容含该采样。若采样器过早返回
+// (未等在途采样), 置脏不会发生, 落盘断言失败。
+func TestEnergyShutdownAfterInFlightSample(t *testing.T) {
+	stubPortAvailable(t, true)
+	oldStats := energyStats
+	defer func() { energyStats = oldStats }()
+
+	b := NewBus("Pin19", "Pin20", false)
+	mock := newMockPIO()
+	mock.readMask[GPPins["Pin20"].Port] = 0 // ACK 恒真
+	b.pio = mock
+	if ok, _ := b.reconfigure(nil, nil); !ok {
+		t.Fatal("reconfigure 失败")
+	}
+
+	// 可控采样时钟: 第一发立即到点, 之后卡住 (模拟周期进行中)
+	tick1 := make(chan time.Time, 1)
+	tick1 <- time.Now()
+	oldTick := energySampleTick
+	energySampleTick = func(ctx context.Context) <-chan time.Time { return tick1 }
+	defer func() { energySampleTick = oldTick }()
+
+	var sampleMu sync.Mutex
+	var sampledPin float64 = -1
+	oldHook := energySampleHook
+	energySampleHook = func(pin float64, dt time.Duration) {
+		sampleMu.Lock()
+		sampledPin = pin
+		sampleMu.Unlock()
+	}
+	defer func() { energySampleHook = oldHook }()
+
+	// 替身注入非零 READ_PIN (100W): mock 总线所有位读同一口值表达不了非零 word,
+	// 经 readWordOverride 接缝注入, 使在途采样真实积分非零功率
+	oldOverride := readWordOverride.Load()
+	setReadWordOverride(func(b *Bus, cmd byte) *uint16 {
+		if cmd == Cmd["READ_PIN"] {
+			// linear11: mant=100, exp=0 -> raw=100
+			w := uint16(100)
+			return &w
+		}
+		return nil
+	})
+	defer func() {
+		if oldOverride == nil {
+			readWordOverride.Store(nil)
+		} else {
+			readWordOverride.Store(oldOverride)
+		}
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	path := filepath.Join(t.TempDir(), "energy.json")
+	e, stop := StartEnergy(b, path, ctx)
+
+	// 等待非零在途采样真实发生 (观察点), 而不是假定时序
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		sampleMu.Lock()
+		p := sampledPin
+		sampleMu.Unlock()
+		if p == 100 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("5s 内未观察到非零采样: 采样循环未按替身时钟运行 (最后 pin=%v)", p)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// 宿主退出序列 (生产入口 newCRPSExitCallback 的三步语义): cancel -> join -> Save
+	cancel()
+	stop()
+	e.Save()
+
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("含在途采样的最终 Save 未落盘: %v", err)
+	}
+	data, _ := os.ReadFile(path)
+	if !strings.Contains(string(data), `"last_pin_w": 100`) {
+		t.Fatalf("energy.json 应含在途采样的 100W 读数: %s", data)
+	}
+}

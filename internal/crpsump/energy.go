@@ -23,6 +23,15 @@ const (
 	EnergyDaysKeep       = 400              // 按日明细保留天数 (~13 个月)
 )
 
+// energySampleTick 单测可替换的采样间隔信号源 (默认 time.After(EnergySampleInterval))。
+// 注入后采样循环用可控时钟驱动, 测试得以在毫秒级确认「采样在途」而非立即空转退出。
+var energySampleTick = func(ctx context.Context) <-chan time.Time {
+	return time.After(EnergySampleInterval)
+}
+
+// energySampleHook 单测观察点: 每次 Sample 真实发生时回调 (含 pin=0 的零功率采样)。
+var energySampleHook func(pin float64, dt time.Duration)
+
 type EnergyStats struct {
 	mu        sync.Mutex
 	path      string
@@ -126,6 +135,9 @@ func (e *EnergyStats) addWh(wh float64, now time.Time) {
 
 // Sample 记录一次功率采样: 用距上次采样的时长做矩形积分
 func (e *EnergyStats) Sample(pin float64, dt time.Duration) {
+	if energySampleHook != nil { // 单测观察点: 确认采样真实发生 (非空转)
+		energySampleHook(pin, dt)
+	}
 	now := time.Now()
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -254,7 +266,7 @@ func energySampler(ctx context.Context, bus *Bus) {
 			return
 		case <-save.C:
 			energyStats.Save()
-		case <-time.After(EnergySampleInterval):
+		case <-energySampleTick(ctx):
 		}
 		now := time.Now()
 		dt := now.Sub(last)
