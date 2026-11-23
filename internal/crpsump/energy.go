@@ -1,6 +1,7 @@
 package crpsump
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"sort"
@@ -21,6 +22,15 @@ const (
 	EnergyMaxGap         = 10 * time.Minute // 采样间隔上限: 超出视为中断, 不计入
 	EnergyDaysKeep       = 400              // 按日明细保留天数 (~13 个月)
 )
+
+// energySampleTick 单测可替换的采样间隔信号源 (默认 time.After(EnergySampleInterval))。
+// 注入后采样循环用可控时钟驱动, 测试得以在毫秒级确认「采样在途」而非立即空转退出。
+var energySampleTick = func(ctx context.Context) <-chan time.Time {
+	return time.After(EnergySampleInterval)
+}
+
+// energySampleHook 单测观察点: 每次 Sample 真实发生时回调 (含 pin=0 的零功率采样)。
+var energySampleHook func(pin float64, dt time.Duration)
 
 type EnergyStats struct {
 	mu        sync.Mutex
@@ -125,6 +135,9 @@ func (e *EnergyStats) addWh(wh float64, now time.Time) {
 
 // Sample 记录一次功率采样: 用距上次采样的时长做矩形积分
 func (e *EnergyStats) Sample(pin float64, dt time.Duration) {
+	if energySampleHook != nil { // 单测观察点: 确认采样真实发生 (非空转)
+		energySampleHook(pin, dt)
+	}
 	now := time.Now()
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -242,16 +255,18 @@ func (e *EnergyStats) save() error {
 
 // energySampler 后台采样循环: 每 EnergySampleInterval 读一次 PIN 并积分, 周期落盘。
 // 与前端轮询共用总线 (mutex 串行化), 每周期只多 1 次 readWord, 开销可忽略。
-func energySampler(bus *Bus) {
+func energySampler(ctx context.Context, bus *Bus) {
 	last := time.Now()
 	save := time.NewTicker(EnergySaveInterval)
 	defer save.Stop()
 	Logf("耗电统计采样已启动: 每 %s 采样 READ_PIN, 每 %s 落盘", EnergySampleInterval, EnergySaveInterval)
 	for {
 		select {
+		case <-ctx.Done():
+			return
 		case <-save.C:
 			energyStats.Save()
-		case <-time.After(EnergySampleInterval):
+		case <-energySampleTick(ctx):
 		}
 		now := time.Now()
 		dt := now.Sub(last)
@@ -265,10 +280,15 @@ func energySampler(bus *Bus) {
 	}
 }
 
-// StartEnergy 初始化全局耗电统计并启动后台采样循环 (backend 入口调用),
-// 返回实例供退出前落盘。
-func StartEnergy(bus *Bus, path string) *EnergyStats {
+// StartEnergy 初始化全局耗电统计并启动后台采样循环 (backend 入口调用)。
+// 返回实例与 stop 函数: stop 等 ctx 取消后采样 goroutine 真正退出并 join,
+// 之后调用方再做最终 Save, 确保最终快照之后不会再发生采样写入。
+func StartEnergy(bus *Bus, path string, ctx context.Context) (*EnergyStats, func()) {
 	energyStats = NewEnergy(path)
-	go energySampler(bus)
-	return energyStats
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		energySampler(ctx, bus)
+	}()
+	return energyStats, func() { <-done }
 }

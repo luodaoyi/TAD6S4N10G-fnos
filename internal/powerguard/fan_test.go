@@ -1893,12 +1893,18 @@ func recordFanPWMWrites(t *testing.T) func() []int {
 	t.Helper()
 	var mu sync.Mutex
 	var writes []int
+	fanPWMWriteHookMu.Lock()
 	fanPWMWriteHook = func(fan FanDevice, raw int) {
 		mu.Lock()
 		writes = append(writes, raw)
 		mu.Unlock()
 	}
-	t.Cleanup(func() { fanPWMWriteHook = nil })
+	fanPWMWriteHookMu.Unlock()
+	t.Cleanup(func() {
+		fanPWMWriteHookMu.Lock()
+		fanPWMWriteHook = nil
+		fanPWMWriteHookMu.Unlock()
+	})
 	return func() []int {
 		mu.Lock()
 		defer mu.Unlock()
