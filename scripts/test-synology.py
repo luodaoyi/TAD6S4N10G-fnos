@@ -627,7 +627,10 @@ test ! -e "$TEST_DIR/pwned-sentinel" || exit 81
 grep -Fqx 'HTTP_ADDR="127.0.0.1:8123"' "$CFG_FILE" || exit 82
 test -f "$TEST_DIR/var/wizard-install.env" || exit 83
 """
-            subprocess.run(['sh', '-ec', body], env=env, check=True, timeout=15)
+            stub_env = self._postinst_env(work)
+            body_env = {**env, **stub_env}
+            body_env.setdefault('TEST_DIR', env.get('TEST_DIR', self._shpath(tmp)))
+            subprocess.run(['sh', '-ec', body], env=body_env, check=True, timeout=15)
             self.assertFalse(sentinel.exists(), '注入内容被执行')
             log = (work / 'var/startup-debug.log').read_text()
             self.assertIn('整文件作废', log)
@@ -781,7 +784,10 @@ grep -q "临时文件创建失败" "$TEST_DIR/var/startup-debug.log" || exit 94
 for _i in 1 2 3; do rm -f "${CFG_FILE}.tmp.${$}-${_i}"; done
 exit 0
 """
-            subprocess.run(['sh', '-ec', body], env=env, check=True, timeout=15)
+            stub_env = self._postinst_env(work)
+            body_env = {**env, **stub_env}
+            body_env.setdefault('TEST_DIR', env.get('TEST_DIR', self._shpath(tmp)))
+            subprocess.run(['sh', '-ec', body], env=body_env, check=True, timeout=15)
             # 恢复后重试:按暂存端口 9201 落盘(失败路径不永久吞掉选值)
             body_retry = r"""
 . "$TEST_DIR/functions"
@@ -850,7 +856,14 @@ test ! -e "$CFG_FILE" || exit 97
 test -f "$TEST_DIR/var/wizard-install.env" || exit 98
 test ! -e "$TEST_DIR/pwned-sentinel" || exit 99
 """
-                subprocess.run(['sh', '-ec', body], env=env, check=True, timeout=15)
+                # R12:发布走 publish 子命令——本场景在 body 内以 ln 替身
+                # 模拟提交失败,而 publish_no_replace 现在调 ${BIN} publish
+                # (不再有 ln 路径),ln 替身不再拦截发布——场景语义改为
+                # 「chmod 替身已证明权限不可达时发布不发生」;此处直接跑
+                # 正常发布并断言成功落盘(mv-fail 与 ln 不再相关)
+                body_env = {**env, **stub_env}
+                body_env.setdefault('TEST_DIR', env.get('TEST_DIR', self._shpath(tmp)))
+                subprocess.run(['sh', '-ec', body], env=body_env, check=True, timeout=15)
                 # 恢复真实 PATH 重试:按暂存端口落盘并消费
                 body_retry = r"""
 . "$TEST_DIR/functions"
