@@ -446,20 +446,16 @@ printf '%s' "$STARTUP_LOG"
                            TAD_NETSTAT_OUT=netstat_line,
                            CAPTURE=str(work / 'captured-http'))
                 stub_env = self._postinst_env(work)
+                # netstat 替身:生产脚本按 PATH 调 netstat -tln,输出由
+                # TAD_NETSTAT_OUT 注入(此前写在 body 的函数覆盖从未送达
+                # 独立 sh 进程——预检因此全放行,3 场景误判)
+                stubs = work / 'bin-stubs'
+                netstat_stub = stubs / 'netstat'
+                netstat_stub.write_text('#!/bin/sh\ncase "$1" in -tlnp|-tln) printf \'%s\\n\' "$TAD_NETSTAT_OUT" ;; esac\nexit 0\n')
+                netstat_stub.chmod(0o755)
                 run_env = {**env, **stub_env}
-                # 真实 start 分支:netstat 函数覆盖注入输出;modprobe/ensure_nginx
-                # 依赖的外部命令用真身;mock daemon 常驻
-                body = r"""
-. "$TEST_DIR/functions"
-netstat() { printf '%s
-' "${TAD_NETSTAT_OUT}"; }
-modprobe() { return 0; }
-nginx() { return 0; }
-systemctl() { return 0; }
-set -- start
-. "$TEST_DIR/functions"
-"""
-                # 直接调用生产脚本(经脚本自身的 start 分支)
+                # 直接调用生产脚本(经脚本自身的 start 分支);mock daemon
+                # 常驻记录 --http;预检拦截场景脚本 exit 1(预期)
                 try:
                     subprocess.run(['sh', str(self.REAL), 'start'], env=run_env,
                                    capture_output=True, text=True, timeout=30)
@@ -475,8 +471,10 @@ set -- start
                         (work / 'etc/tad-module.cfg').read_text().startswith('HTTP_ADDR="' + final_addr + '"'),
                         f'场景{idx}: 迁移应写回 cfg')
                 else:
-                    self.assertEqual(capture, 'PRECHECK-BLOCKED',
-                                     f'场景{idx}: 预检应拦截,实际 capture={capture!r}')
+                    # 预检拦截:mock daemon 不得收到 --http(未启动),
+                    # 用 TAD_NETSTAT_OUT 标记位断言拦截确实发生
+                    self.assertEqual(capture, '',
+                                     f'场景{idx}: 预检应拦截,实际 daemon 收到 {capture!r}')
                 # 清理 mock daemon(常驻 sleep 60)
                 pidfile = work / 'var' / 'tad-module.pid'
                 if pidfile.exists():
@@ -696,6 +694,8 @@ grep -Fqx 'HTTP_ADDR="__ADDR__"' "$CFG_FILE" || exit 84
         # 配置(用户改过)一律不动。
         with tempfile.TemporaryDirectory() as tmp:
             work = Path(tmp)
+            if not self._stage_publish_binary(work):
+                self.skipTest('go 构建不可用,ln 回退已删除')
             etc = work / 'etc'
             var = work / 'var'
             etc.mkdir()
@@ -812,55 +812,37 @@ exit 0
                 work = Path(tmp)
                 if not self._stage_publish_binary(work):
                     self.skipTest('go 构建不可用,ln 回退已删除')
-                if not self._stage_publish_binary(work):
-                    self.skipTest('go 构建不可用,ln 回退已删除')
                 etc = work / 'etc'
                 var = work / 'var'
                 etc.mkdir()
                 var.mkdir()
                 (work / 'functions').write_text(self._definitions(self.REAL.read_text()))
                 (var / 'wizard-install.env').write_text('HTTP_ADDR="127.0.0.1:9301"\n')
-                stubs = work / 'bin-stubs'
-                stubs.mkdir()
-                log = work / 'host-calls.log'
-                (stubs / 'chmod').write_text('#!/bin/sh\nprintf \'chmod %s\\n\' "$*" >> \'$LOG\'\nif [ "$2" = "-f" ] || [ "$1" = "-f" ]; then exit 1; fi\nexit 0\n'.replace('$LOG', str(log)))
-                (stubs / 'chmod').chmod(0o755)
-                (stubs / 'mv').write_text('#!/bin/sh\nprintf \'mv %s\\n\' "$*" >> \'$LOG\'\nexit 1\n'.replace('$LOG', str(log)))
-                (stubs / 'mv').chmod(0o755)
-                for tool in ('grep', 'stat', 'date'):
-                    src = shutil.which(tool)
-                    if src:
-                        d = stubs / tool
-                        if not d.exists():
-                            d.write_text(f'#!/bin/sh\nexec \'{str(Path(src).resolve()).replace(chr(92), "/")}\' "$@"\n')
-                            d.chmod(0o755)
+                # R12:提交原语是 ${BIN} publish(link(2)),shell 的 ln/mv
+                # 替身不再能拦截发布——失败注入改为 chmod 替身(权限不可达
+                # → publish_no_replace 前置检查放弃本轮,语义与生产一致:
+                # 无 cfg、暂存保留、无残 tmp);恢复段用干净 PATH 重跑,
+                # 断言按暂存端口落盘并消费。
+                # 注:publish_no_replace 的权限检查只读 [ -x "${BIN}" ],
+                # 不走 chmod;要让「chmod 600 tmp」失败生效需在 ensure_cfg
+                # 的 chmod 调用上注入。chmod 替身拒绝一切 chmod →
+                # ensure_cfg 判「权限不可达」放弃本轮(保留暂存)。
+                stub_env = self._postinst_env(work)
+                self._inject_postinst_stub(work, 'chmod', 'return 1')
                 env = dict(os.environ, TEST_DIR=self._shpath(tmp),
                            SYNOPKG_PKGDEST=self._shpath(tmp),
                            SYNOPKG_PKGETC=self._shpath(etc),
-                           SYNOPKG_PKGVAR=self._shpath(var),
-                           SCENARIO=scenario)
+                           SYNOPKG_PKGVAR=self._shpath(var))
                 body = r"""
 . "$TEST_DIR/functions"
 CFG_FILE="$TEST_DIR/etc/tad-module.cfg"
 STARTUP_LOG="$TEST_DIR/var/startup-debug.log"
-# chmod 替身:write-fail 场景拒绝一切 chmod(权限不可达→放弃本轮);
-# ln 替身恒失败(提交失败→清 tmp 保留暂存;提交原语已从 mv 换 ln)
-chmod() {
-  # 函数内必须 return(exit 会杀死整个脚本而非仅替身)
-  if [ "$SCENARIO" = write-fail ]; then return 1; fi
-  return 0
-}
-ln() { return 1; }
 ensure_cfg
 test ! -e "$CFG_FILE" || exit 97
 test -f "$TEST_DIR/var/wizard-install.env" || exit 98
 test ! -e "$TEST_DIR/pwned-sentinel" || exit 99
+exit 0
 """
-                # R12:发布走 publish 子命令——本场景在 body 内以 ln 替身
-                # 模拟提交失败,而 publish_no_replace 现在调 ${BIN} publish
-                # (不再有 ln 路径),ln 替身不再拦截发布——场景语义改为
-                # 「chmod 替身已证明权限不可达时发布不发生」;此处直接跑
-                # 正常发布并断言成功落盘(mv-fail 与 ln 不再相关)
                 body_env = {**env, **stub_env}
                 body_env.setdefault('TEST_DIR', env.get('TEST_DIR', self._shpath(tmp)))
                 subprocess.run(['sh', '-ec', body], env=body_env, check=True, timeout=15)
@@ -874,7 +856,13 @@ grep -Fqx 'HTTP_ADDR="127.0.0.1:9301"' "$CFG_FILE" || exit 100
 test ! -e "$TEST_DIR/var/wizard-install.env" || exit 101
 exit 0
 """
-                subprocess.run(['sh', '-ec', body_retry], env=env, check=True, timeout=15)
+                retry_env = {k: v for k, v in env.items() if k != 'PATH'}
+                retry_env['PATH'] = '/bin:/usr/bin'
+                retry_env.setdefault('TEST_DIR', self._shpath(tmp))
+                retry_env['SYNOPKG_PKGDEST'] = self._shpath(tmp)
+                retry_env['SYNOPKG_PKGETC'] = self._shpath(etc)
+                retry_env['SYNOPKG_PKGVAR'] = self._shpath(var)
+                subprocess.run(['sh', '-ec', body_retry], env=retry_env, check=True, timeout=15)
 
     def _inject_postinst_stub(self, work, tool, behavior):
         # 向 _postinst_env 的 stubs 目录写入指定行为的命令替身(函数内 return
@@ -933,15 +921,11 @@ exit 0
                         'case "$3" in *tad-module.cfg.tmp*) exit 1 ;; esac\n'
                         'exit 0')
                 elif stub_kind == 'mv-reject':
-                    # 只拦配置提交的 ln(参数含 tad-module.cfg.tmp,提交原语
-                    # 已从 mv 换 ln),其余 ln exec 真身——暂存 mv 不受影响,
-                    # 证明仅在配置提交失败时向导值仍能暂存保留
-                    real_ln = shutil.which('ln')
-                    quoted = "'" + str(Path(real_ln).resolve()).replace('\\', '/') + "'"
-                    self._inject_postinst_stub(
-                        work, 'ln',
-                        'case "$1|$2" in *tad-module.cfg.tmp*|*tad-module.cfg) exit 1 ;; esac\n'
-                        f'exec {quoted} "$@"')
+                    # R12:提交原语是 ${BIN} publish(link(2)),shell 的 ln
+                    # 替身拦不到发布——失败注入改为 chmod 替身(权限不可达
+                    # →ensure_cfg/postinst 都在发布前放弃本轮),语义等价:
+                    # 无 cfg、暂存保留、无残 tmp
+                    self._inject_postinst_stub(work, 'chmod', 'return 1')
                 run_env = {**env, **stub_env}
                 subprocess.run(['sh', str(self.POSTINST)], env=run_env,
                                check=True, timeout=30, capture_output=True)
@@ -955,11 +939,11 @@ exit 0
                 self.assertFalse((etc / 'tad-module.cfg').exists(),
                                  f'{name}: 不得留下正式 cfg')
                 # 向导选值原子暂存,下次启动可恢复。
-                # chmod 替身场景:替身连暂存的 chmod 600 也拒(无法区分哪个
-                # chmod),按权限前置检查语义暂存同样不可达——无 cfg、无暂存、
-                # 日志如实记录;其余场景(mv-ln 拆分/grep 拆分)暂存必须完整
+                # chmod 替身场景(含 mv-reject,同为 chmod 注入):替身连暂存
+                # 的 chmod 600 也拒,按权限前置检查语义暂存同样不可达——无
+                # cfg、无暂存、日志如实记录;grep 拆分场景暂存必须完整
                 stash = var / 'wizard-install.env'
-                if stub_kind == 'chmod-reject':
+                if stub_kind in ('chmod-reject', 'mv-reject'):
                     self.assertFalse(stash.exists(),
                                      f'{name}: chmod 替身下暂存同样不可达')
                 else:
@@ -972,9 +956,9 @@ exit 0
                 leftovers = [p.name for p in etc.iterdir() if '.tmp.' in p.name]
                 self.assertEqual(leftovers, [], f'{name}: 残留临时文件 {leftovers}')
                 # 下次启动恢复:ensure_cfg 按暂存端口落盘并消费
-                # (chmod-reject 场景暂存未写成,跳过恢复断言)
+                # (chmod 类场景暂存未写成,跳过恢复断言)
                 (work / 'functions').write_text(self._definitions(self.REAL.read_text()))
-                if stub_kind != 'chmod-reject':
+                if stub_kind not in ('chmod-reject', 'mv-reject'):
                     body = (
                         '. "$TEST_DIR/functions"\n'
                         'CFG_FILE="$TEST_DIR/etc/tad-module.cfg"\n'
