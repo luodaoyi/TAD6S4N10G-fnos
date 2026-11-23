@@ -43,6 +43,8 @@ func main() {
 		err = releaseFans(os.Args[2:])
 	case "bind-all-fans":
 		err = bindAllFans(os.Args[2:])
+	case "publish":
+		err = publish(os.Args[2:])
 	case "version":
 		fmt.Println(version)
 	default:
@@ -136,8 +138,27 @@ func bindAllFans(args []string) error {
 	return manager.BindAllFansDefault()
 }
 
-func probe(args []string) error {
-	set := flag.NewFlagSet("probe", flag.ContinueOnError)
+// publish 把 stage 文件以原子 no-replace 方式发布到精确目标路径:
+// 内部直接调用 link(2)(os.Link),对任何已存在目标——普通文件、目录、
+// 指向目录的符号链接、指向文件的符号链接——都返回 EEXIST 而失败,
+// 不产生嵌套条目、不覆盖目标、不改权限、不删任何东西。成功后 stage 与
+// 目标共享同一 inode,stage 的清理(是否 unlink)由调用方决定。
+// DSM busybox ln 对目录目标会"移入"(绕过 link(2) 语义),shell 工具集
+// 内不存在等价原语,故此子命令是配置/暂存发布的唯一发布通道。
+// 用法: tad-module publish <stage> <dest>
+func publish(args []string) error {
+	set := flag.NewFlagSet("publish", flag.ContinueOnError)
+	if err := set.Parse(args); err != nil {
+		return err
+	}
+	rest := set.Args()
+	if len(rest) != 2 || rest[0] == "" || rest[1] == "" {
+		return errors.New("usage: tad-module publish <stage> <dest>")
+	}
+	return os.Link(rest[0], rest[1])
+}
+
+func probe(args []string) error {	set := flag.NewFlagSet("probe", flag.ContinueOnError)
 	root := set.String("sys-root", "/", "alternate system root")
 	asJSON := set.Bool("json", false, "JSON output")
 	if err := set.Parse(args); err != nil {
@@ -565,7 +586,7 @@ func gpioLoop(ctx context.Context, manager *powerguard.Manager, logger *log.Logg
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: tad-module <serve|probe|init|apply|restore|version> [options]")
+	fmt.Fprintln(os.Stderr, "usage: tad-module <serve|probe|init|apply|restore|release-fans|bind-all-fans|publish|version> [options]")
 }
 
 // initCrps 初始化 CRPS PMBus 监控板块 (可选功能)。配置读独立文件 cfgPath

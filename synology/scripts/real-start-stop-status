@@ -228,26 +228,26 @@ ensure_proxy_token() {
 
 # publish_no_replace <stage> <dest>
 # 三处发布(cfg 提交/暂存提交)统一使用的单一已验证原子 no-replace 原语
-# (CodeRabbit R10):
-#   1. 权限已在 stage 上设好(调用方负责),本函数发布后不再 chmod 终路径;
-#   2. ln(无 -f)=link(2):对已存在的普通文件/符号链接目标内核级原子失败;
-#   3. 目标为「目录或指向目录的符号链接」时,部分 ln 实现会把 stage "移入"
-#      目录(link 目标变为 dst/<basename stage>)——移入即判定发布失败:
-#      竞争占位不是本方该覆盖的对象,且必须精确清理误入的嵌套链接,
-#      不留嵌套条目;
-#   4. 提交成败以结果验证 [ -f dst ](且 dst 未变为目录)为准。
+# (luodaoyi 裁决选 A:后端 publish 子命令,内部直接 link(2)/os.Link):
+#   1. 权限已在 stage 上设好(调用方负责),发布后不再 chmod 终路径;
+#   2. os.Link 对任何已存在目标——普通文件/目录/目录与文件符号链接——
+#      均返回 EEXIST 原子失败:精确路径、目标存在即失败、永不产生嵌套
+#      条目、不删目标、不改权限;调用方负责 stage 清理与暂存消费判定。
+# 失败回退:二进制缺失/不可执行时(异常安装态)回落 ln+结果验证+移入
+# 清理的 shell 组合,行为弱化但可用,并如实留痕。
 publish_no_replace() {
   _pub_stage="$1"
   _pub_dst="$2"
+  if [ -x "${BIN}" ]; then
+    "${BIN}" publish "${_pub_stage}" "${_pub_dst}" 2>/dev/null
+    return $?
+  fi
   _pub_rc=1
   if ln "${_pub_stage}" "${_pub_dst}" 2>/dev/null; then
     if [ -f "${_pub_dst}" ]; then
-      # 正常提交:stage 与终路径同一 inode,unlink stage 保终路径存活
       rm -f "${_pub_stage}" 2>/dev/null || true
       _pub_rc=0
     else
-      # ln 把 stage 移入了目录占位(dst 是目录或目录符号链接):
-      # 精确清理误入的嵌套链接,发布失败
       rm -f "${_pub_dst}/$(basename "${_pub_stage}")" 2>/dev/null || true
     fi
   fi
@@ -363,6 +363,9 @@ ensure_cfg() {
     # 原子 no-replace 发布(CodeRabbit R10:三处发布统一使用单一已验证
     # 原语 publish_no_replace;权限在 tmp 上设好,发布后不再 chmod 终路径)
     if publish_no_replace "${CFG_TMP}" "${CFG_FILE}"; then
+      # 发布成功后 unlink 本次 stage(publish 原语不清 stage,调用方负责;
+      # stage 与终路径同一 inode,unlink 终路径仍存活)
+      rm -f "${CFG_TMP}" 2>/dev/null || true
       committed=1
     else
       echo "$(date '+%Y-%m-%dT%H:%M:%S') ensure_cfg:cfg 已存在(竞争写入者先提交)、目录/symlink 占位或发布失败,不覆盖,暂存保留" >> "${STARTUP_LOG}" 2>/dev/null || true

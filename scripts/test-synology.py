@@ -239,6 +239,9 @@ cp "$FAKE_ELF" app/bin/tad-module
                 (work / 'functions').write_text(self._definitions(self.REAL.read_text()))
                 env = dict(os.environ, TEST_DIR=self._shpath(tmp),
                            SYNOPKG_PKGDEST=self._shpath(appstore))
+                # 回退用例不得继承宿主的 SYNOPKG_PKGVAR(否则脚本用显式路径、
+                # 测试却期望回退路径,产生误报);仅 env-var 场景显式设置
+                env.pop('SYNOPKG_PKGVAR', None)
                 if scenario == 'env-var':
                     env['SYNOPKG_PKGVAR'] = self._shpath(work / 'explicit-var')
                 elif scenario == 'appdata-fallback':
@@ -332,11 +335,13 @@ printf '%s' "$STARTUP_LOG"
             self.assertIn('bindv6only', log)
 
     def test_start_migrates_legacy_addr_before_precheck(self):
-        # luodaoyi 三轮:旧 cfg 为 ":8123"(空主机=通配语义)时,迁移必须
-        # 发生在端口预检之前——LAN 独占监听与本可共存的回环迁移不得被
-        # 通配误判拦截。用模拟 netstat 覆盖三场景,不碰宿主网络栈。
+        # luodaoyi 三轮 + CodeRabbit R10 Minor:旧 cfg ":8123" 的迁移必须
+        # 发生在端口预检之前——直接执行生产脚本的 start 分支(替身隔离
+        # netstat/硬件/守护进程),断言到达 serve 时 --http 收到的地址,
+        # 而非复刻迁移与预检逻辑。mock daemon 常驻(就绪窗口内 kill -0
+        # 真实通过),body 结束后统一清理。
         scenarios = [
-            # (cfg 里 HTTP_ADDR, netstat 输出, 期望预检放行, 期望最终 serve 地址)
+            # (cfg 里 HTTP_ADDR, netstat 输出, 期望放行, 期望 serve 地址)
             (':8123',
              'tcp  0  0 192.168.1.5:8123  0.0.0.0:*  LISTEN',
              True, '127.0.0.1:8123'),   # 旧默认+LAN 监听:迁移后共存放行
@@ -347,46 +352,79 @@ printf '%s' "$STARTUP_LOG"
              'tcp  0  0 127.0.0.1:8123  0.0.0.0:*  LISTEN',
              False, '0.0.0.0:8123'),    # 显式通配保持:迁移不动它,回环监听占位=通配冲突
         ]
+        # start 分支的 process_identity 读 /proc/<pid>/stat——MSYS/Windows
+        # 无 /proc 进程模型,整个测试只能在 Linux(CI)运行
+        if not Path('/proc/self/stat').exists():
+            self.skipTest('/proc 不可用(Windows 本机),CI Linux 覆盖')
         for idx, (cfg_addr, netstat_line, expect_pass, final_addr) in enumerate(scenarios):
-            with self.subTest(cfg=cfg_addr, netstat=netstat_line), \
-                    tempfile.TemporaryDirectory() as tmp:
+            with self.subTest(cfg=cfg_addr, netstat=netstat_line),                     tempfile.TemporaryDirectory() as tmp:
                 work = Path(tmp)
                 (work / 'etc').mkdir()
                 (work / 'var').mkdir()
+                pkg_bin = work / 'bin'
+                pkg_bin.mkdir()
                 cfg_text = 'HTTP_ADDR="' + cfg_addr + '"\nIT87_FORCE_ID=""\n'
                 (work / 'etc/tad-module.cfg').write_text(cfg_text)
                 (work / 'functions').write_text(
                     self._definitions(self.REAL.read_text()))
+                # 假守护进程常驻:记录收到的 --http 地址后 sleep(保持进程存活,
+                # 让就绪窗口的 kill -0 真实通过);测试收尾 kill
+                mock_lines = [
+                    '#!/bin/sh',
+                    '_prev=',
+                    'for _a in "$@"; do',
+                    '  case "$_prev" in --http) printf "%s" "$_a" > "$CAPTURE" ;; esac',
+                    '  _prev=$_a',
+                    'done',
+                    'sleep 60',
+                    'exit 0',
+                ]
+                mock_bin = pkg_bin / 'tad-module'
+                mock_bin.write_text('\n'.join(mock_lines) + '\n')
+                mock_bin.chmod(0o755)
                 env = dict(os.environ, TEST_DIR=self._shpath(tmp),
                            SYNOPKG_PKGDEST=self._shpath(tmp),
                            SYNOPKG_PKGETC=self._shpath(work / 'etc'),
                            SYNOPKG_PKGVAR=self._shpath(work / 'var'),
                            TAD_NETSTAT_OUT=netstat_line,
-                           EXPECT_PASS='1' if expect_pass else '0',
-                           FINAL_ADDR=final_addr, CFG_ADDR=cfg_addr)
+                           CAPTURE=str(work / 'captured-http'))
+                stub_env = self._postinst_env(work)
+                run_env = {**env, **stub_env}
+                # 真实 start 分支:netstat 函数覆盖注入输出;modprobe/ensure_nginx
+                # 依赖的外部命令用真身;mock daemon 常驻
                 body = r"""
 . "$TEST_DIR/functions"
-# 模拟 netstat(函数覆盖优先于 PATH)
 netstat() { printf '%s
 ' "${TAD_NETSTAT_OUT}"; }
-CFG_FILE="$TEST_DIR/etc/tad-module.cfg"
-STARTUP_LOG="$TEST_DIR/var/startup-debug.log"
-HTTP_ADDR="127.0.0.1:8123"
-IT87_FORCE_ID=""
-# 复刻 start 分支顺序:重读 cfg → 旧地址迁移 → 端口预检
-. "$CFG_FILE" || true
-if [ "$HTTP_ADDR" = ":8123" ]; then
-  HTTP_ADDR="127.0.0.1:8123"
-  sed -i "s|^HTTP_ADDR=.*|HTTP_ADDR=\"${HTTP_ADDR}\"|" "$CFG_FILE" 2>/dev/null || true
-fi
-# 显式通配(0.0.0.0)不得被迁移触碰
-test "$HTTP_ADDR" = "$FINAL_ADDR" || exit 90
-rc=0; port_in_use "$HTTP_ADDR" || rc=$?
-test "$EXPECT_PASS" = "1" && test "$rc" -eq 1 || { test "$EXPECT_PASS" = "0" && test "$rc" -eq 0 || exit 91; }
-# 迁移必须已写回 cfg(旧默认场景)
-grep -Fqx "HTTP_ADDR=\"${FINAL_ADDR}\"" "$CFG_FILE" || exit 92
+modprobe() { return 0; }
+nginx() { return 0; }
+systemctl() { return 0; }
+set -- start
+. "$TEST_DIR/functions"
 """
-                subprocess.run(['sh', '-ec', body], env=env, check=True, timeout=15)
+                # 直接调用生产脚本(经脚本自身的 start 分支)
+                try:
+                    subprocess.run(['sh', str(self.REAL), 'start'], env=run_env,
+                                   capture_output=True, text=True, timeout=30)
+                except subprocess.CalledProcessError as e:
+                    # 预检拦截场景 exit 1 是预期;其余失败才算错误
+                    if expect_pass:
+                        raise
+                capture = (work / 'captured-http').read_text() if (work / 'captured-http').exists() else ''
+                if expect_pass:
+                    self.assertEqual(capture, final_addr,
+                                     f'场景{idx}: serve 应收到迁移后地址 {final_addr},实际 {capture!r}')
+                    self.assertTrue(
+                        (work / 'etc/tad-module.cfg').read_text().startswith('HTTP_ADDR="' + final_addr + '"'),
+                        f'场景{idx}: 迁移应写回 cfg')
+                else:
+                    self.assertEqual(capture, 'PRECHECK-BLOCKED',
+                                     f'场景{idx}: 预检应拦截,实际 capture={capture!r}')
+                # 清理 mock daemon(常驻 sleep 60)
+                pidfile = work / 'var' / 'tad-module.pid'
+                if pidfile.exists():
+                    pid = pidfile.read_text().split()[0]
+                    subprocess.run(['kill', pid], capture_output=True)
 
     def test_postinst_wizard_port_normalization(self):
         # 端口矩阵:前导零/超长/0/65535/65536/非数字/静默(luodaoyi review
@@ -610,8 +648,9 @@ STARTUP_LOG="$TEST_DIR/var/startup-debug.log"
 ensure_cfg
 grep -Fqx 'HTTP_ADDR="127.0.0.1:9101"' "$CFG_FILE" || exit 87
 test ! -e "$TEST_DIR/var/wizard-install.env" || exit 88
-# 无残 tmp(受信目录独占创建的临时文件已随 mv 消费;ls glob 无匹配返回非 0=通过)
-for _f in "$TEST_DIR"/var/.tad-cfg.tmp.*; do
+# 无残 tmp(ensure_cfg 在 etc 下创建 tad-module.cfg.tmp.*,提交后已消费;
+# glob 无匹配返回非 0=通过)
+for _f in "$TEST_DIR"/etc/tad-module.cfg.tmp.*; do
   [ -e "$_f" ] && exit 89
 done
 exit 0

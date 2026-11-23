@@ -25,14 +25,19 @@ log() {
 }
 
 # publish_no_replace <stage> <dest>
-# 与 real-start-stop-status 同款的三处发布统一原语(CodeRabbit R10):
-# ln(无 -f)=link(2) 对已存在普通文件/符号链接目标内核级原子失败;目标为
-# 目录或目录符号链接时部分 ln 实现会"移入"stage——移入即发布失败并精确
-# 清理误入的嵌套链接;提交成败以结果验证 [ -f dst ] 为准;权限由调用方在
-# stage 上设好,发布后不再 chmod 终路径。
+# 与 real-start-stop-status 同款的三处发布统一原语(luodaoyi 裁决选 A:
+# 后端 publish 子命令,内部直接 link(2)/os.Link——精确路径、任何已存在
+# 目标(普通文件/目录/两种 symlink)EEXIST 原子失败、零嵌套、不删目标、
+# 不改权限;stage 清理与暂存消费由调用方决定)。
+# 失败回退:安装阶段二进制缺失/不可执行时回落 ln+结果验证+移入清理的
+# shell 组合,行为弱化但可用,并如实留痕。
 publish_no_replace() {
   _pub_stage="$1"
   _pub_dst="$2"
+  if [ -x "${BIN}" ]; then
+    "${BIN}" publish "${_pub_stage}" "${_pub_dst}" 2>/dev/null
+    return $?
+  fi
   _pub_rc=1
   if ln "${_pub_stage}" "${_pub_dst}" 2>/dev/null; then
     if [ -f "${_pub_dst}" ]; then
@@ -230,8 +235,13 @@ if [ ! -f "${CFG_FILE}" ]; then
         rm -f "${STASH_TMP}" 2>/dev/null || true
         log "暂存临时文件权限不可达 600,首次启动由服务脚本自愈为默认端口"
       elif publish_no_replace "${STASH_TMP}" "${PKG_VAR}/wizard-install.env"; then
+        # 发布成功后 unlink 本次 stage(publish 原语不清 stage,调用方负责)
+        rm -f "${STASH_TMP}" 2>/dev/null || true
         log "向导选值原子暂存 var/wizard-install.env (cfg 未提交)"
       else
+        # 发布失败(目标已有暂存/占位/EEXIST):清本次 tmp,不删既有暂存,
+        # 防止重复安装累积残留(CodeRabbit R10 Minor)
+        rm -f "${STASH_TMP}" 2>/dev/null || true
         log "暂存提交失败(目标已有暂存、目录/symlink 占位或发布失败),首次启动由服务脚本自愈为默认端口"
       fi
     else
