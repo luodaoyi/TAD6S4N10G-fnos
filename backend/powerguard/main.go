@@ -608,10 +608,17 @@ func initCrps(logger *log.Logger, cfgPath string, ctx context.Context, cancel co
 	// 收敛的退出流程, 自包含不依赖 defer 顺序: 取消 ctx -> 等采样 goroutine 退出 ->
 	// 最终 Save。服务器启动失败 (未收到信号、cancel 未被 defer 执行) 时同样正确:
 	// 回调自己先取消再等待, 不会卡死, 最终快照必定落盘。
-	return srv.APIHandler(), func() {
+	return srv.APIHandler(), newCRPSExitCallback(cancel, energyStop, energy.Save)
+}
+
+// newCRPSExitCallback 构造 CRPS 自包含退出回调 (生产入口, 单测直接调用以锁定
+// 「取消 -> 等采样结束 -> 保存」的顺序)。save 不得早于 stopSampler 返回,
+// 否则最终快照之后还可能发生采样写入。
+func newCRPSExitCallback(cancel func(), stopSampler func(), save func()) func() {
+	return func() {
 		cancel()
-		energyStop()
-		energy.Save()
+		stopSampler()
+		save()
 	}
 }
 
