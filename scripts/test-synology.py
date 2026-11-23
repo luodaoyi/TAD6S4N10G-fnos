@@ -451,14 +451,19 @@ int main(int argc, char **argv) {
         return dest
 
     @staticmethod
-    def _quit_wait_mock(quit_file, pidfile):
-        # finally 清理:QUIT 通知+有界等待回执,不发信号不扫进程表
+    def _quit_wait_mock(quit_file, pidfile, expect_ack=False):
+        # finally 清理:QUIT 通知+有界等待回执,不发信号不扫进程表。
+        # expect_ack=True(发布成功、mock 已就绪的用例):断言回执在时限
+        # 内到来,不把等满 5 秒当成功。
         try:
             if pidfile.exists():
                 quit_file.write_text('')
                 deadline = time.monotonic() + 5.0
                 while quit_file.exists() and time.monotonic() < deadline:
                     time.sleep(0.05)
+                if expect_ack:
+                    assert not quit_file.exists(), \
+                        'mock daemon 未在 5 秒内确认退出回执'
         except OSError:
             pass
 
@@ -513,10 +518,14 @@ int main(int argc, char **argv) {
             systemctl_stub.write_text('#!/bin/sh\nexit 0\n')
             systemctl_stub.chmod(0o755)
             quit_file = work / 'mock-daemon.quit'
+            capture_file = work / 'captured-http'
+            # luodaoyi R19②:QUIT/CAPTURE 显式绑定本用例私有路径,不用继承值
             env = dict(os.environ, TEST_DIR=self._shpath(tmp),
                        SYNOPKG_PKGDEST=self._shpath(tmp),
                        SYNOPKG_PKGETC=self._shpath(work / 'etc'),
-                       SYNOPKG_PKGVAR=self._shpath(work / 'var'))
+                       SYNOPKG_PKGVAR=self._shpath(work / 'var'),
+                       CAPTURE=self._shpath(capture_file),
+                       QUIT=self._shpath(quit_file))
             run_env = {**env, **stub_env}
             pidfile = work / 'var' / 'tad-module.pid'
             try:
@@ -527,15 +536,21 @@ int main(int argc, char **argv) {
                 # 已有配置恰 source 一次(非幂等计数=1);预检/serve 生效
                 self.assertEqual(counter.read_text().strip(), '1',
                                  f'已有配置必须只 source 一次,实际 counter={counter.read_text().strip()}')
+                self.assertEqual(capture_file.read_text() if capture_file.exists() else '',
+                                 '127.0.0.1:8123',
+                                 'serve 应按已有配置地址启动')
+                # mock 已就绪:断言退出回执,不等满 5 秒也算成功
+                self._quit_wait_mock(quit_file, pidfile, expect_ack=True)
             finally:
                 self._quit_wait_mock(quit_file, pidfile)
 
     def test_cfg_published_in_race_window_is_read_before_serve(self):
-        # luodaoyi R18①:配置在脚本顶部检查之后、ensure_cfg 期间由竞争者
-        # 发布(顶部未读,_cfg_read_done=0)——start 必须补读并以配置地址
-        # 启动,不得跳过读取以默认地址静默启动。grep 钩子在 ensure_cfg 的
-        # 校验点触发:先让竞争者发布正式 cfg(带竞争地址),再放行校验,
-        # 本方提交 EEXIST 失败但竞争配置已存在 → 补读分支读到竞争地址。
+        # luodaoyi R18①/R19③:真正的竞争窗口——脚本顶部判断时 cfg 尚不
+        # 存在(_cfg_read_done=0),进入 ensure_cfg 之前竞争者已发布正式
+        # cfg。注入点钩在 start 分支 ensure_cfg 前最后一条命令 rm -f
+        # PIDFILE 上:此时顶部判断已发生、ensure_cfg 尚未进入,窗口精确。
+        # 本方提交因 cfg 已存在(EEXIST/占位)不覆盖,补读分支必须读到
+        # 竞争地址,不得以默认地址静默启动。
         if not Path('/proc/self/stat').exists():
             self.skipTest('/proc 不可用(Windows 本机),CI Linux 覆盖')
         with tempfile.TemporaryDirectory() as tmp:
@@ -545,7 +560,7 @@ int main(int argc, char **argv) {
             pkg_bin = work / 'bin'
             pkg_bin.mkdir()
             self._build_mock_daemon(pkg_bin / 'tad-module')
-            # 竞争配置:grep 钩子触发时发布,地址与默认不同以验证补读生效
+            # 竞争配置:rm 钩子触发时发布,地址与默认不同以验证补读生效
             race_addr = '127.0.0.1:8321'
             race_cfg = (work / 'etc/race.cfg')
             race_cfg.write_text(f'HTTP_ADDR="{race_addr}"\nIT87_FORCE_ID=""\n')
@@ -558,28 +573,36 @@ int main(int argc, char **argv) {
             script_copy.chmod(0o755)
             stub_env = self._postinst_env(work)
             stubs = work / 'bin-stubs'
-            # grep 钩子:$3 为 cfg tmp 时竞争发布(仅在真实 cfg 尚不存在时,
-            # 防两次校验调用重入),再放行真身
-            real_grep = shutil.which('grep')
-            qg = "'" + str(Path(real_grep).resolve()).replace(chr(92), '/') + "'"
+            # rm 钩子:首次调用(=start 分支 ensure_cfg 前的 rm -f PIDFILE)
+            # 时竞争发布正式 cfg,再放行真身;仅发布一次,后续 rm 不重入
+            real_rm = shutil.which('rm')
+            qrm = "'" + str(Path(real_rm).resolve()).replace(chr(92), '/') + "'"
             qrace = "'" + self._shpath(race_cfg) + "'"
             qdst = "'" + self._shpath(work / 'etc/tad-module.cfg') + "'"
-            stub_body = ('case "$3" in *tad-module.cfg.tmp*) '
-                         f'[ -e {qdst} ] || cp {qrace} {qdst} ;; esac' + chr(10) +
-                         f'exec {qg} "$@"')
-            self._inject_postinst_stub(work, 'grep', stub_body)
+            rm_marker = self._shpath(work / 'race-published.marker')
+            stub_body = (
+                'if [ ! -e ' + rm_marker + ' ]; then '
+                ': > ' + rm_marker + ' 2>/dev/null; '
+                '[ -e ' + qdst + ' ] || cp ' + qrace + ' ' + qdst + ' 2>/dev/null; '
+                'fi\n' +
+                f'exec {qrm} "$@"\n'
+            )
+            self._inject_postinst_stub(work, 'rm', stub_body)
             for name, body_text in (('netstat', '#!/bin/sh\nexit 0\n'),
                                     ('nginx', '#!/bin/sh\nexit 0\n'),
                                     ('systemctl', '#!/bin/sh\nexit 0\n')):
                 p = stubs / name
                 p.write_text(body_text)
                 p.chmod(0o755)
+            # luodaoyi R19②:QUIT/CAPTURE 显式绑定本用例私有路径,不用继承值
             quit_file = work / 'mock-daemon.quit'
+            capture_file = work / 'captured-http'
             env = dict(os.environ, TEST_DIR=self._shpath(tmp),
                        SYNOPKG_PKGDEST=self._shpath(tmp),
                        SYNOPKG_PKGETC=self._shpath(work / 'etc'),
                        SYNOPKG_PKGVAR=self._shpath(work / 'var'),
-                       CAPTURE=str(work / 'captured-http'))
+                       CAPTURE=self._shpath(capture_file),
+                       QUIT=self._shpath(quit_file))
             run_env = {**env, **stub_env}
             pidfile = work / 'var' / 'tad-module.pid'
             try:
@@ -587,44 +610,51 @@ int main(int argc, char **argv) {
                                       capture_output=True, text=True, timeout=30)
                 self.assertEqual(proc.returncode, 0,
                                  f'竞争发布场景应放行,rc={proc.returncode} stderr={proc.stderr[-300:]!r}')
-                capture = (work / 'captured-http').read_text() if (work / 'captured-http').exists() else ''
+                self.assertTrue((work / 'race-published.marker').is_file(),
+                                'rm 钩子必须在 ensure_cfg 前触发(竞争发布标记)')
+                self.assertTrue(Path(str(race_cfg)).is_file(),
+                                f'竞争配置必须已发布到正式路径,race_cfg={race_cfg}')
+                capture = capture_file.read_text() if capture_file.exists() else ''
                 self.assertEqual(capture, race_addr,
                                  f'serve 必须收到竞争配置地址 {race_addr},实际 {capture!r}')
+                # mock 已就绪:断言退出回执,不等满 5 秒也算成功
+                self._quit_wait_mock(quit_file, pidfile, expect_ack=True)
             finally:
                 self._quit_wait_mock(quit_file, pidfile)
 
     def test_stash_commit_failure_fails_start_keeps_stash(self):
-        # luodaoyi R18②:有有效向导暂存、无正式配置且提交失败时——不能
-        # 报启动成功却悄悄绑定默认地址:启动 daemon 前报失败原因退出 1、
-        # 暂存保留(下次 start 重试)。提交失败用目标过滤 publish 包装器
-        # 注入(R16 手法,证明发布被调用却失败);无暂存/已有配置场景保持
-        # 默认行为(由既有用例覆盖)。
+        # luodaoyi R19②三态对照,同一种失败注入(目标过滤 publish 包装器,
+        # 证明发布被调用却失败):仅「有效暂存+提交失败+无可用正式配置」
+        # 阻止启动(exit 1、暂存保留、原因落盘);无暂存与非法暂存(空/
+        # 重复记录)回落默认启动。判据=ensure_cfg 的解析结果,不是暂存
+        # 文件存在。
         if not Path('/proc/self/stat').exists():
             self.skipTest('/proc 不可用(Windows 本机),CI Linux 覆盖')
-        for scenario in ('commit-fail-with-stash', 'no-stash-default-ok'):
-            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as tmp:
+        scenarios = [
+            # (名, 暂存内容[None=不建], 期望退出码, 期望 serve 地址)
+            ('valid-stash-commit-fail', 'HTTP_ADDR="127.0.0.1:9402"\n', 1, None),
+            ('no-stash-default-ok', None, 0, '127.0.0.1:8123'),
+            ('empty-stash-default-ok', '', 0, '127.0.0.1:8123'),
+            ('invalid-record-default-ok', 'HTTP_ADDR="bad"\n', 0, '127.0.0.1:8123'),
+            ('duplicate-records-default-ok',
+             'HTTP_ADDR="127.0.0.1:9402"\nHTTP_ADDR="127.0.0.1:9403"\n', 0, '127.0.0.1:8123'),
+        ]
+        for name, stash_text, want_rc, want_addr in scenarios:
+            with self.subTest(scenario=name), tempfile.TemporaryDirectory() as tmp:
                 work = Path(tmp)
                 (work / 'etc').mkdir()
                 (work / 'var').mkdir()
                 pkg_bin = work / 'bin'
                 pkg_bin.mkdir()
                 self._build_mock_daemon(pkg_bin / 'tad-module')
-                if scenario == 'commit-fail-with-stash':
-                    (work / 'var/wizard-install.env').write_text(
-                        'HTTP_ADDR="127.0.0.1:9402"\n')
-                    # 目标过滤包装器:配置提交永远失败(publish 被调用)
-                    real = pkg_bin / '.tad-module.real'
-                    shutil.move(str(pkg_bin / 'tad-module'), str(real))
-                    qreal = "'" + self._shpath(real) + "'"
-                    wrapper = (
-                        '#!/bin/sh\n'
-                        'if [ "$1" = "publish" ] && [ $# -ge 3 ]; then\n'
-                        '  case "$3" in *tad-module.cfg) exit 1 ;; esac\n'
-                        'fi\n'
-                        f'exec {qreal} "$@"\n'
-                    )
-                    (pkg_bin / 'tad-module').write_text(wrapper)
-                    (pkg_bin / 'tad-module').chmod(0o755)
+                if stash_text is not None:
+                    (work / 'var/wizard-install.env').write_text(stash_text)
+                (work / 'etc/tad-module.cfg').mkdir()  # 目录占位=publish 必失败
+                # 统一注入:配置提交永远失败——cfg 目标位置用目录占位,
+                # publish 原语 no-replace 语义对已存在目标必然 EEXIST 失败
+                # (发布被真实调用),同时 mock ELF 必须留在 BIN 原路径:
+                # daemon_pid 校验 /proc/<pid>/exe==BIN,wrapper exec 到别名
+                # 会改变 exe 身份导致就绪探测误判失败。
                 real_text = self.REAL.read_text()
                 old_line = 'NGINX_CONF_DIR="/usr/local/etc/nginx/conf.d"'
                 new_line = 'NGINX_CONF_DIR="' + self._shpath(work / 'nginx-conf.d') + '"'
@@ -634,40 +664,43 @@ int main(int argc, char **argv) {
                 script_copy.chmod(0o755)
                 stub_env = self._postinst_env(work)
                 stubs = work / 'bin-stubs'
-                for name in ('netstat', 'nginx', 'systemctl'):
-                    p = stubs / name
+                for sname in ('netstat', 'nginx', 'systemctl'):
+                    p = stubs / sname
                     p.write_text('#!/bin/sh\nexit 0\n')
                     p.chmod(0o755)
+                # luodaoyi R19:QUIT/CAPTURE 显式绑定本用例私有路径
                 quit_file = work / 'mock-daemon.quit'
+                capture_file = work / 'captured-http'
                 env = dict(os.environ, TEST_DIR=self._shpath(tmp),
                            SYNOPKG_PKGDEST=self._shpath(tmp),
                            SYNOPKG_PKGETC=self._shpath(work / 'etc'),
                            SYNOPKG_PKGVAR=self._shpath(work / 'var'),
-                           CAPTURE=str(work / 'captured-http'))
+                           CAPTURE=self._shpath(capture_file),
+                           QUIT=self._shpath(quit_file))
                 run_env = {**env, **stub_env}
                 pidfile = work / 'var' / 'tad-module.pid'
                 try:
                     proc = subprocess.run(['sh', str(script_copy), 'start'], env=run_env,
                                           capture_output=True, text=True, timeout=30)
-                    if scenario == 'commit-fail-with-stash':
-                        self.assertEqual(proc.returncode, 1,
-                                         f'提交失败+暂存场景必须 exit 1,rc={proc.returncode} stderr={proc.stderr[-200:]!r}')
+                    self.assertEqual(proc.returncode, want_rc,
+                                     f'{name}: rc 应为 {want_rc},stderr={proc.stderr[-200:]!r}')
+                    if want_rc == 1:
                         self.assertFalse(pidfile.exists(),
-                                         '提交失败场景不得启动 daemon')
-                        self.assertFalse((work / 'captured-http').exists(),
-                                         '提交失败场景 daemon 不得收到 --http')
+                                         f'{name}: 不得启动 daemon')
+                        self.assertFalse(capture_file.exists(),
+                                         f'{name}: daemon 不得收到 --http')
                         stash = work / 'var/wizard-install.env'
-                        self.assertTrue(stash.is_file(), '暂存必须保留待重试')
-                        self.assertIn('HTTP_ADDR="127.0.0.1:9402"', stash.read_text())
+                        self.assertTrue(stash.is_file(), f'{name}: 暂存必须保留待重试')
                         log = (work / 'var/startup-debug.log').read_text() if (work / 'var/startup-debug.log').exists() else ''
                         self.assertIn('配置提交失败', log,
-                                      f'失败原因必须落盘,日志={log[-400:]!r}')
+                                      f'{name}: 失败原因必须落盘,日志={log[-300:]!r}')
                     else:
-                        self.assertEqual(proc.returncode, 0,
-                                         f'无暂存默认行为应放行,rc={proc.returncode} stderr={proc.stderr[-300:]!r}')
-                        capture = (work / 'captured-http').read_text() if (work / 'captured-http').exists() else ''
-                        self.assertEqual(capture, '127.0.0.1:8123',
-                                         f'无暂存走默认地址启动,实际 {capture!r}')
+                        capture = capture_file.read_text() if capture_file.exists() else ''
+                        self.assertEqual(capture, want_addr,
+                                         f'{name}: 应按默认地址启动,实际 {capture!r}')
+                        # mock 已就绪的用例:断言退出回执(不等满 5 秒)
+                        if pidfile.exists():
+                            self._quit_wait_mock(quit_file, pidfile, expect_ack=True)
                 finally:
                     self._quit_wait_mock(quit_file, pidfile)
 
@@ -766,8 +799,9 @@ int main(int argc, char **argv) {
                            SYNOPKG_PKGETC=self._shpath(work / 'etc'),
                            SYNOPKG_PKGVAR=self._shpath(work / 'var'),
                            TAD_NETSTAT_OUT=netstat_line,
-                           CAPTURE=str(work / 'captured-http'),
-                           QUIT=str(work / 'mock-daemon.quit'))
+                           # luodaoyi R19②:QUIT/CAPTURE 显式绑定本用例私有路径
+                           CAPTURE=self._shpath(work / 'captured-http'),
+                           QUIT=self._shpath(work / 'mock-daemon.quit'))
                 stub_env = self._postinst_env(work)
                 # netstat/nginx 替身:副本脚本按 PATH 调 netstat -tln 与
                 # nginx(ensure_nginx 的 -t/reload);输出由环境变量注入。
@@ -819,22 +853,17 @@ int main(int argc, char **argv) {
                         self.assertFalse((work / 'var' / 'tad-module.log').exists(),
                                          f'场景{idx}: 拦截场景守护进程不得启动')
                 finally:
-                    # luodaoyi R15:退出通知协作清理——向本用例私有目录写
-                    # 通知文件,mock 看到即删文件作回执并退出;finally 有界
-                    # 等待回执,不向任何 PID 发信号、不扫全机进程表(裸 PID
-                    # 复用/子串匹配都可能误伤宿主进程)。alarm(120) 仅兜底
-                    # 测试崩溃等极端情形。仅正向场景等待(负向场景 daemon
-                    # 未启动,无回执可等;alarm 兜底覆盖一切意外)。
+                    # luodaoyi R15/R19②:退出通知协作清理+回执断言——向本
+                    # 用例私有目录写通知文件($QUIT 显式绑定,mock 看到即删
+                    # 文件作回执),有界等待回执,不向任何 PID 发信号、不扫
+                    # 全机进程表(裸 PID 复用/子串匹配都可能误伤宿主进程)。
+                    # alarm(120) 仅兜底测试崩溃等极端情形。仅正向场景等待
+                    # (负向场景 daemon 未启动,无回执可等;alarm 兜底覆盖
+                    # 一切意外)。
                     quit_file = work / 'mock-daemon.quit'
                     try:
                         if expect_pass and pidfile.exists():
-                            quit_file.write_text('')
-                            # 有界等待退出回执(通知文件被 mock 删除)
-                            deadline = time.monotonic() + 5.0
-                            while quit_file.exists() and time.monotonic() < deadline:
-                                time.sleep(0.05)
-                            self.assertFalse(quit_file.exists(),
-                                             'mock daemon 未在 5 秒内确认退出回执(alarm 兜底仍会自杀)')
+                            self._quit_wait_mock(quit_file, pidfile, expect_ack=True)
                     except OSError:
                         pass
 

@@ -245,7 +245,11 @@ publish_no_replace() {
 
 ensure_cfg() {
   # 默认运行参数自愈:postinst 以套件用户跑,etc 被 root 属主时写不进
-  # (安装不阻断),这里在 root 语境补齐;已有配置(用户改过)不动
+  # (安装不阻断),这里在 root 语境补齐;已有配置(用户改过)不动。
+  # luodaoyi R19:调用方(start)需要知道「本次是否解析出有效暂存且未
+  # 提交成功」——以此区分有效暂存(拒绝默认地址静默启动)与空/非法/
+  # 重复暂存(回落默认启动)。空文件默认 0。
+  _stash_valid_uncommitted=0
   if [ -f "${CFG_FILE}" ]; then
     return 0
   fi
@@ -366,7 +370,12 @@ ensure_cfg() {
       rm -f "${WIZ_ENV}" 2>/dev/null || true
     fi
   else
-    # 写入/提交失败:清残缺临时文件,保留原暂存,下次启动重试自愈,记真实结果
+    # 写入/提交失败:清残缺临时文件,保留原暂存,下次启动重试自愈,记真实结果。
+    # 仅当本次解析出有效暂存值才标记「有效未提交」——空/非法/重复记录的
+    # 暂存不算(R19:它们回落默认启动,不阻止启动)
+    if [ -n "${WIZ_ADDR}" ]; then
+      _stash_valid_uncommitted=1
+    fi
     rm -f "${CFG_TMP}" 2>/dev/null || true
     echo "$(date '+%Y-%m-%dT%H:%M:%S') ensure_cfg:cfg 写入或提交失败,暂存保留待重试" >> "${STARTUP_LOG}" 2>/dev/null || true
   fi
@@ -449,15 +458,16 @@ case "${1:-}" in
       . "${CFG_FILE}" || true
       _cfg_read_done=1
     fi
-    # luodaoyi R18:启动前未读取到有效配置、且存在有效向导暂存但本次
-    # 提交失败时——绝不能报启动成功却悄悄绑定默认地址。保留暂存(下次
-    # start 重试)并给出失败原因退出。ensure_cfg 只在提交失败时保留暂存
-    # (成功会消费),此处以「暂存仍存在且本次未读到新配置」为判据。
-    if [ "${_cfg_read_done}" = "0" ] && [ -f "${PKG_VAR}/wizard-install.env" ]; then
+    # luodaoyi R18/R19:启动前未读取到有效配置、且本次 ensure_cfg 解析出
+    # 「有效暂存但提交失败」时——绝不能报启动成功却悄悄绑定默认地址。
+    # 判据是 ensure_cfg 的解析结果(_stash_valid_uncommitted),不是暂存
+    # 文件存在:空/非法/重复记录的暂存回落默认启动,不阻止。
+    # 暂存已保留(下次 start 重试),失败原因落盘。
+    if [ "${_cfg_read_done}" = "0" ] && [ "${_stash_valid_uncommitted}" = "1" ]; then
       {
-        echo "$(date '+%Y-%m-%dT%H:%M:%S') 启动失败:向导暂存存在但配置提交失败,拒绝以默认地址静默启动;暂存已保留,下次 start 重试"
+        echo "$(date '+%Y-%m-%dT%H:%M:%S') 启动失败:有效向导暂存存在但配置提交失败,拒绝以默认地址静默启动;暂存已保留,下次 start 重试"
       } >> "${STARTUP_LOG}" 2>/dev/null || true
-      echo "启动失败:向导端口暂存存在但配置提交失败,已保留暂存待重试;详细: ${STARTUP_LOG}" >&2
+      echo "启动失败:有效向导暂存存在但配置提交失败,已保留暂存待重试;详细: ${STARTUP_LOG}" >&2
       exit 1
     fi
     # 旧版默认值迁移:独立端口时代遗留的 ":8123"(空主机=通配语义)改为
