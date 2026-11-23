@@ -392,6 +392,103 @@ printf '%s' "$STARTUP_LOG"
             self.assertIn('AMBIGUOUS :::8123', log)
             self.assertIn('bindv6only', log)
 
+    def test_existing_cfg_sourced_once_per_start(self):
+        # luodaoyi R17:已有配置在一次启动中只读一次——脚本顶部已 source
+        # CFG_FILE,start 的 ensure_cfg 之后不得再 source(非幂等语句会被
+        # 执行两遍)。用临时配置写本用例私有计数文件断言恰一次;不碰宿主配置。
+        if not Path('/proc/self/stat').exists():
+            self.skipTest('/proc 不可用(Windows 本机),CI Linux 覆盖')
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            (work / 'etc').mkdir()
+            (work / 'var').mkdir()
+            pkg_bin = work / 'bin'
+            pkg_bin.mkdir()
+            counter = work / 'cfg-sourced.count'
+            rm_marker = work / 'cfg-rm.marker'
+            # cfg 含非幂等语句:每 source 一次 counter+1;剥计数文件模拟
+            # 非幂等副作用(第二次 source 才可见)
+            cfg_text = (
+                'if [ -f "' + self._shpath(counter) + '" ]; then\n'
+                '  _n=$(cat "' + self._shpath(counter) + '")\n'
+                'else\n'
+                '  _n=0\n'
+                'fi\n'
+                'printf "%s\\n" "$((_n + 1))" > "' + self._shpath(counter) + '"\n'
+                'rm -f "' + self._shpath(rm_marker) + '"\n'
+                'HTTP_ADDR="127.0.0.1:8123"\n'
+                'IT87_FORCE_ID=""\n'
+            )
+            (work / 'etc/tad-module.cfg').write_text(cfg_text)
+            rm_marker.write_text('')  # 首次 source 会删掉它
+            # mock daemon ELF(同 start 迁移测试,alarm 自限+QUIT 协作退出)
+            mock_src = work / 'mock-daemon.c'
+            mock_src.write_text(r'''
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+    alarm(120);
+    (void)argc; (void)argv;
+    for (;;) pause();
+    return 0;
+}
+''')
+            mock_bin = pkg_bin / 'tad-module'
+            cc = shutil.which('cc') or shutil.which('gcc')
+            if not cc:
+                self.skipTest('容器无 C 编译器,mock daemon 需要 ELF')
+            r = subprocess.run([cc, '-o', str(mock_bin), str(mock_src)],
+                               capture_output=True, text=True, timeout=60)
+            if r.returncode != 0:
+                self.fail(f'mock daemon 编译失败: {r.stderr[-300:]}')
+            mock_bin.chmod(0o755)
+            # 脚本副本:只替换 NGINX_CONF_DIR 常量进私有目录(R14 手法)
+            real_text = self.REAL.read_text()
+            old_line = 'NGINX_CONF_DIR="/usr/local/etc/nginx/conf.d"'
+            new_line = 'NGINX_CONF_DIR="' + self._shpath(work / 'nginx-conf.d') + '"'
+            self.assertEqual(real_text.count(old_line), 1)
+            script_copy = work / 'real-start-stop-status-test'
+            script_copy.write_text(real_text.replace(old_line, new_line, 1))
+            script_copy.chmod(0o755)
+            stub_env = self._postinst_env(work)
+            stubs = work / 'bin-stubs'
+            netstat_stub = stubs / 'netstat'
+            netstat_stub.write_text('#!/bin/sh\nexit 0\n')  # 无占用,放行
+            netstat_stub.chmod(0o755)
+            nginx_stub = stubs / 'nginx'
+            nginx_stub.write_text('#!/bin/sh\nexit 0\n')
+            nginx_stub.chmod(0o755)
+            systemctl_stub = stubs / 'systemctl'
+            systemctl_stub.write_text('#!/bin/sh\nexit 0\n')
+            systemctl_stub.chmod(0o755)
+            quit_file = work / 'mock-daemon.quit'
+            env = dict(os.environ, TEST_DIR=self._shpath(tmp),
+                       SYNOPKG_PKGDEST=self._shpath(tmp),
+                       SYNOPKG_PKGETC=self._shpath(work / 'etc'),
+                       SYNOPKG_PKGVAR=self._shpath(work / 'var'))
+            run_env = {**env, **stub_env}
+            pidfile = work / 'var' / 'tad-module.pid'
+            try:
+                proc = subprocess.run(['sh', str(script_copy), 'start'], env=run_env,
+                                      capture_output=True, text=True, timeout=30)
+                self.assertEqual(proc.returncode, 0,
+                                 f'start 应成功,rc={proc.returncode} stderr={proc.stderr[-300:]!r}')
+                # 已有配置恰 source 一次(非幂等计数=1);预检/serve 生效
+                self.assertEqual(counter.read_text().strip(), '1',
+                                 f'已有配置必须只 source 一次,实际 counter={counter.read_text().strip()}')
+            finally:
+                # R15 手法:QUIT 通知协作退出,不发信号不扫进程表
+                try:
+                    if pidfile.exists():
+                        quit_file.write_text('')
+                        deadline = time.monotonic() + 5.0
+                        while quit_file.exists() and time.monotonic() < deadline:
+                            time.sleep(0.05)
+                except OSError:
+                    pass
+
     def test_start_migrates_legacy_addr_before_precheck(self):
         # luodaoyi 三轮 + CodeRabbit R10 Minor:旧 cfg ":8123" 的迁移必须
         # 发生在端口预检之前——直接执行生产脚本的 start 分支(替身隔离

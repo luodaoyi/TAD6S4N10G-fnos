@@ -434,12 +434,19 @@ case "${1:-}" in
     [ -x "${BIN}" ] || exit 1
     mkdir -p "${PKG_VAR}"
     rm -f "${PIDFILE}"
-    # 先自愈运行参数再预检端口:ensure_cfg 可能按安装向导刚创建 cfg,
-    # 不重读会让预检与 serve 都用脚本顶部的旧默认端口
-    ensure_cfg
-    if [ -f "${CFG_FILE}" ]; then
-      # shellcheck disable=SC1090
-      . "${CFG_FILE}" || true
+    # 自愈运行参数再预检端口。已有配置只在脚本顶部读过一次(luodaoyi R17:
+    # 二次 source 会把非幂等语句执行两遍);这里仅当启动前未读取且
+    # ensure_cfg 刚新建了 cfg 时才补读——向导端口要进预检与 serve。
+    if [ ! -f "${CFG_FILE}" ]; then
+      _cfg_read_done=0
+      ensure_cfg
+      if [ -f "${CFG_FILE}" ]; then
+        # shellcheck disable=SC1090
+        . "${CFG_FILE}" || true
+        _cfg_read_done=1
+      fi
+    else
+      _cfg_read_done=1
     fi
     # 旧版默认值迁移:独立端口时代遗留的 ":8123"(空主机=通配语义)改为
     # 回环绑定。必须在端口预检之前(CodeRabbit 三轮 Major:否则旧 cfg 为
