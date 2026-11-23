@@ -313,6 +313,13 @@ ensure_cfg() {
       WIZ_ADDR=""
     fi
   fi
+  # luodaoyi R20:解析出有效暂存即标记「有效待提交」——后续 CFG_TMP 创建
+  # 失败或 chmod 600 失败会提前 return 0,若到那时才置位就会漏标,start
+  # 会在默认地址报成功。发布成功(committed=1)才清除;此前的所有失败
+  # 路径(创建失败/chmod 失败/publish 失败)都保留标志。
+  if [ -n "${WIZ_ADDR}" ]; then
+    _stash_valid_uncommitted=1
+  fi
   # 原子提交(luodaoyi 四轮):受信目录内独占创建临时文件(noclobber),
   # 完整写入并校验关键行,先设权限再经 publish_no_replace 原子 no-replace
   # 提交;成功才消费暂存——失败保留原暂存、清残 tmp、记真实结果,下次启动
@@ -365,17 +372,16 @@ ensure_cfg() {
     fi
   fi
   if [ "${committed}" = "1" ]; then
-    # 提交成功才消费暂存(有向导选值时)
+    # 提交成功才消费暂存(有向导选值时),并清除「有效待提交」标志
     if [ -n "${WIZ_ADDR}" ]; then
       rm -f "${WIZ_ENV}" 2>/dev/null || true
+      _stash_valid_uncommitted=0
     fi
   else
-    # 写入/提交失败:清残缺临时文件,保留原暂存,下次启动重试自愈,记真实结果。
-    # 仅当本次解析出有效暂存值才标记「有效未提交」——空/非法/重复记录的
-    # 暂存不算(R19:它们回落默认启动,不阻止启动)
-    if [ -n "${WIZ_ADDR}" ]; then
-      _stash_valid_uncommitted=1
-    fi
+    # 写入/提交失败:清残缺临时文件,保留原暂存,下次启动重试自愈,记真实
+    # 结果。标志已在解析完成时置位(R20:提前 return 的创建/chmod 失败也
+    # 覆盖);空/非法/重复记录的暂存解析阶段就把 WIZ_ADDR 清空,标志不置位
+    # (R19:它们回落默认启动,不阻止启动)
     rm -f "${CFG_TMP}" 2>/dev/null || true
     echo "$(date '+%Y-%m-%dT%H:%M:%S') ensure_cfg:cfg 写入或提交失败,暂存保留待重试" >> "${STARTUP_LOG}" 2>/dev/null || true
   fi

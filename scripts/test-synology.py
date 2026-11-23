@@ -539,10 +539,10 @@ int main(int argc, char **argv) {
                 self.assertEqual(capture_file.read_text() if capture_file.exists() else '',
                                  '127.0.0.1:8123',
                                  'serve 应按已有配置地址启动')
-                # mock 已就绪:断言退出回执,不等满 5 秒也算成功
-                self._quit_wait_mock(quit_file, pidfile, expect_ack=True)
             finally:
-                self._quit_wait_mock(quit_file, pidfile)
+                # luodaoyi R20②:QUIT 只发一次、收口在 finally,已就绪即验证回执
+                self._quit_wait_mock(quit_file, pidfile,
+                                     expect_ack=pidfile.exists())
 
     def test_cfg_published_in_race_window_is_read_before_serve(self):
         # luodaoyi R18①/R19③:真正的竞争窗口——脚本顶部判断时 cfg 尚不
@@ -617,10 +617,10 @@ int main(int argc, char **argv) {
                 capture = capture_file.read_text() if capture_file.exists() else ''
                 self.assertEqual(capture, race_addr,
                                  f'serve 必须收到竞争配置地址 {race_addr},实际 {capture!r}')
-                # mock 已就绪:断言退出回执,不等满 5 秒也算成功
-                self._quit_wait_mock(quit_file, pidfile, expect_ack=True)
             finally:
-                self._quit_wait_mock(quit_file, pidfile)
+                # luodaoyi R20②:QUIT 只发一次、收口在 finally,已就绪即验证回执
+                self._quit_wait_mock(quit_file, pidfile,
+                                     expect_ack=pidfile.exists())
 
     def test_stash_commit_failure_fails_start_keeps_stash(self):
         # luodaoyi R19②三态对照,同一种失败注入(目标过滤 publish 包装器,
@@ -631,15 +631,18 @@ int main(int argc, char **argv) {
         if not Path('/proc/self/stat').exists():
             self.skipTest('/proc 不可用(Windows 本机),CI Linux 覆盖')
         scenarios = [
-            # (名, 暂存内容[None=不建], 期望退出码, 期望 serve 地址)
-            ('valid-stash-commit-fail', 'HTTP_ADDR="127.0.0.1:9402"\n', 1, None),
-            ('no-stash-default-ok', None, 0, '127.0.0.1:8123'),
-            ('empty-stash-default-ok', '', 0, '127.0.0.1:8123'),
-            ('invalid-record-default-ok', 'HTTP_ADDR="bad"\n', 0, '127.0.0.1:8123'),
+            # (名, 暂存内容[None=不建], 注入方式, 期望退出码, 期望 serve 地址)
+            ('valid-stash-commit-fail', 'HTTP_ADDR="127.0.0.1:9402"\n', 'publish-eexist', 1, None),
+            # luodaoyi R20:chmod 600 失败→CFG_TMP 置空→提前 return 0,此前
+            # 该路径漏置标志,start 会以默认地址报成功——必须同样阻止启动
+            ('valid-stash-chmod-fail', 'HTTP_ADDR="127.0.0.1:9402"\n', 'chmod-fail', 1, None),
+            ('no-stash-default-ok', None, 'publish-eexist', 0, '127.0.0.1:8123'),
+            ('empty-stash-default-ok', '', 'publish-eexist', 0, '127.0.0.1:8123'),
+            ('invalid-record-default-ok', 'HTTP_ADDR="bad"\n', 'publish-eexist', 0, '127.0.0.1:8123'),
             ('duplicate-records-default-ok',
-             'HTTP_ADDR="127.0.0.1:9402"\nHTTP_ADDR="127.0.0.1:9403"\n', 0, '127.0.0.1:8123'),
+             'HTTP_ADDR="127.0.0.1:9402"\nHTTP_ADDR="127.0.0.1:9403"\n', 'publish-eexist', 0, '127.0.0.1:8123'),
         ]
-        for name, stash_text, want_rc, want_addr in scenarios:
+        for name, stash_text, inject, want_rc, want_addr in scenarios:
             with self.subTest(scenario=name), tempfile.TemporaryDirectory() as tmp:
                 work = Path(tmp)
                 (work / 'etc').mkdir()
@@ -649,12 +652,16 @@ int main(int argc, char **argv) {
                 self._build_mock_daemon(pkg_bin / 'tad-module')
                 if stash_text is not None:
                     (work / 'var/wizard-install.env').write_text(stash_text)
-                (work / 'etc/tad-module.cfg').mkdir()  # 目录占位=publish 必失败
-                # 统一注入:配置提交永远失败——cfg 目标位置用目录占位,
-                # publish 原语 no-replace 语义对已存在目标必然 EEXIST 失败
-                # (发布被真实调用),同时 mock ELF 必须留在 BIN 原路径:
-                # daemon_pid 校验 /proc/<pid>/exe==BIN,wrapper exec 到别名
-                # 会改变 exe 身份导致就绪探测误判失败。
+                if inject == 'publish-eexist':
+                    # 统一注入:配置提交永远失败——cfg 目标位置用目录占位,
+                    # publish 原语 no-replace 语义对已存在目标必然 EEXIST 失败
+                    # (发布被真实调用),同时 mock ELF 必须留在 BIN 原路径:
+                    # daemon_pid 校验 /proc/<pid>/exe==BIN,wrapper exec 到
+                    # 别名会改变 exe 身份导致就绪探测误判失败。
+                    (work / 'etc/tad-module.cfg').mkdir()
+                # inject == 'chmod-fail':chmod 替身仅对 cfg tmp 返回 1,
+                # 触发 ensure_cfg 的 chmod 失败提前 return 路径;mock ELF
+                # 不动,发布路径不被拦截(走不到)。
                 real_text = self.REAL.read_text()
                 old_line = 'NGINX_CONF_DIR="/usr/local/etc/nginx/conf.d"'
                 new_line = 'NGINX_CONF_DIR="' + self._shpath(work / 'nginx-conf.d') + '"'
@@ -664,6 +671,15 @@ int main(int argc, char **argv) {
                 script_copy.chmod(0o755)
                 stub_env = self._postinst_env(work)
                 stubs = work / 'bin-stubs'
+                if inject == 'chmod-fail':
+                    # chmod 替身:仅对 cfg tmp 返回 1,其余转交真身
+                    real_chmod = shutil.which('chmod')
+                    qc = "'" + str(Path(real_chmod).resolve()).replace(chr(92), '/') + "'"
+                    qtmp = "'" + self._shpath(work / 'etc/tad-module.cfg.tmp') + "'"
+                    self._inject_postinst_stub(
+                        work, 'chmod',
+                        'case "$2" in ' + qtmp + '*) exit 1 ;; esac' + chr(10) +
+                        f'exec {qc} "$@"')
                 for sname in ('netstat', 'nginx', 'systemctl'):
                     p = stubs / sname
                     p.write_text('#!/bin/sh\nexit 0\n')
@@ -698,11 +714,13 @@ int main(int argc, char **argv) {
                         capture = capture_file.read_text() if capture_file.exists() else ''
                         self.assertEqual(capture, want_addr,
                                          f'{name}: 应按默认地址启动,实际 {capture!r}')
-                        # mock 已就绪的用例:断言退出回执(不等满 5 秒)
-                        if pidfile.exists():
-                            self._quit_wait_mock(quit_file, pidfile, expect_ack=True)
                 finally:
-                    self._quit_wait_mock(quit_file, pidfile)
+                    # luodaoyi R20②:QUIT 只发一次、收口在 finally——已就绪
+                    # 的用例在此验证私有回执(expect_ack),异常路径也发同一
+                    # 次通知;不发 PID 信号,不二次通知(无进程应答只会空等)。
+                    daemon_started = pidfile.exists()
+                    self._quit_wait_mock(quit_file, pidfile,
+                                         expect_ack=daemon_started)
 
     def test_start_migrates_legacy_addr_before_precheck(self):
         # luodaoyi 三轮 + CodeRabbit R10 Minor:旧 cfg ":8123" 的迁移必须
