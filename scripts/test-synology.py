@@ -206,11 +206,13 @@ cp "$FAKE_ELF" app/bin/tad-module
                        capture_output=True, text=True,
                        cwd=str(ROOT), timeout=300)
             if r.returncode != 0:
-                return None
+                # 构建失败必须可见:静默 None 会让下游测试以"cfg 未落盘"
+                # 的误导性错误失败(luodaoyi R12)
+                raise RuntimeError(f'publish test binary build failed: {r.stderr[-500:]}')
             cls._publish_bin = str(Path(tempfile.gettempdir()) / 'tad-module-publish-test-bin')
             return cls._publish_bin
-        except (OSError, sp.TimeoutExpired):
-            return None
+        except (OSError, sp.TimeoutExpired) as e:
+            raise RuntimeError(f'publish test binary unavailable: {e}')
 
     @classmethod
     def _postinst_env(cls, work):
