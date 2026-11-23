@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -1263,88 +1264,66 @@ func TestFanAutoDiagUsesLifecycleCtx(t *testing.T) {
 	if ok, _ := b.reconfigure(nil, nil); !ok {
 		t.Fatal("reconfigure 失败")
 	}
-	srv := &AppServer{Bus: b}
 	lifecycle, lifecycleCancel := context.WithCancel(context.Background())
 	defer lifecycleCancel()
-	srv.LifecycleCtx = lifecycle
-	h := srv.APIHandler()
+	srv := &AppServer{Bus: b, LifecycleCtx: lifecycle}
 
-	// 计数 fanRpm 读回 (诊断读回会产生 READ_FAN1 事务)。bitbang 事务难以精确
-	// 计数, 用写计数近似: 读回发生在延迟任务中, POST 返回后仍增长即证明
-	// 诊断未被请求 ctx 取消。
-	post := func() {
-		req := httptest.NewRequest(http.MethodPost, "/api/crps/fan", strings.NewReader(`{"mode":"auto","pct":10}`))
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, req)
-		if rec.Code != http.StatusOK {
-			t.Fatalf("POST /fan -> %d: %s", rec.Code, rec.Body.String())
-		}
-	}
-
-	// READ_FAN1 观察点: 诊断读回必经 fanRpm。快照刷新 (doPost 的 1.2s 延迟
-	// refresh 与 StartStatusRefresher) 不在本测试启动, 故读回即诊断。
-	diagReads := make(chan string, 64)
-	oldOverride2 := readWordOverride.Load()
-	setReadWordOverride(func(b *Bus, cmd byte) *uint16 {
-		if cmd == Cmd["READ_FAN1"] {
-			select {
-			case diagReads <- "read":
-			default:
-			}
-		}
-		return nil
-	})
+	// 诊断专用观察点: 仅延迟诊断任务触发 (setFan 同步 baseline 与快照刷新不计入)。
+	// 用原子计数而非 channel: countDiag 多次调用不能消耗历史命中。
+	var diagCount atomic.Int64
+	oldHook := autoFanDiagHook.Load()
+	setAutoFanDiagHook(func() { diagCount.Add(1) })
 	defer func() {
-		if oldOverride2 == nil {
-			readWordOverride.Store(nil)
+		if oldHook == nil {
+			autoFanDiagHook.Store(nil)
 		} else {
-			readWordOverride.Store(oldOverride2)
+			autoFanDiagHook.Store(oldHook)
 		}
 	}()
 
-	post() // 第一个 POST: 返回后注册延迟诊断
-	writes1 := mock.writeCount()
-	time.Sleep(150 * time.Millisecond)
-	post() // 第二个 POST: 应合并进同一延迟任务, 不另起 goroutine
-	// 等诊断延迟 (3s) 过去, 服务 ctx 仍存活: 读回必须发生 (POST 已返回,
-	// 证明延迟任务未被请求 ctx 取消)
-	deadline := time.Now().Add(6 * time.Second)
-	for {
-		select {
-		case <-diagReads:
-			goto diagSeen
-		default:
+	countDiag := func() int { return int(diagCount.Load()) }
+
+	// 真实 httptest.Server: 真实 TCP 连接, 请求返回后 server 侧请求 ctx 被取消
+	// (直接 ServeHTTP 不会这样), 模拟真实客户端断开后的服务端环境
+	ts := httptest.NewServer(srv.APIHandler())
+	defer ts.Close()
+
+	post := func() {
+		resp, err := http.Post(ts.URL+"/api/crps/fan", "application/json", strings.NewReader(`{"mode":"auto","pct":10}`))
+		if err != nil {
+			t.Fatalf("POST 失败: %v", err)
 		}
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("POST /fan -> %d", resp.StatusCode)
+		}
+		resp.Body.Close()
+	}
+
+	post()
+	post() // 第二次在延迟窗口内: 应合并
+	if n := countDiag(); n != 0 {
+		t.Fatalf("诊断不应在 POST 同步路径触发, 得到 %d", n)
+	}
+	deadline := time.Now().Add(autoFanDiagDelay + 3*time.Second)
+	for countDiag() < 1 {
 		if time.Now().After(deadline) {
-			t.Fatal("POST 返回后 6s 内诊断读回未发生: 延迟任务被请求 ctx 取消")
+			t.Fatal("POST 返回后延迟窗口内诊断未发生: 延迟任务被请求 ctx 取消")
 		}
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(20 * time.Millisecond)
 	}
-diagSeen:
-	_ = writes1
+	time.Sleep(500 * time.Millisecond) // 容忍合并失败时的第二发
+	if n := countDiag(); n != 1 {
+		t.Fatalf("两次 POST 应恰好一次诊断, 得到 %d", n)
+	}
 
-	// 服务取消后: 等第一段任务全部收尾, 再验证取消后的新任务不读回
-	// 等第一段所有延迟任务自然收尾 (含 POST2 合并任务的读回), 避免它们污染取消段观察
-	time.Sleep(autoFanDiagDelay + time.Second)
-
-	// 取消服务 ctx, 等在途 goroutine (快照刷新 1.2s) 全部退出
+	// 等第一段任务收尾, 再取消服务 ctx: 取消后新 POST 的延迟任务不得读回
+	time.Sleep(autoFanDiagDelay)
 	lifecycleCancel()
-	time.Sleep(1500 * time.Millisecond)
-	readCount := func() int {
-		n := 0
-		for {
-			select {
-			case <-diagReads:
-				n++
-			default:
-				return n
-			}
-		}
-	}
-	base := readCount()
-	post() // 取消后注册的延迟任务必须直接退出, 不发读回
+	time.Sleep(300 * time.Millisecond)
+	base := countDiag()
+	post()
 	time.Sleep(autoFanDiagDelay + time.Second)
-	if readCount() > base {
-		t.Fatal("服务取消后仍有诊断读回")
+	if n := countDiag(); n > base {
+		t.Fatalf("服务取消后仍有诊断: %d -> %d", base, n)
 	}
 }

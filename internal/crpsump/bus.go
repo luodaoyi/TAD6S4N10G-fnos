@@ -112,6 +112,19 @@ var Cmd = map[string]byte{
 // autoFanDiagDelay 切回自动后的 RPM 读回延迟: 固件调速有迟滞, 立即读是旧值。
 const autoFanDiagDelay = 3 * time.Second
 
+// autoFanDiagHook 单测观察点: 延迟诊断任务真正发起读回时回调一次。
+// setFan 的同步 baseline 读不触发——测试可据此区分诊断与请求内读。
+// atomic 访问: 延迟诊断 goroutine 可能跨测试存续, 测试安装/恢复替身不得与在途调用竞争。
+var autoFanDiagHook atomic.Pointer[func()]
+
+func setAutoFanDiagHook(fn func()) {
+	if fn == nil {
+		autoFanDiagHook.Store(nil)
+		return
+	}
+	autoFanDiagHook.Store(&fn)
+}
+
 // ---------------- PMBus bitbang 总线 ----------------
 //
 // 并发模型:
@@ -946,6 +959,9 @@ func (b *Bus) setFan(ctx context.Context, mode string, pct int) bool {
 			base := b.autoFanDiag.pendingBaseline
 			b.autoFanDiag.pending = nil
 			b.autoFanDiag.mu.Unlock()
+			if fn := autoFanDiagHook.Load(); fn != nil { // 单测观察点: 仅延迟诊断任务触发 (同步基线不计入)
+				(*fn)()
+			}
 			rpm := b.fanRpm()
 			Logf("切回自动: 写 FAN_COMMAND_1=10%% -> FAN=%s (手动基线=%s)", ptrStr(rpm), ptrStr(base))
 		}()
