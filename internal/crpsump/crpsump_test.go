@@ -1272,7 +1272,12 @@ func TestFanAutoDiagUsesLifecycleCtx(t *testing.T) {
 	// 用原子计数而非 channel: countDiag 多次调用不能消耗历史命中。
 	var diagCount atomic.Int64
 	oldHook := autoFanDiagHook.Load()
-	setAutoFanDiagHook(func() { diagCount.Add(1) })
+	setAutoFanDiagHook(func(bus *Bus) {
+		if bus != b { // 只计本测试的 Bus: 其他用例的延迟任务可能跨用例存活
+			return
+		}
+		diagCount.Add(1)
+	})
 	defer func() {
 		if oldHook == nil {
 			autoFanDiagHook.Store(nil)
