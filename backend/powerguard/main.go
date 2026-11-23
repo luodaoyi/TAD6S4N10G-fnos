@@ -254,7 +254,9 @@ func serve(args []string) error {
 	// 耗电统计 energy.json 同目录落盘，退出时保存。
 	crpsHandler, crpsEnergySave := initCrps(logger, filepath.Join(filepath.Dir(*config), "crps.json"), ctx)
 	if crpsEnergySave != nil {
-		defer crpsEnergySave() // CRPS 耗电统计退出落盘 (ctx.Done 与 server 错误两条路径均覆盖)
+		// CRPS 退出落盘 (ctx.Done 与 server 错误两条路径均覆盖): defer 顺序保证先
+		// cancel (255 行 defer cancel 之上) -> 采样 goroutine join -> 最终 Save。
+		defer crpsEnergySave()
 	}
 	go func() {
 		// BasePath: 不传 --base-path 时保持 fnOS 宿主的固定前缀;DSM 嵌入模式
@@ -490,16 +492,12 @@ func gpioLoop(ctx context.Context, manager *powerguard.Manager, logger *log.Logg
 	}()
 	var config powerguard.GPIOConfig
 	var nextConfigLoad time.Time
-	var lastLoggedError string
-	var lastLoggedErrorAt time.Time
 	// logGPIOError 按「同错误文本 1 分钟内只记一次」去重: 字符串比较只能压住同一
 	// 错误, 两种错误交替出现 (如 open/poll 轮流失败) 时原逻辑会每次都刷屏。
+	gpioThrottle := newErrorLogThrottle(time.Now)
 	logGPIOError := func(stage string, err error) {
-		now := time.Now()
-		if err.Error() != lastLoggedError || now.Sub(lastLoggedErrorAt) >= time.Minute {
+		if gpioThrottle.allow(err) {
 			logger.Printf("gpio %s failed: %v", stage, err)
-			lastLoggedError = err.Error()
-			lastLoggedErrorAt = now
 		}
 	}
 	for {
@@ -523,7 +521,7 @@ func gpioLoop(ctx context.Context, manager *powerguard.Manager, logger *log.Logg
 					port = nil
 				}
 				manager.ResetGPIO(false, false, nil)
-				lastLoggedError = ""
+				gpioThrottle.reset()
 				continue
 			}
 			if port == nil {
@@ -542,7 +540,6 @@ func gpioLoop(ctx context.Context, manager *powerguard.Manager, logger *log.Logg
 				port = nil
 				continue
 			}
-			lastLoggedError = ""
 			for _, event := range events {
 				if event.IsFeedback() {
 					logger.Printf("gpio hold confirmed button=%s stage=%s", event.ButtonID, event.Stage)
@@ -603,12 +600,17 @@ func initCrps(logger *log.Logger, cfgPath string, ctx context.Context) (http.Han
 	// 日志放到 crps.json 同目录 (宿主状态目录), 不使用全局可写的 /tmp
 	crpsump.LogPath = filepath.Join(filepath.Dir(cfgPath), "crps.log")
 	bus := crpsump.NewBus(sclPin, sdaPin, configured)
-	energy := crpsump.StartEnergy(bus, filepath.Join(filepath.Dir(cfgPath), "energy.json"), ctx)
+	energy, energyStop := crpsump.StartEnergy(bus, filepath.Join(filepath.Dir(cfgPath), "energy.json"), ctx)
 	crpsump.StartStatusRefresher(bus, ctx) // 状态快照后台刷新: CRPS 页面首开即有数据
 	crpsump.LogStartup(bus, sclPin, sdaPin)
 	logger.Printf("crps module enabled config=%s energy=%s", cfgPath, filepath.Join(filepath.Dir(cfgPath), "energy.json"))
 	srv := &crpsump.AppServer{Bus: bus, ConfigPath: cfgPath}
-	return srv.APIHandler(), energy.Save
+	// 退出落盘顺序: 先 cancel ctx -> energyStop 等采样 goroutine 退出 -> 最终 Save。
+	// 保证最终快照落盘后不会再有采样写入 (server 启动失败与正常退出两条路径都走这)。
+	return srv.APIHandler(), func() {
+		energyStop()
+		energy.Save()
+	}
 }
 
 // bootChimeWindow 开机提示音的判定窗口：只有系统刚启动（uptime 小于该值）才响。

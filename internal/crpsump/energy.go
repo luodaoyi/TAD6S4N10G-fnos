@@ -268,10 +268,15 @@ func energySampler(ctx context.Context, bus *Bus) {
 	}
 }
 
-// StartEnergy 初始化全局耗电统计并启动后台采样循环 (backend 入口调用),
-// 返回实例供退出前落盘。ctx 取消后采样循环退出 (save ticker 由 defer 停止)。
-func StartEnergy(bus *Bus, path string, ctx context.Context) *EnergyStats {
+// StartEnergy 初始化全局耗电统计并启动后台采样循环 (backend 入口调用)。
+// 返回实例与 stop 函数: stop 等 ctx 取消后采样 goroutine 真正退出并 join,
+// 之后调用方再做最终 Save, 确保最终快照之后不会再发生采样写入。
+func StartEnergy(bus *Bus, path string, ctx context.Context) (*EnergyStats, func()) {
 	energyStats = NewEnergy(path)
-	go energySampler(ctx, bus)
-	return energyStats
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		energySampler(ctx, bus)
+	}()
+	return energyStats, func() { <-done }
 }
