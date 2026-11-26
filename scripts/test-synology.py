@@ -186,6 +186,7 @@ cp "$FAKE_ELF" app/bin/tad-module
         return source_text.split('\ncase "${1:-}" in\n')[0]
 
     _publish_bin = None  # 类级缓存:真实构建的 tad-module(linux/amd64)
+    _build_dir = None    # 进程私有构建目录(CodeRabbit R21:并行检出隔离)
 
     @classmethod
     def _ensure_publish_binary(cls):
@@ -200,9 +201,14 @@ cp "$FAKE_ELF" app/bin/tad-module
             return None
         if cls._publish_bin and Path(cls._publish_bin).exists():
             return cls._publish_bin
+        # CodeRabbit R21:构建产物与缓存路径限定在本进程私有目录——共享
+        # tempfile.gettempdir() 固定路径会让同一主机上两个检出并行跑测试
+        # 时互相覆盖 go build 产物,跑的是另一份检出的二进制。
+        if cls._build_dir is None:
+            cls._build_dir = tempfile.mkdtemp(prefix='tad-publish-bin-')
         try:
             r = sp.run(['go', 'build', '-o',
-                        Path(tempfile.gettempdir()) / 'tad-module-publish-test-bin',
+                        Path(cls._build_dir) / 'tad-module-publish-test-bin',
                         './backend/powerguard'],
                        capture_output=True, text=True,
                        cwd=str(ROOT), timeout=300)
@@ -210,7 +216,7 @@ cp "$FAKE_ELF" app/bin/tad-module
                 # 构建失败必须可见:静默 None 会让下游测试以"cfg 未落盘"
                 # 的误导性错误失败(luodaoyi R12)
                 raise RuntimeError(f'publish test binary build failed: {r.stderr[-500:]}')
-            cls._publish_bin = str(Path(tempfile.gettempdir()) / 'tad-module-publish-test-bin')
+            cls._publish_bin = str(Path(cls._build_dir) / 'tad-module-publish-test-bin')
             return cls._publish_bin
         except (OSError, sp.TimeoutExpired) as e:
             raise RuntimeError(f'publish test binary unavailable: {e}')
@@ -276,6 +282,9 @@ cp "$FAKE_ELF" app/bin/tad-module
     def _run_postinst(self, work, extra_env):
         env = dict(os.environ)
         env.update(self._postinst_env(work))
+        # CodeRabbit R21:剥离继承的 wizard_* 后再叠场景显式值
+        for k in [k for k in env if k.startswith('wizard_')]:
+            del env[k]
         env.update({k: str(v) for k, v in extra_env.items()})
         return subprocess.run(['sh', str(self.POSTINST)], env=env,
                               check=True, timeout=30, capture_output=True)
@@ -285,6 +294,18 @@ cp "$FAKE_ELF" app/bin/tad-module
         # Windows 本地跑 Git Bash sh 时,`*/@appstore` 这类尾缀匹配只认 "/"。
         # Linux CI 上是无操作。
         return str(p).replace('\\', '/')
+
+    @staticmethod
+    def _wizard_env(bases, **explicit):
+        # CodeRabbit R21:安装夹具不得继承宿主环境里的 wizard_* 变量——
+        # 若运行环境已有 wizard_standalone_mode=true,只覆盖 wizard_port 的
+        # 场景会暂存 0.0.0.0:port 而测试期望 127.0.0.1:port。先从所有基底
+        # 剥离继承值,再显式设置各场景需要的模式与端口。
+        merged = {}
+        for base in bases:
+            merged.update({k: v for k, v in base.items() if not k.startswith('wizard_')})
+        merged.update({k: str(v) for k, v in explicit.items()})
+        return merged
 
     def test_startup_log_resolves_after_appdata_fallback(self):
         # STARTUP_LOG 必须在 PKG_VAR 的 @appdata 回退之后赋值,否则手动调用
@@ -875,12 +896,13 @@ int main(int argc, char **argv) {
                     # 用例私有目录写通知文件($QUIT 显式绑定,mock 看到即删
                     # 文件作回执),有界等待回执,不向任何 PID 发信号、不扫
                     # 全机进程表(裸 PID 复用/子串匹配都可能误伤宿主进程)。
-                    # alarm(120) 仅兜底测试崩溃等极端情形。仅正向场景等待
-                    # (负向场景 daemon 未启动,无回执可等;alarm 兜底覆盖
-                    # 一切意外)。
+                    # alarm(120) 仅兜底测试崩溃等极端情形。按实际启动结果
+                    # 清理(CodeRabbit R21):PID 文件存在即发通知——负向
+                    # 场景拦截失败时断言已 fail,但 mock 若真的起来了也得
+                    # 收到退出通知,否则只能等满 120s 兜底 alarm。
                     quit_file = work / 'mock-daemon.quit'
                     try:
-                        if expect_pass and pidfile.exists():
+                        if pidfile.exists():
                             self._quit_wait_mock(quit_file, pidfile, expect_ack=True)
                     except OSError:
                         pass
@@ -959,9 +981,10 @@ int main(int argc, char **argv) {
             var = work / 'var'
             etc.mkdir()
             var.mkdir()
-            env = dict(os.environ, TEST_DIR=self._shpath(tmp), SYNOPKG_PKGDEST=self._shpath(tmp),
+            env = dict(self._wizard_env([os.environ], wizard_port='8231'),
+                       TEST_DIR=self._shpath(tmp), SYNOPKG_PKGDEST=self._shpath(tmp),
                        SYNOPKG_PKGETC=self._shpath(etc),
-                       SYNOPKG_PKGVAR=self._shpath(var), wizard_port='8231')
+                       SYNOPKG_PKGVAR=self._shpath(var))
             # 阻断 cfg 写入:把 etc 目标路径变成目录。
             (etc / 'tad-module.cfg').mkdir()
             stub_env = self._postinst_env(work)
@@ -1211,6 +1234,17 @@ exit 0
         # 非 linux 宿主无法执行目标平台二进制,整测跳过(CI Linux 实跑)
         if sys.platform != 'linux':
             self.skipTest('需要 linux 宿主(publish 子命令),CI 覆盖')
+        # ⑤ 写入或提交失败:暂存保留、残 tmp 清理、日志记真实结果;恢复后
+        # 重试同样保端口(luodaoyi 五轮:真实走到失败路径)。
+        # CodeRabbit R21:两场景注入必须分离——write-fail 使 ensure_cfg 的
+        # 配置临时文件校验失败(grep 替身只拦 cfg tmp,写入分支在 publish
+        # 之前断掉,断言 publish 未被调用);mv-fail 才注入 publish 失败,
+        # 证明「publish 已被调用却失败后暂存保留」。
+    def test_ensure_cfg_commit_failure_retries_and_preserves_stash(self):
+        # 发布走后端 publish 子命令(ln 回退已删),linux 二进制是前提:
+        # 非 linux 宿主无法执行目标平台二进制,整测跳过(CI Linux 实跑)
+        if sys.platform != 'linux':
+            self.skipTest('需要 linux 宿主(publish 子命令),CI 覆盖')
         for scenario in ('write-fail', 'mv-fail'):
             with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as tmp:
                 work = Path(tmp)
@@ -1222,15 +1256,33 @@ exit 0
                 var.mkdir()
                 (work / 'functions').write_text(self._definitions(self.REAL.read_text()))
                 (var / 'wizard-install.env').write_text('HTTP_ADDR="127.0.0.1:9301"\n')
-                # luodaoyi R13:失败注入用目标过滤的 publish 包装器——仅
-                # 配置提交失败一次,其余转交真实二进制,证明「publish 已被
-                # 调用却失败后暂存保留」;恢复段先还原真身再重试
-                restore = self._wrap_publish_filter(work, 'tad-module.cfg')
+                stub_env = self._postinst_env(work)
+                publish_calls_log = work / 'publish-calls.log'
+                # write-fail:grep 校验替身只拦配置 tmp(模拟写入产物不完整),
+                # 其余 grep 调用放行——校验失败分支在 publish 之前
+                if scenario == 'write-fail':
+                    self._inject_postinst_stub(work, 'grep',
+                        'case "$3" in *tad-module.cfg.tmp*) exit 1 ;; esac\n'
+                        'exit 0')
+                    # publish 调用记录替身:真实二进制包装,先留痕再转交
+                    bin_dst = work / 'bin/tad-module'
+                    real = work / 'bin/.tad-module.real'
+                    shutil.move(str(bin_dst), str(real))
+                    qreal = "'" + self._shpath(real) + "'"
+                    wrapper = ('#!/bin/sh\n'
+                               "printf '%s\\n' \"$*\" >> '" + str(publish_calls_log) + "'\n"
+                               f'exec {qreal} "$@"\n')
+                    bin_dst.write_text(wrapper)
+                    bin_dst.chmod(0o755)
+                else:
+                    # luodaoyi R13:失败注入用目标过滤的 publish 包装器——仅
+                    # 配置提交失败一次,其余转交真实二进制,证明「publish 已被
+                    # 调用却失败后暂存保留」;恢复段先还原真身再重试
+                    restore = self._wrap_publish_filter(work, 'tad-module.cfg')
                 env = dict(os.environ, TEST_DIR=self._shpath(tmp),
                            SYNOPKG_PKGDEST=self._shpath(tmp),
                            SYNOPKG_PKGETC=self._shpath(etc),
                            SYNOPKG_PKGVAR=self._shpath(var))
-                stub_env = self._postinst_env(work)
                 body = r"""
 . "$TEST_DIR/functions"
 CFG_FILE="$TEST_DIR/etc/tad-module.cfg"
@@ -1243,8 +1295,13 @@ exit 0
 """
                 body_env = {**env, **stub_env}
                 subprocess.run(['sh', '-ec', body], env=body_env, check=True, timeout=15)
-                # 恢复真实二进制重试:按暂存端口落盘并消费
-                restore()
+                if scenario == 'write-fail':
+                    # 校验失败必须在 publish 之前断掉:发布 helper 不得被调用
+                    self.assertFalse(publish_calls_log.exists(),
+                                     'write-fail: 配置校验失败时 publish 不得被调用')
+                else:
+                    # 恢复真实二进制重试:按暂存端口落盘并消费
+                    restore()
                 # 恢复真实 PATH 重试:按暂存端口落盘并消费
                 body_retry = r"""
 . "$TEST_DIR/functions"
@@ -1320,10 +1377,10 @@ exit 0
                 var = work / 'var'
                 etc.mkdir()
                 var.mkdir()
-                env = dict(os.environ, SYNOPKG_PKGDEST=self._shpath(tmp),
+                env = dict(self._wizard_env([os.environ], wizard_port='9401'),
+                           SYNOPKG_PKGDEST=self._shpath(tmp),
                            SYNOPKG_PKGETC=self._shpath(etc),
-                           SYNOPKG_PKGVAR=self._shpath(var),
-                           wizard_port='9401')
+                           SYNOPKG_PKGVAR=self._shpath(var))
                 if stub_kind == 'noclobber-collision':
                     # 预占三个候选临时名:通过 TAD_CFG_TMP_RACE 钉死 postinst
                     # 的候选名(生产恒 $$ 唯一),noclobber 循环全失败
@@ -1540,10 +1597,10 @@ exit 0
                          'head -c $((n / 2)) "$3" > "$3.part" && mv "$3.part" "$3" ;; esac' + chr(10) +
                          f'exec {qg} "$@"')
             self._inject_postinst_stub(work, 'grep', stub_body)
-            env = dict(os.environ, SYNOPKG_PKGDEST=self._shpath(tmp),
+            env = dict(self._wizard_env([os.environ], wizard_port='9601'),
+                       SYNOPKG_PKGDEST=self._shpath(tmp),
                        SYNOPKG_PKGETC=self._shpath(etc),
-                       SYNOPKG_PKGVAR=self._shpath(var),
-                       wizard_port='9601')
+                       SYNOPKG_PKGVAR=self._shpath(var))
             stub_env = self._postinst_env(work)
             run_env = {**env, **stub_env}
             subprocess.run(['sh', str(self.POSTINST)], env=run_env,
@@ -1603,11 +1660,11 @@ exit 0
                     # ensure-cfg 生命周期则预建暂存(验证恢复语义)。
                     if lifecycle == 'ensure-cfg':
                         (var / 'wizard-install.env').write_text('HTTP_ADDR="127.0.0.1:9801"\n')
-                    env = dict(os.environ, TEST_DIR=self._shpath(tmp),
+                    env = dict(self._wizard_env([os.environ], wizard_port='9801'),
+                               TEST_DIR=self._shpath(tmp),
                                SYNOPKG_PKGDEST=self._shpath(tmp),
                                SYNOPKG_PKGETC=self._shpath(etc),
-                               SYNOPKG_PKGVAR=self._shpath(var),
-                               wizard_port='9801')
+                               SYNOPKG_PKGVAR=self._shpath(var))
                     stub_env = self._postinst_env(work)
                     if lifecycle == 'ensure-cfg':
                         body = (
@@ -1803,10 +1860,10 @@ exit 0
                                        check=True, timeout=15)
                         log_path = var / 'startup-debug.log'
                     else:
-                        env = dict(os.environ, SYNOPKG_PKGDEST=self._shpath(tmp),
+                        env = dict(self._wizard_env([os.environ], wizard_port='9902'),
+                                   SYNOPKG_PKGDEST=self._shpath(tmp),
                                    SYNOPKG_PKGETC=self._shpath(etc),
-                                   SYNOPKG_PKGVAR=self._shpath(var),
-                                   wizard_port='9902')
+                                   SYNOPKG_PKGVAR=self._shpath(var))
                         stub_env = self._postinst_env(work)
                         _break_helper()
                         subprocess.run(['sh', str(self.POSTINST)],

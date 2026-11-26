@@ -90,7 +90,15 @@ port_in_use() {
   want_port="${1##*:}"
   want_addr="${1%:*}"
   case "${want_addr}" in
-    localhost) want_addr="127.0.0.1"; want_family=4 ;;
+    localhost)
+      # localhost 不固定映射 127.0.0.1:Go net.Listen 解析结果含 IPv4 时
+      # 用 IPv4,但若 /etc/hosts 让 localhost 仅解析 ::1 则绑 [::1]。
+      # 脚本无法按相同规则解析主机名——只记诊断不预判(返回 1=可用),
+      # 由守护进程实际 bind 定论;明确 IPv4 字面量(127.0.0.1 等)仍照常
+      # 拦截。默认值/向导/postinst 只写 127.0.0.1 或 0.0.0.0,影响极窄。
+      echo "$(date '+%Y-%m-%dT%H:%M:%S') 端口预检:目标 localhost 的地址族无法可靠解析(与 net.Listen 一致性不可脚本化),跳过预检,以服务实际 bind 为准" >> "${STARTUP_LOG}" 2>/dev/null || true
+      return 1
+      ;;
     \[*\])
       want_addr="${want_addr#\[}"; want_addr="${want_addr%\]}"
       case "${want_addr}" in
@@ -121,7 +129,10 @@ port_in_use() {
         lfamily = 4
         sub(/^::ffff:/, "", laddr)
       } else {
-        if ($1 == "tcp6") { lfamily = 6 } else { lfamily = 4 }
+        # 地址族按监听地址本身判断,不依赖 netstat 协议列——BusyBox
+        # netstat 对 IPv6 socket 也输出 tcp,DSM 若同则 tcp6 判定失效。
+        # 已剥 ::ffff: 前缀的 v4-mapped 走不到这里(lfamily=4 上方已定)。
+        if (laddr ~ /:/) { lfamily = 6 } else { lfamily = 4 }
       }
       if (lport != wp) next
       lwild = 0
@@ -493,8 +504,9 @@ case "${1:-}" in
         echo "$(date '+%Y-%m-%dT%H:%M:%S') 启动失败:${HTTP_ADDR} 已被其他进程占用"
         echo "占用者(供排查):"
         netstat -tlnp 2>/dev/null | grep ":${HTTP_ADDR##*:}[[:space:]]" || netstat -tln 2>/dev/null | grep ":${HTTP_ADDR##*:}[[:space:]]"
-        echo "处置:编辑 ${CFG_FILE} 把 HTTP_ADDR 改成其他端口(如 127.0.0.1:8231),并同步修改"
-        echo "      ${NGINX_CONF} 里 proxy_pass 的端口后重启套件;或停掉占用该端口的进程/容器"
+        echo "处置:编辑 ${CFG_FILE} 把 HTTP_ADDR 改成其他端口(如 127.0.0.1:8231)后重启套件即可;"
+        echo "      不要手动修改 ${NGINX_CONF} 的 proxy_pass——保留原值启动时才能被检测到并自动 reload nginx;"
+        echo "      或停掉占用该端口的进程/容器"
       } >> "${STARTUP_LOG}" 2>/dev/null || true
       echo "启动失败:${HTTP_ADDR} 端口已被其他进程占用(常见于 Docker 容器映射或 RR 组件)。" >&2
       echo "处置:改 ${CFG_FILE} 的 HTTP_ADDR 端口后重启套件。详细: ${STARTUP_LOG}" >&2

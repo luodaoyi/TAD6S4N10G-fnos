@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -1713,15 +1714,17 @@ func setFanPWM(fan FanDevice, percent int) error {
 // fanPWMWriteHook 测试钩子：非 nil 时记录每一笔 PWM 原始写入（0–255）。
 // 回归用例需要核对「整条路径上有没有出现过非零写入」，只看最后一次 PWM 值会
 // 漏掉中途被 fail-safe 拉到 100% 又再写回 0 的情况。
-var fanPWMWriteHook func(fan FanDevice, raw int)
+// atomic.Pointer:测试在并行 goroutine 中安装钩子(setFanPWMRaw 在主测试
+// goroutine 读),go test -race 报数据竞争,必须原子访问。
+var fanPWMWriteHook atomic.Pointer[func(fan FanDevice, raw int)]
 
 // setFanPWMRaw 直接按原始占空比(0–255)写入;百分比调用方先换算。
 func setFanPWMRaw(fan FanDevice, raw int) error {
 	if raw < 0 || raw > 255 {
 		return fmt.Errorf("invalid fan PWM raw %d", raw)
 	}
-	if fanPWMWriteHook != nil {
-		fanPWMWriteHook(fan, raw)
+	if hook := fanPWMWriteHook.Load(); hook != nil {
+		(*hook)(fan, raw)
 	}
 	currentPWM, err := readInt(fan.PWMPath)
 	if err != nil {

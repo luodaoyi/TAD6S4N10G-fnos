@@ -1893,12 +1893,15 @@ func recordFanPWMWrites(t *testing.T) func() []int {
 	t.Helper()
 	var mu sync.Mutex
 	var writes []int
-	fanPWMWriteHook = func(fan FanDevice, raw int) {
+	hook := func(fan FanDevice, raw int) {
 		mu.Lock()
 		writes = append(writes, raw)
 		mu.Unlock()
 	}
-	t.Cleanup(func() { fanPWMWriteHook = nil })
+	// atomic 存储(与生产读侧的 atomic.Pointer 配对):测试 goroutine 中途
+	// 安装钩子,主测试 goroutine 并发读,go test -race 要求原子访问
+	fanPWMWriteHook.Store(&hook)
+	t.Cleanup(func() { fanPWMWriteHook.Store(nil) })
 	return func() []int {
 		mu.Lock()
 		defer mu.Unlock()

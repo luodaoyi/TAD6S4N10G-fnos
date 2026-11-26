@@ -235,9 +235,10 @@ if [ ! -f "${CFG_FILE}" ]; then
         log "向导选值原子暂存 var/wizard-install.env (cfg 未提交)"
       else
         # 发布失败(目标已有暂存/占位/EEXIST):清本次 tmp,不删既有暂存,
-        # 防止重复安装累积残留(CodeRabbit R10 Minor)
+        # 防止重复安装累积残留(CodeRabbit R10 Minor)。不预测启动端口:
+        # 已有暂存有效时下次启动会先尝试提交它,提交仍失败则退出而非回落默认
         rm -f "${STASH_TMP}" 2>/dev/null || true
-        log "暂存提交失败(目标已有暂存、目录/symlink 占位或发布失败),首次启动由服务脚本自愈为默认端口"
+        log "本次向导值暂存提交失败(目标已有暂存、目录/symlink 占位或发布失败);既有暂存(如有)保留原样,由启动脚本重新检查后决定提交或保留"
       fi
     else
       [ -n "${STASH_TMP}" ] && rm -f "${STASH_TMP}" 2>/dev/null || true
