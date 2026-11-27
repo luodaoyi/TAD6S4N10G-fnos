@@ -42,6 +42,27 @@ fi
 # SYNOPKG_PKGVAR)时目录可能已被回退改写，日志要落进最终运行目录
 # (luodaoyi review #40 第 4 条)。
 STARTUP_LOG="${PKG_VAR}/startup-debug.log"
+
+# log_root 硬化追加(luodaoyi 权限审查:薄壳以套件用户身份在 root 降权前
+# 可写 var 目录,root 再追加同一文件会跟随套件用户预置的 symlink/硬链接
+# 写任意路径)。本脚本以 root 运行,追加前校验目标:
+#   1. 普通文件且非符号链接(-h 排除 symlink 自身,readlink -f 排除父目录链);
+#   2. 属主恰为 root(套件用户无 chown 回权);
+#   3. 硬链接数=1(排除指向别处的硬链接替身);
+# 任一不满足→安全跳过本次写入(root 侧不碰不可信路径),诊断改走 stderr。
+# 文件不存在时:在受信目录内以 noclobber 独占创建并 chmod 600(root 属主)。
+log_root() {
+  _msg="$*"
+  if [ -L "${STARTUP_LOG}" ] || [ -e "${STARTUP_LOG}" ] && { [ ! -f "${STARTUP_LOG}" ] || [ "$(stat -c %u "${STARTUP_LOG}" 2>/dev/null)" != "0" ] || [ "$(stat -c %h "${STARTUP_LOG}" 2>/dev/null)" != "1" ]; }; then
+    echo "startup-debug.log 路径不可信(非 root 独占普通文件),跳过诊断落盘: ${_msg}" >&2
+    return 0
+  fi
+  if [ ! -e "${STARTUP_LOG}" ]; then
+    ( set -o noclobber; umask 077; : > "${STARTUP_LOG}" ) 2>/dev/null || true
+    chmod 600 "${STARTUP_LOG}" 2>/dev/null || true
+  fi
+  echo "$(date '+%Y-%m-%dT%H:%M:%S') [real] ${_msg}" >> "${STARTUP_LOG}" 2>/dev/null || true
+}
 BIN="${PKGDEST}/bin/tad-module"
 WEBROOT="${PKGDEST}/ui/static"
 PIDFILE="${PKG_VAR}/tad-module.pid"
@@ -96,7 +117,7 @@ port_in_use() {
       # 脚本无法按相同规则解析主机名——只记诊断不预判(返回 1=可用),
       # 由守护进程实际 bind 定论;明确 IPv4 字面量(127.0.0.1 等)仍照常
       # 拦截。默认值/向导/postinst 只写 127.0.0.1 或 0.0.0.0,影响极窄。
-      echo "$(date '+%Y-%m-%dT%H:%M:%S') 端口预检:目标 localhost 的地址族无法可靠解析(与 net.Listen 一致性不可脚本化),跳过预检,以服务实际 bind 为准" >> "${STARTUP_LOG}" 2>/dev/null || true
+      log_root "端口预检:目标 localhost 的地址族无法可靠解析(与 net.Listen 一致性不可脚本化),跳过预检,以服务实际 bind 为准"
       return 1
       ;;
     \[*\])
@@ -152,11 +173,11 @@ port_in_use() {
     while IFS= read -r line; do
       case "${line}" in
         CONFLICT*)
-          echo "$(date '+%Y-%m-%dT%H:%M:%S') 端口预检:${line}" >> "${STARTUP_LOG}" 2>/dev/null || true
+          log_root "端口预检:${line}"
           result=0
           ;;
         AMBIGUOUS*)
-          echo "$(date '+%Y-%m-%dT%H:%M:%S') 端口预检:${line}(IPv6 通配对 IPv4 的占位取决于 net.ipv6.bindv6only,不预判,以服务实际 bind 为准)" >> "${STARTUP_LOG}" 2>/dev/null || true
+          log_root "端口预检:${line}(IPv6 通配对 IPv4 的占位取决于 net.ipv6.bindv6only,不预判,以服务实际 bind 为准)"
           ;;
       esac
     done
@@ -247,7 +268,7 @@ publish_no_replace() {
   # 弱化实现;helper 不可用(异常安装态)时安全地不发布,调用方保留已有
   # 配置与可恢复暂存,原因写入 STARTUP_LOG。
   if [ ! -x "${BIN}" ]; then
-    echo "$(date '+%Y-%m-%dT%H:%M:%S') publish_no_replace:${BIN} 不可执行,安全不发布(helper 缺失),保留已有配置与暂存" >> "${STARTUP_LOG}" 2>/dev/null || true
+    log_root "publish_no_replace:${BIN} 不可执行,安全不发布(helper 缺失),保留已有配置与暂存"
     return 1
   fi
   "${BIN}" publish "${_pub_stage}" "${_pub_dst}" 2>/dev/null
@@ -320,7 +341,7 @@ ensure_cfg() {
     # 重复记录或夹带额外内容:签名不符(本套件 postinst 只写单行),整文件
     # 按不可信处理,回落默认地址
     if [ "${wiz_records}" -ne 1 ] || [ "${wiz_other}" -ne 0 ]; then
-      echo "$(date '+%Y-%m-%dT%H:%M:%S') ensure_cfg:暂存记录数=${wiz_records} 额外行=${wiz_other},非本套件 postinst 签名,整文件作废" >> "${STARTUP_LOG}" 2>/dev/null || true
+      log_root "ensure_cfg:暂存记录数=${wiz_records} 额外行=${wiz_other},非本套件 postinst 签名,整文件作废"
       WIZ_ADDR=""
     fi
   fi
@@ -357,7 +378,7 @@ ensure_cfg() {
     fi
   fi
   if [ -z "${CFG_TMP}" ]; then
-    echo "$(date '+%Y-%m-%dT%H:%M:%S') ensure_cfg:临时文件创建失败或权限不可达,暂存保留待重试 (committed=0)" >> "${STARTUP_LOG}" 2>/dev/null || true
+    log_root "ensure_cfg:临时文件创建失败或权限不可达,暂存保留待重试 (committed=0)"
     return 0
   fi
   committed=0
@@ -379,7 +400,7 @@ ensure_cfg() {
       rm -f "${CFG_TMP}" 2>/dev/null || true
       committed=1
     else
-      echo "$(date '+%Y-%m-%dT%H:%M:%S') ensure_cfg:cfg 已存在(竞争写入者先提交)、目录/symlink 占位或发布失败,不覆盖,暂存保留" >> "${STARTUP_LOG}" 2>/dev/null || true
+      log_root "ensure_cfg:cfg 已存在(竞争写入者先提交)、目录/symlink 占位或发布失败,不覆盖,暂存保留"
     fi
   fi
   if [ "${committed}" = "1" ]; then
@@ -394,9 +415,9 @@ ensure_cfg() {
     # 覆盖);空/非法/重复记录的暂存解析阶段就把 WIZ_ADDR 清空,标志不置位
     # (R19:它们回落默认启动,不阻止启动)
     rm -f "${CFG_TMP}" 2>/dev/null || true
-    echo "$(date '+%Y-%m-%dT%H:%M:%S') ensure_cfg:cfg 写入或提交失败,暂存保留待重试" >> "${STARTUP_LOG}" 2>/dev/null || true
+    log_root "ensure_cfg:cfg 写入或提交失败,暂存保留待重试"
   fi
-  echo "$(date '+%Y-%m-%dT%H:%M:%S') ensure_cfg 自愈创建 cfg (HTTP_ADDR=${final_addr}, committed=${committed})" >> "${STARTUP_LOG}" 2>/dev/null || true
+  log_root "ensure_cfg 自愈创建 cfg (HTTP_ADDR=${final_addr}, committed=${committed})"
 }
 
 ensure_nginx() {
@@ -483,7 +504,7 @@ case "${1:-}" in
     if [ "${_cfg_read_done}" = "0" ] && [ "${_stash_valid_uncommitted}" = "1" ]; then
       {
         echo "$(date '+%Y-%m-%dT%H:%M:%S') 启动失败:有效向导暂存存在但配置提交失败,拒绝以默认地址静默启动;暂存已保留,下次 start 重试"
-      } >> "${STARTUP_LOG}" 2>/dev/null || true
+      } | while IFS= read -r _l; do log_root "$_l"; done
       echo "启动失败:有效向导暂存存在但配置提交失败,已保留暂存待重试;详细: ${STARTUP_LOG}" >&2
       exit 1
     fi
@@ -507,7 +528,7 @@ case "${1:-}" in
         echo "处置:编辑 ${CFG_FILE} 把 HTTP_ADDR 改成其他端口(如 127.0.0.1:8231)后重启套件即可;"
         echo "      不要手动修改 ${NGINX_CONF} 的 proxy_pass——保留原值启动时才能被检测到并自动 reload nginx;"
         echo "      或停掉占用该端口的进程/容器"
-      } >> "${STARTUP_LOG}" 2>/dev/null || true
+      } | while IFS= read -r _l; do log_root "$_l"; done
       echo "启动失败:${HTTP_ADDR} 端口已被其他进程占用(常见于 Docker 容器映射或 RR 组件)。" >&2
       echo "处置:改 ${CFG_FILE} 的 HTTP_ADDR 端口后重启套件。详细: ${STARTUP_LOG}" >&2
       exit 1
@@ -550,7 +571,7 @@ case "${1:-}" in
           echo "$(date '+%Y-%m-%dT%H:%M:%S') 守护进程在就绪窗口内退出 (exit 探测第 ${i} 秒)"
           echo "---- 守护进程日志尾部 ----"
           tail -n 10 "${LOGFILE}" 2>/dev/null || true
-        } >> "${STARTUP_LOG}" 2>/dev/null || true
+        } | while IFS= read -r _l; do log_root "$_l"; done
         echo "tad-module 在启动阶段退出，最近日志："
         tail -n 5 "${LOGFILE}" 2>/dev/null || true
         echo "详细诊断: ${STARTUP_LOG}" >&2

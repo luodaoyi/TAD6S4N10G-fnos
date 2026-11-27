@@ -1881,8 +1881,71 @@ exit 0
                     self.assertIn('不可执行', log,
                                   f'{lifecycle}/{kind}: 原因必须落日志,日志={log!r}')
 
-    def test_wrapper_captures_spm_exec_rejection(self):
-        # set -e 下 spm-exec 非零退出必须仍记录返回码,退出码原样透传
+    def test_log_root_rejects_untrusted_paths_and_normal_start_unaffected(self):
+        # luodaoyi 权限审查:real 脚本以 root 追加套件用户可写 var 目录里的
+        # startup-debug.log,会跟随套件用户预置的 symlink/硬链接写任意路径。
+        # log_root 必须在追加前校验:普通文件、属主 root、硬链接数=1;不可信
+        # 时安全跳过(root 侧不碰该路径);可信/不存在路径正常落盘。
+        if not Path('/proc/self/stat').exists():
+            self.skipTest('stat/属主语义需要 POSIX,CI Linux 覆盖')
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            (work / 'etc').mkdir()
+            (work / 'var').mkdir()
+            (work / 'functions').write_text(self._definitions(self.REAL.read_text()))
+            sentinel = work / 'pwned-sentinel'
+            env = dict(os.environ, TEST_DIR=self._shpath(tmp),
+                       SYNOPKG_PKGDEST=self._shpath(tmp),
+                       SYNOPKG_PKGETC=self._shpath(work / 'etc'),
+                       SYNOPKG_PKGVAR=self._shpath(work / 'var'))
+            # ① symlink 预置:必须拒绝且哨兵不被写
+            body = r"""
+. "$TEST_DIR/functions"
+ln -s "$TEST_DIR/pwned-sentinel" "$TEST_DIR/var/startup-debug.log"
+log_root "注入测试"
+test ! -e "$TEST_DIR/pwned-sentinel" || exit 110
+exit 0
+"""
+            subprocess.run(['sh', '-ec', body], env=env, check=True, timeout=15)
+            # ② 非 root 属主普通文件:必须拒绝且内容不被追加。预置文件
+            # chown 给 nobody(容器内以 root 跑,模拟套件用户属主)
+            (work / 'var/startup-debug.log').unlink()
+            (work / 'var/startup-debug.log').write_text('victim\n')
+            subprocess.run(['chown', '65534:65534', str(work / 'var/startup-debug.log')],
+                           check=False)
+            body = r"""
+. "$TEST_DIR/functions"
+# chown 失败(容器无 nobody)则跳过本段——模拟前提不成立
+[ "$(stat -c %u "$TEST_DIR/var/startup-debug.log")" != "$(id -u)" ] || exit 0
+log_root "注入测试"
+test "$(cat "$TEST_DIR/var/startup-debug.log")" = victim || exit 111
+exit 0
+"""
+            subprocess.run(['sh', '-ec', body], env=env, check=True, timeout=15)
+            # ③ 硬链接替身:必须拒绝且目标不被写
+            (work / 'var/startup-debug.log').unlink()
+            (work / 'outside-target').write_text('clean\n')
+            os.link(work / 'outside-target', work / 'var/startup-debug.log')
+            body = r"""
+. "$TEST_DIR/functions"
+log_root "注入测试"
+test "$(cat "$TEST_DIR/outside-target")" = clean || exit 112
+exit 0
+"""
+            subprocess.run(['sh', '-ec', body], env=env, check=True, timeout=15)
+            # ④ 路径不存在:独占创建并落盘(600 属当前用户,容器内=root)
+            (work / 'var/startup-debug.log').unlink()
+            body = r"""
+. "$TEST_DIR/functions"
+log_root "正常诊断"
+test -f "$TEST_DIR/var/startup-debug.log" || exit 113
+grep -q "正常诊断" "$TEST_DIR/var/startup-debug.log" || exit 114
+test "$(stat -c %a "$TEST_DIR/var/startup-debug.log")" = 600 || exit 115
+exit 0
+"""
+            subprocess.run(['sh', '-ec', body], env=env, check=True, timeout=15)
+
+    def test_wrapper_captures_spm_exec_rejection(self):        # set -e 下 spm-exec 非零退出必须仍记录返回码,退出码原样透传
         # (luodaoyi review #40 第 2 条)。
         if hasattr(os, 'geteuid') and os.geteuid() == 0:
             self.skipTest('uid=0 走直接执行分支,不经过 spm-exec')
@@ -1898,9 +1961,13 @@ exit 0
             result = subprocess.run(['sh', str(ROOT / 'synology/scripts/start-stop-status'), 'status'],
                                     env=env, capture_output=True, text=True, timeout=15)
             self.assertEqual(result.returncode, 42, result.stderr)
-            log = (var / 'startup-debug.log').read_text()
+            # 薄壳诊断写独立的 entry 日志(luodaoyi 权限审查:薄壳以套件用户
+            # 运行,不得预创建/追加 root 侧独占的 startup-debug.log)
+            log = (var / 'startup-debug-entry.log').read_text()
             self.assertIn('经 spm-exec 提权转发', log)
             self.assertIn('spm-exec 返回 42', log)
+            self.assertFalse((var / 'startup-debug.log').exists(),
+                             '薄壳不得预创建 root 侧独占的 startup-debug.log')
 
     @unittest.skipUnless(shutil.which('node'), 'node unavailable')
     def test_desktop_window_config_passthrough(self):
