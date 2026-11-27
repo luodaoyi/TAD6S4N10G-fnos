@@ -47,14 +47,15 @@ STARTUP_LOG="${PKG_VAR}/startup-debug.log"
 # 可写 var 目录,root 再追加同一文件会跟随套件用户预置的 symlink/硬链接
 # 写任意路径)。本脚本以 root 运行,追加前校验目标:
 #   1. 普通文件且非符号链接(-h 排除 symlink 自身,readlink -f 排除父目录链);
-#   2. 属主恰为 root(套件用户无 chown 回权);
+#   2. 属主恰为当前 euid(生产=root;套件用户写入的文件属主≠root,拒绝);
 #   3. 硬链接数=1(排除指向别处的硬链接替身);
-# 任一不满足→安全跳过本次写入(root 侧不碰不可信路径),诊断改走 stderr。
-# 文件不存在时:在受信目录内以 noclobber 独占创建并 chmod 600(root 属主)。
+# 任一不满足→安全跳过本次写入(不碰不可信路径),诊断改走 stderr。
+# 文件不存在时:在受信目录内以 noclobber 独占创建并 chmod 600。
+_euid="$(id -u)"
 log_root() {
   _msg="$*"
-  if [ -L "${STARTUP_LOG}" ] || [ -e "${STARTUP_LOG}" ] && { [ ! -f "${STARTUP_LOG}" ] || [ "$(stat -c %u "${STARTUP_LOG}" 2>/dev/null)" != "0" ] || [ "$(stat -c %h "${STARTUP_LOG}" 2>/dev/null)" != "1" ]; }; then
-    echo "startup-debug.log 路径不可信(非 root 独占普通文件),跳过诊断落盘: ${_msg}" >&2
+  if [ -L "${STARTUP_LOG}" ] || [ -e "${STARTUP_LOG}" ] && { [ ! -f "${STARTUP_LOG}" ] || [ "$(stat -c %u "${STARTUP_LOG}" 2>/dev/null)" != "${_euid}" ] || [ "$(stat -c %h "${STARTUP_LOG}" 2>/dev/null)" != "1" ]; }; then
+    echo "startup-debug.log 路径不可信(非运行者独占普通文件),跳过诊断落盘: ${_msg}" >&2
     return 0
   fi
   if [ ! -e "${STARTUP_LOG}" ]; then
