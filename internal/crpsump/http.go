@@ -46,12 +46,20 @@ func refreshStatusSnapshot(bus *Bus) {
 	}
 }
 
-// StartStatusRefresher 启动状态快照后台刷新循环 (两个入口各调一次)
-func StartStatusRefresher(bus *Bus) {
+// StartStatusRefresher 启动状态快照后台刷新循环 (两个入口各调一次)。
+// ctx 取消后循环退出，避免 goroutine 泄漏。
+func StartStatusRefresher(bus *Bus, ctx context.Context) {
 	go func() {
 		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
 			refreshStatusSnapshot(bus)
-			time.Sleep(StatusRefreshInterval)
+			if !sleepCtx(ctx, StatusRefreshInterval) {
+				return
+			}
 		}
 	}()
 }
@@ -171,6 +179,10 @@ type AppServer struct {
 	// DetectFn 可注入的自动探测函数 (单测失败路径用, 绕过真实 bitbang 扫描);
 	// nil 时使用 Bus.autoDetect。第三个返回值是探测收尾清理错误 (针脚释放失败)。
 	DetectFn func(ctx context.Context) (string, string, error)
+	// LifecycleCtx 宿主服务生命周期 ctx (启动时注入): 延迟后台任务 (切回自动的
+	// RPM 诊断读回等) 必须用它而非请求 ctx —— 请求一返回 ctx 即取消, 延迟任务
+	// 永远发不出; 合并的后续请求也不能被第一个请求的结束所取消。
+	LifecycleCtx context.Context
 }
 
 var mimeTypes = map[string]string{
@@ -387,7 +399,12 @@ func (s *AppServer) doPost(w http.ResponseWriter, r *http.Request, p string) {
 		if pct > 100 {
 			pct = 100
 		}
-		ok := s.Bus.setFan(ctx, mode, pct)
+		// 延迟诊断用服务生命周期 ctx (nil 时回退请求 ctx: 独立嵌入场景未注入)。
+		diagCtx := s.LifecycleCtx
+		if diagCtx == nil {
+			diagCtx = ctx
+		}
+		ok := s.Bus.setFan(diagCtx, mode, pct)
 		// 异步延后刷新快照: 不在响应路径同步读 (会与后台循环/连续切换抢总线锁拖慢响应),
 		// 等 ~1.2s 让电源固件转速先动起来再读一轮, 前端随后立即拉取, 转速显示延迟
 		// 从最坏 ~6s (快照3s+轮询3s) 压到 ~1.5s。合并标记防连点堆积多个刷新。

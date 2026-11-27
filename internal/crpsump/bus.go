@@ -50,6 +50,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -108,6 +109,23 @@ var Cmd = map[string]byte{
 	"MFR_REVISION":  0x9b,
 }
 
+// autoFanDiagDelay 切回自动后的 RPM 读回延迟: 固件调速有迟滞, 立即读是旧值。
+const autoFanDiagDelay = 3 * time.Second
+
+// autoFanDiagHook 单测观察点: 延迟诊断任务真正发起读回时回调一次, 参数为发起
+// 诊断的 Bus——其他测试的延迟任务可能跨用例存活, 观察方按实例过滤防止串计。
+// setFan 的同步 baseline 读不触发——测试可据此区分诊断与请求内读。
+// atomic 访问: 延迟诊断 goroutine 可能跨测试存续, 测试安装/恢复替身不得与在途调用竞争。
+var autoFanDiagHook atomic.Pointer[func(b *Bus)]
+
+func setAutoFanDiagHook(fn func(b *Bus)) {
+	if fn == nil {
+		autoFanDiagHook.Store(nil)
+		return
+	}
+	autoFanDiagHook.Store(&fn)
+}
+
 // ---------------- PMBus bitbang 总线 ----------------
 //
 // 并发模型:
@@ -115,6 +133,10 @@ var Cmd = map[string]byte{
 //                 (sclName/sdaName/sclCfg/sdaCfg/ok)。任何访问底层 GPIO 的操作必须先持有 mu,
 //                 保证切换引脚瞬间不会有正在进行的传输半途换针脚。
 //   - stateMu   : 保护非 I/O 状态字段 (configured / fanMode / readable 缓存)。
+//   - 跨锁快照   : readAll 等读方先取 stateMu 的 configured/fanMode, 再取 mu 做 I/O 并看 ok。
+//                 两次加锁之间状态可能已变, 得到的可能是半新半旧快照——这是有意接受的
+//                 良性竞态: 最坏情况晚一轮反映切换 (auto/manual 切换本身有固件迟滞),
+//                 换取 I/O 锁不承担状态读。不要基于跨锁一致性做写决策。
 //   - 方向缓存   : sclOut/sdaOut 记录 SIO 方向寄存器缓存, 只在方向真正变化时写 SIO,
 //                 避免每次位操作都完整走一遍 enter/exit (项目惯例要求的性能优化)。
 
@@ -136,6 +158,13 @@ type Bus struct {
 	fanMode    string
 	lastOK     bool // readable() TTL 缓存
 	lastTs     int64
+	// 切回自动的延迟 RPM 诊断合并状态 (mu 保护): pending 非 nil 表示已有延迟任务
+	// 在跑, 重复请求只更新 pendingBaseline, 不另起 goroutine。
+	autoFanDiag struct {
+		mu              sync.Mutex
+		pending         chan struct{}
+		pendingBaseline *float64
+	}
 }
 
 // NewBus 创建 GPIO bitbang PMBus 总线: 校验引脚名, configured 时初始化方向寄存器。
@@ -699,8 +728,24 @@ func (b *Bus) i2cReadByte(ack bool) int {
 
 // ---- 事务 (自带加锁) ----
 
+// readWordOverride 单测替身: 非 nil 时 readWord 直接返回其结果, 不走 bitbang
+// (mock 总线所有位读同一口值, 无法表达非零 word; 该接缝让测试注入真实非零采样)。
+// atomic 访问: 延迟快照 goroutine 可能跨测试存续, 测试恢复替身时不得与在途读竞争。
+var readWordOverride atomic.Pointer[func(b *Bus, cmd byte) *uint16]
+
+func setReadWordOverride(fn func(b *Bus, cmd byte) *uint16) {
+	if fn == nil {
+		readWordOverride.Store(nil)
+		return
+	}
+	readWordOverride.Store(&fn)
+}
+
 // readWord 读一个 word (从设备先发低字节), 返回 nil 表示失败 (含端口写失败)
 func (b *Bus) readWord(cmd byte) *uint16 {
+	if fn := readWordOverride.Load(); fn != nil {
+		return (*fn)(b, cmd)
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.ioErr = nil
@@ -894,13 +939,36 @@ func (b *Bus) setFan(ctx context.Context, mode string, pct int) bool {
 		return ok
 	}
 	b.setFanMode("auto")
-	go func() {
-		if !sleepCtx(context.Background(), 3*time.Second) {
-			return
-		}
-		rpm := b.fanRpm()
-		Logf("切回自动: 写 FAN_COMMAND_1=10%% -> FAN=%s (手动基线=%s)", ptrStr(rpm), ptrStr(baseline))
-	}()
+	// 延迟 RPM 诊断由服务生命周期管理 (ctx), 不用请求 ctx —— 请求一返回就取消,
+	// 诊断日志永远发不出。多次快速切回自动时合并成单个延迟任务 (只记最后一次
+	// baseline), 不为每次请求留无界 goroutine。
+	b.autoFanDiag.mu.Lock()
+	b.autoFanDiag.pendingBaseline = baseline
+	if b.autoFanDiag.pending == nil {
+		done := make(chan struct{})
+		b.autoFanDiag.pending = done
+		b.autoFanDiag.mu.Unlock()
+		go func() {
+			defer close(done)
+			if !sleepCtx(ctx, autoFanDiagDelay) {
+				b.autoFanDiag.mu.Lock()
+				b.autoFanDiag.pending = nil
+				b.autoFanDiag.mu.Unlock()
+				return
+			}
+			b.autoFanDiag.mu.Lock()
+			base := b.autoFanDiag.pendingBaseline
+			b.autoFanDiag.pending = nil
+			b.autoFanDiag.mu.Unlock()
+			if fn := autoFanDiagHook.Load(); fn != nil { // 单测观察点: 仅延迟诊断任务触发 (同步基线不计入)
+				(*fn)(b)
+			}
+			rpm := b.fanRpm()
+			Logf("切回自动: 写 FAN_COMMAND_1=10%% -> FAN=%s (手动基线=%s)", ptrStr(rpm), ptrStr(base))
+		}()
+		return ok
+	}
+	b.autoFanDiag.mu.Unlock()
 	return ok
 }
 

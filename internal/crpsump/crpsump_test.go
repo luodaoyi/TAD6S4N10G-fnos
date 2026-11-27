@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -668,6 +669,7 @@ func TestAutoDetectRestoreConfiguredRestoresOriginalPins(t *testing.T) {
 //  1. switchPin 恢复原引脚失败 (failOutb 全写失败) -> "恢复原引脚失败"
 //  2. switchPin 成功但 busReset 末尾 sdaRelease 端口写失败 -> "总线复位失败",
 //     SDA 滞留输出须保留在 driven 追踪; 故障清除后重试应释放并消除错误。
+//
 // 复位末尾的释放与 initDirs 的 SDA 置输入写同一值 (Pin20: 0xCD 寄存器清 bit0
 // => sioWrite 数据口 0x2F 写 0x06), 用 failOnNth 跳过 initDirs 那次精确打击复位末尾。
 func TestAutoDetectRestoreConfiguredFailurePropagates(t *testing.T) {
@@ -1072,5 +1074,261 @@ func TestPostRejectsBadBody(t *testing.T) {
 	}
 	if rec.Body.Len() == 0 {
 		t.Fatal("null body 不应得到空响应")
+	}
+}
+
+// ---------------- 耗电统计采样循环生命周期 ----------------
+
+// 回归: StartEnergy 返回的 stop 必须等采样 goroutine 真正退出后才返回,
+// 之后调用方做最终 Save 时不会再有 Sample 写入 (最终快照之后零采样)。
+// 覆盖正常退出 (cancel ctx -> stop -> Save) 一条路径。
+func TestEnergyStopThenSaveFinalSnapshotStable(t *testing.T) {
+	stubPortAvailable(t, true)
+	oldStats := energyStats
+	defer func() { energyStats = oldStats }()
+
+	b := NewBus("Pin19", "Pin20", false)
+	mock := newMockPIO()
+	mock.readMask[GPPins["Pin20"].Port] = 0 // ACK 恒真, 读回全 0 (PIN=0W, 合法)
+	b.pio = mock
+	if ok, _ := b.reconfigure(nil, nil); !ok {
+		t.Fatal("reconfigure 失败")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	e, stop := StartEnergy(b, filepath.Join(t.TempDir(), "energy.json"), ctx)
+
+	// 给采样循环一点运行时间 (EnergySampleInterval=15s, 15s 内至多一轮),
+	// 然后走退出序列
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	stop() // 必须 join 采样 goroutine
+
+	// join 后记录快照基线; 若 stop 未真正 join, 后台循环仍可能写 energyStats
+	before := e.Snapshot()
+	time.Sleep(50 * time.Millisecond)
+	after := e.Snapshot()
+	if len(before["days"].([]map[string]any)) != 0 || len(after["days"].([]map[string]any)) != 0 {
+		// mock 总线 PIN 恒 0, 不积分; days 增长说明 stop 后仍有采样写入
+		t.Fatalf("stop 后快照发生变化: before=%v after=%v", before, after)
+	}
+	// 最终 Save 在 join 之后执行 (宿主退出序列), 这里验证 Save 可调用且幂等
+	e.Save()
+	e.Save()
+}
+
+// 回归: server 启动失败路径 —— StartEnergy 的 stop 必须能作为生产退出回调的一环
+// 独立完成 join: 采样在途、未预取消时调用 stop 也必须在有限时间返回。生产侧
+// (backend/powerguard) 用 newCRPSExitCallback 先 cancel 再 stop 再 Save, 顺序
+// 由该包的 TestCRPSExitCallbackOrder 锁定; 本测试锁定 stop 自身的可终止性。
+func TestEnergyStopJoinsInFlightSamplerWithoutPresetCancel(t *testing.T) {
+	stubPortAvailable(t, true)
+	oldStats := energyStats
+	defer func() { energyStats = oldStats }()
+
+	b := NewBus("Pin19", "Pin20", false)
+	mock := newMockPIO()
+	mock.readMask[GPPins["Pin20"].Port] = 0
+	b.pio = mock
+	if ok, _ := b.reconfigure(nil, nil); !ok {
+		t.Fatal("reconfigure 失败")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	_, stop := StartEnergy(b, filepath.Join(t.TempDir(), "energy.json"), ctx)
+
+	done := make(chan struct{})
+	go func() {
+		cancel()
+		stop()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stop 未在 5s 内 join 采样 goroutine, 疑似永久阻塞")
+	}
+}
+
+// 回归 (review 四轮): 替身覆盖「有真实采样在途」的退出路径 —— 可控时钟让采样
+// 循环真正跑完一次 Sample (非零 dt 积分), 观察点确认采样发生在途, 随后取消->
+// stop->最终 Save, 断言 energy.json 落盘且内容含该采样。若采样器过早返回
+// (未等在途采样), 置脏不会发生, 落盘断言失败。
+func TestEnergyShutdownAfterInFlightSample(t *testing.T) {
+	stubPortAvailable(t, true)
+	oldStats := energyStats
+	defer func() { energyStats = oldStats }()
+
+	b := NewBus("Pin19", "Pin20", false)
+	mock := newMockPIO()
+	mock.readMask[GPPins["Pin20"].Port] = 0 // ACK 恒真
+	b.pio = mock
+	if ok, _ := b.reconfigure(nil, nil); !ok {
+		t.Fatal("reconfigure 失败")
+	}
+
+	// 可控采样时钟: 第一发立即到点, 之后卡住 (模拟周期进行中)
+	tick1 := make(chan time.Time, 1)
+	tick1 <- time.Now()
+	oldTick := energySampleTick
+	energySampleTick = func(ctx context.Context) <-chan time.Time { return tick1 }
+	defer func() { energySampleTick = oldTick }()
+
+	// 同步屏障: 观察回调卡住采样中途 (Sample 未提交), 测试显式放行后才继续。
+	// 这样「stop 等待期间采样仍在途」是确定的, 而非碰运气的时间窗。
+	sampleEnter := make(chan struct{})   // 采样进入观察点
+	sampleRelease := make(chan struct{}) // 测试放行提交
+	oldHook := energySampleHook
+	energySampleHook = func(pin float64, dt time.Duration) {
+		sampleEnter <- struct{}{}
+		<-sampleRelease
+	}
+	defer func() { energySampleHook = oldHook }()
+
+	// 替身注入非零 READ_PIN (100W): mock 总线所有位读同一口值表达不了非零 word,
+	// 经 readWordOverride 接缝注入, 使在途采样真实积分非零功率
+	oldOverride := readWordOverride.Load()
+	setReadWordOverride(func(b *Bus, cmd byte) *uint16 {
+		if cmd == Cmd["READ_PIN"] {
+			// linear11: mant=100, exp=0 -> raw=100
+			w := uint16(100)
+			return &w
+		}
+		return nil
+	})
+	defer func() {
+		if oldOverride == nil {
+			readWordOverride.Store(nil)
+		} else {
+			readWordOverride.Store(oldOverride)
+		}
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	path := filepath.Join(t.TempDir(), "energy.json")
+	e, stop := StartEnergy(b, path, ctx)
+
+	// 等非零采样到达观察点 (Sample 已调用但被屏障卡住, 未提交)
+	select {
+	case <-sampleEnter:
+	case <-time.After(5 * time.Second):
+		t.Fatal("5s 内采样未到达观察点: 采样循环未按替身时钟运行")
+	}
+
+	// 屏障持有期间 (采样未提交) 触发退出序列: stop 必须阻塞等采样完成
+	exitDone := make(chan struct{})
+	go func() {
+		cancel()
+		stop() // 生产回调的 join 步
+		close(exitDone)
+	}()
+	select {
+	case <-exitDone:
+		t.Fatal("采样未提交时 stop 就返回了: 采样器过早退出 (join 无效)")
+	case <-time.After(100 * time.Millisecond):
+		// 预期: stop 仍阻塞在 join
+	}
+
+	// 放行采样提交, join 应随即完成
+	close(sampleRelease)
+	select {
+	case <-exitDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("采样提交后 stop 未在 5s 内返回")
+	}
+	e.Save()
+
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("含在途采样的最终 Save 未落盘: %v", err)
+	}
+	data, _ := os.ReadFile(path)
+	if !strings.Contains(string(data), `"last_pin_w": 100`) {
+		t.Fatalf("energy.json 应含在途采样的 100W 读数: %s", data)
+	}
+}
+
+// ---------------- 服务生命周期延迟诊断 ----------------
+
+// fakeNow 便于断言 Logf 输出 (log 内容不可直接断言, 用 fanRpm 读回次数代替)
+
+// 回归 (review 五轮): RPM 诊断延迟读回必须用服务生命周期 ctx —— POST 返回后
+// 请求 ctx 取消不得影响诊断; 重复 POST 合并为单个延迟任务; 服务 ctx 取消后
+// 不再发起读回。隔离的 HTTP 应答测试 (httptest, 不碰真机)。
+func TestFanAutoDiagUsesLifecycleCtx(t *testing.T) {
+	stubAdmin(t, true)
+	stubPortAvailable(t, true)
+	b := NewBus("Pin19", "Pin20", false)
+	mock := newMockPIO()
+	mock.readMask[GPPins["Pin20"].Port] = 0
+	b.pio = mock
+	if ok, _ := b.reconfigure(nil, nil); !ok {
+		t.Fatal("reconfigure 失败")
+	}
+	lifecycle, lifecycleCancel := context.WithCancel(context.Background())
+	defer lifecycleCancel()
+	srv := &AppServer{Bus: b, LifecycleCtx: lifecycle}
+
+	// 诊断专用观察点: 仅延迟诊断任务触发 (setFan 同步 baseline 与快照刷新不计入)。
+	// 用原子计数而非 channel: countDiag 多次调用不能消耗历史命中。
+	var diagCount atomic.Int64
+	oldHook := autoFanDiagHook.Load()
+	setAutoFanDiagHook(func(bus *Bus) {
+		if bus != b { // 只计本测试的 Bus: 其他用例的延迟任务可能跨用例存活
+			return
+		}
+		diagCount.Add(1)
+	})
+	defer func() {
+		if oldHook == nil {
+			autoFanDiagHook.Store(nil)
+		} else {
+			autoFanDiagHook.Store(oldHook)
+		}
+	}()
+
+	countDiag := func() int { return int(diagCount.Load()) }
+
+	// 真实 httptest.Server: 真实 TCP 连接, 请求返回后 server 侧请求 ctx 被取消
+	// (直接 ServeHTTP 不会这样), 模拟真实客户端断开后的服务端环境
+	ts := httptest.NewServer(srv.APIHandler())
+	defer ts.Close()
+
+	post := func() {
+		resp, err := http.Post(ts.URL+"/api/crps/fan", "application/json", strings.NewReader(`{"mode":"auto","pct":10}`))
+		if err != nil {
+			t.Fatalf("POST 失败: %v", err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("POST /fan -> %d", resp.StatusCode)
+		}
+		resp.Body.Close()
+	}
+
+	post()
+	post() // 第二次在延迟窗口内: 应合并
+	if n := countDiag(); n != 0 {
+		t.Fatalf("诊断不应在 POST 同步路径触发, 得到 %d", n)
+	}
+	deadline := time.Now().Add(autoFanDiagDelay + 3*time.Second)
+	for countDiag() < 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("POST 返回后延迟窗口内诊断未发生: 延迟任务被请求 ctx 取消")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	time.Sleep(500 * time.Millisecond) // 容忍合并失败时的第二发
+	if n := countDiag(); n != 1 {
+		t.Fatalf("两次 POST 应恰好一次诊断, 得到 %d", n)
+	}
+
+	// 等第一段任务收尾, 再取消服务 ctx: 取消后新 POST 的延迟任务不得读回
+	time.Sleep(autoFanDiagDelay)
+	lifecycleCancel()
+	time.Sleep(300 * time.Millisecond)
+	base := countDiag()
+	post()
+	time.Sleep(autoFanDiagDelay + time.Second)
+	if n := countDiag(); n > base {
+		t.Fatalf("服务取消后仍有诊断: %d -> %d", base, n)
 	}
 }
