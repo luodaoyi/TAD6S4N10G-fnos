@@ -55,6 +55,7 @@ jobs:
           for script in cmd/* scripts/build.sh scripts/build-spk.sh; do bash -n "$script"; done
           for script in synology/scripts/*; do sh -n "$script"; done
           python3 scripts/test-synology.py
+          node scripts/test-tadmodule-window.js
 
       - name: Download official fnpack
         run: |

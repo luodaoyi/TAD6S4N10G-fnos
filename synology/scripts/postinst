@@ -24,6 +24,27 @@ log() {
   echo "$(date '+%Y-%m-%dT%H:%M:%S') $*" >> "${DEBUG_LOG}" 2>/dev/null || true
 }
 
+# publish_no_replace <stage> <dest>
+# 与 real-start-stop-status 同款的三处发布统一原语(luodaoyi 裁决选 A:
+# 后端 publish 子命令,内部直接 link(2)/os.Link——精确路径、任何已存在
+# 目标(普通文件/目录/两种 symlink)EEXIST 原子失败、零嵌套、不删目标、
+# 不改权限;stage 清理与暂存消费由调用方决定)。
+# 失败回退:安装阶段二进制缺失/不可执行时回落 ln+结果验证+移入清理的
+# shell 组合,行为弱化但可用,并如实留痕。
+publish_no_replace() {
+    _pub_stage="$1"
+  _pub_dst="$2"
+  # luodaoyi R12:去掉 ln 回退(同 real-start-stop-status);安装阶段 helper
+  # 不可用(异常安装态)时安全地不发布,保留已有配置与可恢复暂存,原因
+  # 写入 postinst-debug.log。
+  if [ ! -x "${BIN}" ]; then
+    log "publish_no_replace:${BIN} 不可执行,安全不发布(helper 缺失),保留已有配置与暂存"
+    return 1
+  fi
+  "${BIN}" publish "${_pub_stage}" "${_pub_dst}" 2>/dev/null
+  return $?
+}
+
 # 目录可能由 DSM/历史 root 操作创建而归属 root（本脚本以套件用户运行）：
 # 权限与写入全部 best-effort，失败只留痕——默认 cfg/凭据首次 root 启动时
 # 由服务脚本自愈，绝不能让安装死在这里
@@ -98,19 +119,134 @@ log "auth step done"
 # 一律不碰 /usr/local；写不进时同样顺延（启动脚本会按需自愈）。
 log "cfg step: begin"
 CFG_FILE="${PKG_ETC}/tad-module.cfg"
+
+# 安装向导选值：DSM 7 的 WIZARD_UIFILES/install_uifile 把 subitems 的 key 作为
+# 环境变量传入安装脚本。singleselect 传 true/false（wizard_embed_mode /
+# wizard_standalone_mode），textfield 传端口号（wizard_port）。静默安装/升级
+# 时向导变量为空——一律回落默认嵌入模式 8123，行为与旧版一致。
+WIZ_PORT="${wizard_port:-8123}"
+case "${WIZ_PORT}" in
+  ""|*[!0-9]*) WIZ_PORT="8123" ;;
+esac
+# 规范化十进制(luodaoyi review #40 第 5 条):先剥前导零、限长 ≤5 位,
+# 再做范围校验——超长纯数字会让 test 的整数比较直接报错(条件语境按假处理),
+# 反而绕过回落逻辑。覆盖:前导零、超长数字、0、65535、65536、非数字。
+while :; do
+  case "${WIZ_PORT}" in
+    0[0-9]*) WIZ_PORT="${WIZ_PORT#0}" ;;
+    *) break ;;
+  esac
+done
+case "${#WIZ_PORT}" in
+  [1-5]) ;;
+  *) WIZ_PORT="8123" ;;
+esac
+if [ "${WIZ_PORT}" -lt 1 ] || [ "${WIZ_PORT}" -gt 65535 ]; then
+  log "向导端口 ${WIZ_PORT} 越界，回落 8123"
+  WIZ_PORT="8123"
+fi
+if [ "${wizard_standalone_mode:-false}" = "true" ]; then
+  WIZ_HTTP_ADDR="0.0.0.0:${WIZ_PORT}"
+else
+  WIZ_HTTP_ADDR="127.0.0.1:${WIZ_PORT}"
+fi
+log "wizard: embed=${wizard_embed_mode:-unset} standalone=${wizard_standalone_mode:-unset} port=${WIZ_PORT} -> HTTP_ADDR=${WIZ_HTTP_ADDR}"
+
 if [ ! -f "${CFG_FILE}" ]; then
-  if {
-    echo "# tad-module（DSM 版）运行参数；修改后重启套件生效"
-    echo "# 默认桌面嵌入模式：只监听本机回环，由 DSM nginx 反代 /webman/3rdparty/tad-module/ 提供，鉴权走 DSM 登录"
-    echo "# 改成 0.0.0.0:8123 可独立端口访问（启动时会自动生成 Basic 凭据，见 etc/initial-password.txt）"
-    echo 'HTTP_ADDR="127.0.0.1:8123"'
-    echo "# it87 探测参数（仅当系统自带 it87 模块时生效，如 force_id=\"IT8620E\"）"
-    echo 'IT87_FORCE_ID=""'
-  } > "${CFG_FILE}" 2>/dev/null; then
-    chmod 600 "${CFG_FILE}" 2>/dev/null || true
+  # 目录占位不再需要预判(CodeRabbit R9:发布用 ln no-replace 原语,对
+  # 目录目标同样原子失败,竞争处理不依赖任何预检查);提交失败统一走
+  # committed=0 → 暂存分支
+  CFG_COMMITTED=0
+  STASH_NOW=0
+  # 原子提交(luodaoyi 四/五轮):etc 受信目录内独占创建临时文件(noclobber,
+  # 防覆盖并发残留),完整写入并校验关键行后先设权限再 ln no-replace 到位
+  # ——绝不留下半份正式配置;已有有效配置永不被破坏
+  CFG_TMP=""
+  # 候选名含 $$;TAD_CFG_TMP_RACE 仅测试注入(noclobber 碰撞场景预占
+  # 精确候选名用),生产环境恒空——候选名回落 $$ 唯一性
+  _race="${TAD_CFG_TMP_RACE:-$$}"
+  for _i in 1 2 3; do
+    _cand="${CFG_FILE}.tmp.${_race}-$_i"
+    if ( set -o noclobber; umask 077; : > "${_cand}" ) 2>/dev/null; then
+      CFG_TMP="${_cand}"
+      break
+    fi
+  done
+  if [ -z "${CFG_TMP}" ]; then
+    # 临时文件创建失败(noclobber 三次全碰撞):committed=0 → 走暂存分支
+    log "cfg 临时文件创建失败(noclobber 碰撞)"
   else
-    log "cfg 不可写(root 属主?),首次启动由服务脚本自愈"
+    if {
+      echo "# tad-module（DSM 版）运行参数；修改后重启套件生效"
+      echo "# 桌面嵌入模式：只监听本机回环，由 DSM nginx 反代 /webman/3rdparty/tad-module/ 提供，鉴权走 DSM 登录"
+      echo "# 独立端口模式：0.0.0.0:端口 对外监听（启动时会自动生成 Basic 凭据，见 etc/initial-password.txt）"
+      echo "HTTP_ADDR=\"${WIZ_HTTP_ADDR}\""
+      echo "# it87 探测参数（仅当系统自带 it87 模块时生效，如 force_id=\"IT8620E\"）"
+      echo 'IT87_FORCE_ID=""'
+     } > "${CFG_TMP}" 2>/dev/null \
+     && grep -Fqx "HTTP_ADDR=\"${WIZ_HTTP_ADDR}\"" "${CFG_TMP}" \
+     && grep -Fqx 'IT87_FORCE_ID=""' "${CFG_TMP}"; then
+      # 先设权限再提交(root-only);chmod 退出码为准(stat 读数部分平台不可靠)
+      # 原子 no-replace 提交(CodeRabbit R10):统一 publish_no_replace 原语
+      if ! chmod 600 "${CFG_TMP}" 2>/dev/null; then
+        log "cfg 临时文件权限不可达 600"
+      elif publish_no_replace "${CFG_TMP}" "${CFG_FILE}"; then
+        log "cfg written atomically (no-replace link): HTTP_ADDR=${WIZ_HTTP_ADDR}"
+        CFG_COMMITTED=1
+      else
+        log "cfg 目标已存在(竞争写入者先提交)、目录/symlink 占位或发布失败,不覆盖"
+      fi
+    else
+      log "cfg 写入或校验失败"
+    fi
+    # 清临时文件:与"是否提交"判定分开——无论成败都不得留残 tmp
+    if [ -n "${CFG_TMP}" ] && [ -f "${CFG_TMP}" ]; then
+      rm -f "${CFG_TMP}" 2>/dev/null || true
+    fi
   fi
+  # 「配置未提交」才暂存向导选值(与清理临时文件分离判定,luodaoyi 六轮)
+  if [ "${CFG_COMMITTED}" = "0" ]; then
+    STASH_NOW=1
+  fi
+  if [ "${STASH_NOW:-0}" = "1" ]; then
+    # 暂存写入同样原子化(nuodaoyi 九轮/CodeRabbit R9):var 受信目录内独占
+    # 创建→完整写入→校验→chmod→**ln no-replace 原子提交**(与配置提交同一
+    # 发布原语;目标已有暂存时 ln 原子失败,不覆盖——旧值本就有效,本次未
+    # 提交 cfg 时保留旧暂存语义成立);ln 是硬链接,提交后 unlink tmp;
+    # 失败清残 tmp,日志记真实结果
+    STASH_TMP=""
+    for _i in 1 2 3; do
+      _cand="${PKG_VAR}/wizard-install.env.tmp.$$-$_i"
+      if ( set -o noclobber; umask 077; : > "${_cand}" ) 2>/dev/null; then
+        STASH_TMP="${_cand}"
+        break
+      fi
+    done
+    if [ -n "${STASH_TMP}" ] \
+       && printf 'HTTP_ADDR="%s"\n' "${WIZ_HTTP_ADDR}" > "${STASH_TMP}" 2>/dev/null \
+       && grep -Fqx "HTTP_ADDR=\"${WIZ_HTTP_ADDR}\"" "${STASH_TMP}"; then
+      # 权限前置检查与其他发布点一致:chmod 600 以退出码为准,失败不发布
+      if ! chmod 600 "${STASH_TMP}" 2>/dev/null; then
+        rm -f "${STASH_TMP}" 2>/dev/null || true
+        log "暂存临时文件权限不可达 600,首次启动由服务脚本自愈为默认端口"
+      elif publish_no_replace "${STASH_TMP}" "${PKG_VAR}/wizard-install.env"; then
+        # 发布成功后 unlink 本次 stage(publish 原语不清 stage,调用方负责)
+        rm -f "${STASH_TMP}" 2>/dev/null || true
+        log "向导选值原子暂存 var/wizard-install.env (cfg 未提交)"
+      else
+        # 发布失败(目标已有暂存/占位/EEXIST):清本次 tmp,不删既有暂存,
+        # 防止重复安装累积残留(CodeRabbit R10 Minor)。不预测启动端口:
+        # 已有暂存有效时下次启动会先尝试提交它,提交仍失败则退出而非回落默认
+        rm -f "${STASH_TMP}" 2>/dev/null || true
+        log "本次向导值暂存提交失败(目标已有暂存、目录/symlink 占位或发布失败);既有暂存(如有)保留原样,由启动脚本重新检查后决定提交或保留"
+      fi
+    else
+      [ -n "${STASH_TMP}" ] && rm -f "${STASH_TMP}" 2>/dev/null || true
+      log "暂存写入失败,首次启动由服务脚本自愈为默认端口"
+    fi
+  fi
+else
+  log "cfg 已存在(升级/重装),保留用户配置,不套用向导端口"
 fi
 log "cfg step done, postinst ok"
 
